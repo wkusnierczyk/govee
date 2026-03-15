@@ -2,7 +2,7 @@
 name = "govee"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.91"
 license = "Apache-2.0"
 description = "Async Rust library for controlling Govee smart lighting devices via cloud and local LAN APIs"
 repository = "https://github.com/wkusnierczyk/govee"
