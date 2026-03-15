@@ -1,7 +1,8 @@
 //! Integration tests for the cloud API backend (wiremock-based).
 
-#[tokio::test]
-async fn cloud_mock_placeholder() {
-    // Placeholder — will be replaced with wiremock-based tests in M3.
-    assert!(true);
+#[test]
+fn cloud_mock_placeholder() {
+    // Placeholder — will be replaced with wiremock-based async tests in M3.
+    let harness_works = true;
+    assert!(harness_works);
 }

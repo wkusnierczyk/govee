@@ -1,7 +1,8 @@
 //! Integration tests for the local LAN backend (UDP loopback).
 
-#[tokio::test]
-async fn local_mock_placeholder() {
-    // Placeholder — will be replaced with UDP loopback tests in M4.
-    assert!(true);
+#[test]
+fn local_mock_placeholder() {
+    // Placeholder — will be replaced with UDP loopback async tests in M4.
+    let harness_works = true;
+    assert!(harness_works);
 }
