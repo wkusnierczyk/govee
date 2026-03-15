@@ -4,6 +4,31 @@ A Rust library for controlling Govee smart lighting devices. Provides idiomatic 
 
 Designed as a foundation for `govee-cli`, `govee-server`, and `govee-mcp` — it has no opinion about how it is invoked.
 
+## Getting started
+
+### Prerequisites
+
+- [Rust](https://www.rust-lang.org/tools/install) (1.85+ for edition 2024)
+
+### Build
+
+```sh
+cargo build
+```
+
+### Test
+
+```sh
+cargo test
+```
+
+### Lint
+
+```sh
+cargo fmt --check
+cargo clippy
+```
+
 ## Development plan
 
 | Milestone | Scope |
