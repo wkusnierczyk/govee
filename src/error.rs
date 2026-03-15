@@ -1,5 +1,6 @@
 /// Govee domain error type.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum GoveeError {}
 
 /// Convenience alias used throughout the crate.
