@@ -4,18 +4,53 @@ The `govee` crate is a Rust library for controlling Govee smart lighting devices
 idiomatic async access to both the Govee cloud API and the local LAN API, a unified backend
 abstraction, device registry, and a workflow engine for scripting complex multi-device behaviours.
 
-It is the foundation on which `govee-cli`, `govee-server`, and `govee-mcp` are built. It has no
-opinion about how it is invoked — no CLI, no HTTP server, no MCP protocol.
+
+
+
+## Table of Contents
+
+- [1. Govee APIs](#1-govee-apis)
+  - [1.1 Cloud API](#11-cloud-api)
+  - [1.2 Local LAN API](#12-local-lan-api)
+  - [1.3 API Comparison](#13-api-comparison)
+- [2. Existing Crates](#2-existing-crates)
+- [3. Architecture](#3-architecture)
+  - [3.1 Crate structure](#31-crate-structure)
+  - [3.2 Component overview](#32-component-overview)
+- [4. Public API](#4-public-api)
+  - [4.1 Core types](#41-core-types)
+  - [4.2 GoveeBackend trait](#42-goveebackend-trait)
+  - [4.3 DeviceRegistry](#43-deviceregistry)
+  - [4.4 Configuration](#44-configuration)
+  - [4.5 Scene registry](#45-scene-registry)
+  - [4.6 Workflow engine [stub in v1]](#46-workflow-engine-stub-in-v1)
+- [5. Error handling](#5-error-handling)
+- [6. Rust fit](#6-rust-fit)
+  - [6.1 Advantages](#61-advantages)
+  - [6.2 Disadvantages](#62-disadvantages)
+  - [6.3 Dependencies](#63-dependencies)
+- [7. Design discussions](#7-design-discussions)
+  - [7.1 Backend selection per device](#71-backend-selection-per-device)
+  - [7.2 State management](#72-state-management)
+  - [7.3 Device identity and naming](#73-device-identity-and-naming)
+  - [7.4 Concurrency and shared state](#74-concurrency-and-shared-state)
+  - [7.5 Port conflict mitigation](#75-port-conflict-mitigation)
+  - [7.6 Workflow engine scope [deferred]](#76-workflow-engine-scope-deferred)
+- [Appendix: Network requirements for local backend](#appendix-network-requirements-for-local-backend)
 
 ---
 
 ## 1. Govee APIs
+<sub>[↑ TOC](#table-of-contents) · [1.1 Cloud API →](#11-cloud-api)</sub>
+
 
 Govee exposes two independent control planes: a cloud REST API and a local LAN API over UDP. They
 are not mirrors of each other — they differ in authentication model, latency, feature surface, and
 reliability characteristics.
 
-### 1.1 Cloud API (v1 / v2)
+### 1.1 Cloud API
+<sub>[↑ TOC](#table-of-contents) · [← 1. Govee APIs](#1-govee-apis) · [1.2 Local LAN API →](#12-local-lan-api)</sub>
+
 
 A conventional HTTPS REST API hosted by Govee. Authentication uses a static API key passed as the
 `Govee-API-Key` header, obtained via the Govee Home mobile app.
@@ -49,6 +84,8 @@ array per device. H6078 is explicitly supported in v2. Less community documentat
 meaningfully richer for capable devices.
 
 ### 1.2 Local LAN API
+<sub>[↑ TOC](#table-of-contents) · [← 1.1 Cloud API](#11-cloud-api) · [1.3 API Comparison →](#13-api-comparison)</sub>
+
 
 Communicates directly with devices on the same LAN segment over UDP. Must be explicitly enabled
 per device in the Govee Home app (Settings → LAN Control).
@@ -96,6 +133,8 @@ per device in the Govee Home app (Settings → LAN Control).
 several seconds. The recommended pattern is optimistic update, not read-after-write.
 
 ### 1.3 API Comparison
+<sub>[↑ TOC](#table-of-contents) · [← 1.2 Local LAN API](#12-local-lan-api) · [2. Existing Crates →](#2-existing-crates)</sub>
+
 
 | Dimension | Cloud API | Local LAN API |
 |---|---|---|
@@ -117,6 +156,8 @@ devices that don't support local control, and the authoritative source for devic
 ---
 
 ## 2. Existing Crates
+<sub>[↑ TOC](#table-of-contents) · [← 1.3 API Comparison](#13-api-comparison) · [3. Architecture →](#3-architecture)</sub>
+
 
 Three Rust crates in this space were evaluated before deciding to write a new library.
 
@@ -140,8 +181,12 @@ crate name `govee` appears unclaimed on crates.io as of March 2026.
 ---
 
 ## 3. Architecture
+<sub>[↑ TOC](#table-of-contents) · [← 2. Existing Crates](#2-existing-crates) · [3.1 Crate structure →](#31-crate-structure)</sub>
+
 
 ### 3.1 Crate structure
+<sub>[↑ TOC](#table-of-contents) · [← 3. Architecture](#3-architecture) · [3.2 Component overview →](#32-component-overview)</sub>
+
 
 ```
 govee/
@@ -165,6 +210,8 @@ govee/
 ```
 
 ### 3.2 Component overview
+<sub>[↑ TOC](#table-of-contents) · [← 3.1 Crate structure](#31-crate-structure) · [4. Public API →](#4-public-api)</sub>
+
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
@@ -203,8 +250,12 @@ govee/
 ---
 
 ## 4. Public API
+<sub>[↑ TOC](#table-of-contents) · [← 3.2 Component overview](#32-component-overview) · [4.1 Core types →](#41-core-types)</sub>
+
 
 ### 4.1 Core types
+<sub>[↑ TOC](#table-of-contents) · [← 4. Public API](#4-public-api) · [4.2 GoveeBackend trait →](#42-goveebackend-trait)</sub>
+
 
 ```rust
 /// Opaque device identifier (wraps MAC address string internally).
@@ -239,6 +290,8 @@ pub struct Color { pub r: u8, pub g: u8, pub b: u8 }
 ```
 
 ### 4.2 GoveeBackend trait
+<sub>[↑ TOC](#table-of-contents) · [← 4.1 Core types](#41-core-types) · [4.3 DeviceRegistry →](#43-deviceregistry)</sub>
+
 
 ```rust
 #[async_trait]
@@ -258,6 +311,8 @@ concrete backend types. This also makes testing straightforward — mock backend
 same trait.
 
 ### 4.3 DeviceRegistry
+<sub>[↑ TOC](#table-of-contents) · [← 4.2 GoveeBackend trait](#42-goveebackend-trait) · [4.4 Configuration →](#44-configuration)</sub>
+
 
 The `DeviceRegistry` is the primary entry point for library consumers. It owns both backends,
 handles backend selection per device, and provides name/alias resolution.
@@ -292,6 +347,8 @@ impl DeviceRegistry {
 ```
 
 ### 4.4 Configuration
+<sub>[↑ TOC](#table-of-contents) · [← 4.3 DeviceRegistry](#43-deviceregistry) · [4.5 Scene registry →](#45-scene-registry)</sub>
+
 
 ```rust
 pub struct Config {
@@ -310,6 +367,8 @@ Consumer binaries (CLI, MCP) may layer additional config sources (env vars, CLI 
 that is their responsibility, not the library's.
 
 ### 4.5 Scene registry
+<sub>[↑ TOC](#table-of-contents) · [← 4.4 Configuration](#44-configuration) · [4.6 Workflow engine [stub in v1] →](#46-workflow-engine-stub-in-v1)</sub>
+
 
 ```rust
 pub struct Scene {
@@ -337,6 +396,8 @@ Built-in scenes (compiled in):
 User scenes are loaded from config and extend (or override) the built-ins.
 
 ### 4.6 Workflow engine (stub in v1)
+<sub>[↑ TOC](#table-of-contents) · [← 4.5 Scene registry](#45-scene-registry) · [5. Error handling →](#5-error-handling)</sub>
+
 
 The workflow engine is exposed as a single async function. In v1, calling it returns an error
 explaining it is not yet implemented. The function signature is stable — consumer crates can call
@@ -354,6 +415,8 @@ The YAML workflow format will be designed separately and implemented in a subseq
 ---
 
 ## 5. Error handling
+<sub>[↑ TOC](#table-of-contents) · [← 4.6 Workflow engine [stub in v1]](#46-workflow-engine-stub-in-v1) · [6. Rust fit →](#6-rust-fit)</sub>
+
 
 ```rust
 #[derive(Debug, thiserror::Error)]
@@ -395,8 +458,12 @@ boundaries. The library never panics on bad API responses — all error paths re
 ---
 
 ## 6. Rust fit
+<sub>[↑ TOC](#table-of-contents) · [← 5. Error handling](#5-error-handling) · [6.1 Advantages →](#61-advantages)</sub>
+
 
 ### 6.1 Advantages
+<sub>[↑ TOC](#table-of-contents) · [← 6. Rust fit](#6-rust-fit) · [6.2 Disadvantages →](#62-disadvantages)</sub>
+
 
 **Type safety at protocol boundaries.** Both APIs are JSON-heavy. `serde` with typed structs
 catches shape mismatches at compile time. Python or JS would fail silently at runtime.
@@ -414,6 +481,8 @@ linked binary. No runtime, no virtualenv, no version conflicts.
 dispatch) with no framework overhead.
 
 ### 6.2 Disadvantages
+<sub>[↑ TOC](#table-of-contents) · [← 6.1 Advantages](#61-advantages) · [6.3 Dependencies →](#63-dependencies)</sub>
+
 
 **Slower iteration on protocol changes.** If Govee changes a JSON field name, a recompile is
 required to pick up the fix. Acceptable — this is not a hot-reload environment.
@@ -425,6 +494,8 @@ required to pick up the fix. Acceptable — this is not a hot-reload environment
 The workflow engine (once implemented) partially addresses this for the common case.
 
 ### 6.3 Dependencies
+<sub>[↑ TOC](#table-of-contents) · [← 6.2 Disadvantages](#62-disadvantages) · [7. Design discussions →](#7-design-discussions)</sub>
+
 
 | Crate | Role | Notes |
 |---|---|---|
@@ -449,8 +520,12 @@ No heavy dependencies. Estimated clean build: ~45–60s. Incremental: ~5–10s.
 ---
 
 ## 7. Design discussions
+<sub>[↑ TOC](#table-of-contents) · [← 6.3 Dependencies](#63-dependencies) · [7.1 Backend selection per device →](#71-backend-selection-per-device)</sub>
+
 
 ### 7.1 Backend selection per device
+<sub>[↑ TOC](#table-of-contents) · [← 7. Design discussions](#7-design-discussions) · [7.2 State management →](#72-state-management)</sub>
+
 
 **Option A: Global flag** (`cloud | local`). Simple, but breaks for mixed environments where some
 devices don't support LAN.
@@ -465,6 +540,8 @@ default for debugging or forced-cloud scenarios.
 Decision: **Option B**.
 
 ### 7.2 State management
+<sub>[↑ TOC](#table-of-contents) · [← 7.1 Backend selection per device](#71-backend-selection-per-device) · [7.3 Device identity and naming →](#73-device-identity-and-naming)</sub>
+
 
 **Option A: Live query on every `get_state`.** Accurate, slow on cloud, exposes all API
 unreliability directly to callers.
@@ -481,6 +558,8 @@ Decision: **Option B**, with `stale: bool` in `DeviceState` to let consumers dec
 present uncertainty.
 
 ### 7.3 Device identity and naming
+<sub>[↑ TOC](#table-of-contents) · [← 7.2 State management](#72-state-management) · [7.4 Concurrency and shared state →](#74-concurrency-and-shared-state)</sub>
+
 
 MAC addresses are the stable identity used internally. The cloud API provides user-assigned names;
 local discovery provides only MAC + IP. The `DeviceRegistry` merges both at startup — cloud names
@@ -491,12 +570,16 @@ replace the canonical name. Both `"H6078 Living Room"` and `"bedroom"` resolve t
 `DeviceId`.
 
 ### 7.4 Concurrency and shared state
+<sub>[↑ TOC](#table-of-contents) · [← 7.3 Device identity and naming](#73-device-identity-and-naming) · [7.5 Port conflict mitigation →](#75-port-conflict-mitigation)</sub>
+
 
 `DeviceRegistry` is wrapped in `Arc` and designed to be cheaply cloned and shared across async
 tasks. Internal mutable state (cached device states) is protected by `RwLock`. The background
 reconciliation task holds a `Weak<DeviceRegistry>` to avoid preventing shutdown.
 
 ### 7.5 Port conflict mitigation
+<sub>[↑ TOC](#table-of-contents) · [← 7.4 Concurrency and shared state](#74-concurrency-and-shared-state) · [7.6 Workflow engine scope [deferred] →](#76-workflow-engine-scope-deferred)</sub>
+
 
 The local LAN API protocol fixes UDP ports 4001–4003. Only one process per host IP may use the
 local backend at a time. The library detects bind failure on port 4002 at startup and returns
@@ -506,6 +589,8 @@ In `Auto` mode, if local binding fails, the library logs a warning and falls bac
 devices rather than failing to start entirely.
 
 ### 7.6 Workflow engine scope (deferred)
+<sub>[↑ TOC](#table-of-contents) · [← 7.5 Port conflict mitigation](#75-port-conflict-mitigation) · [Appendix: Network requirements for local backend →](#appendix-network-requirements-for-local-backend)</sub>
+
 
 The workflow format is deliberately left undesigned for v1. The requirements are clear in outline —
 timed sequences of device commands, multi-device targets, possibly conditional branches — but the
@@ -515,6 +600,8 @@ preserves the call site so consumers don't need to change when the engine ships.
 ---
 
 ## Appendix: Network requirements for local backend
+<sub>[↑ TOC](#table-of-contents) · [← 7.6 Workflow engine scope [deferred]](#76-workflow-engine-scope-deferred)</sub>
+
 
 | Port | Direction | Purpose |
 |---|---|---|
