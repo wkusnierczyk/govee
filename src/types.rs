@@ -36,3 +36,15 @@ pub struct Color {
     pub g: u8,
     pub b: u8,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn device_id_equality() {
+        let a = DeviceId("AA:BB:CC:DD".into());
+        let b = DeviceId("AA:BB:CC:DD".into());
+        assert_eq!(a, b);
+    }
+}
