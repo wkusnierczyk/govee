@@ -4,6 +4,51 @@ A Rust library for controlling Govee smart lighting devices. Provides idiomatic 
 
 Designed as a foundation for `govee-cli`, `govee-server`, and `govee-mcp` — it has no opinion about how it is invoked.
 
+## Getting started
+
+### Prerequisites
+
+- [Rust](https://www.rust-lang.org/tools/install) (1.85+ for edition 2024)
+- [Lefthook](https://github.com/evilmartians/lefthook) — git hooks manager
+
+### Set up git hooks
+
+Install lefthook and activate the hooks before making any commits:
+
+```sh
+# macOS
+brew install lefthook
+
+# or via npm/cargo/go — see https://github.com/evilmartians/lefthook/blob/master/docs/install.md
+```
+
+```sh
+lefthook install
+```
+
+This configures:
+- **pre-commit** — `cargo fmt --check` and `cargo clippy` (parallel)
+- **pre-push** — `cargo build` then `cargo test` (sequential)
+
+### Build
+
+```sh
+cargo build
+```
+
+### Test
+
+```sh
+cargo test
+```
+
+### Lint
+
+```sh
+cargo fmt --check
+cargo clippy
+```
+
 ## Development plan
 
 | Milestone | Scope |
