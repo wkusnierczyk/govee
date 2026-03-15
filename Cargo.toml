@@ -1,0 +1,23 @@
+[package]
+name = "govee"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Async Rust library for controlling Govee smart lighting devices via cloud and local LAN APIs"
+repository = "https://github.com/wkusnierczyk/govee"
+keywords = ["govee", "smart-home", "iot", "lighting", "home-automation"]
+categories = ["api-bindings", "asynchronous"]
+
+[dependencies]
+tokio = { version = "1.50", features = ["full"] }
+reqwest = { version = "0.13", features = ["json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+async-trait = "0.1"
+tracing = "0.1"
+toml = "1.0"
+
+[dev-dependencies]
+wiremock = "0.6"
+tokio = { version = "1.50", features = ["full", "test-util"] }
