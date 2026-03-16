@@ -1,12 +1,10 @@
-> Up to date with version 0.4.0
-
 # `govee` — Library Design Document
 
 The `govee` crate is a Rust library for controlling Govee smart lighting devices. It provides
 idiomatic async access to both the Govee cloud API and the local LAN API, a unified backend
 abstraction, device registry, and a workflow engine for scripting complex multi-device behaviours.
 
-
+> Up to date with version 0.4.0
 
 
 ## Table of Contents
