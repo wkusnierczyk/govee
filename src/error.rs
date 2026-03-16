@@ -37,6 +37,9 @@ pub enum GoveeError {
 
     #[error("brightness must be 0–100, got {0}")]
     InvalidBrightness(u8),
+
+    #[error("invalid config: {0}")]
+    InvalidConfig(String),
 }
 
 /// Convenience alias used throughout the crate.
