@@ -2,11 +2,11 @@
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum GoveeError {
-    #[error("HTTP error: {0}")]
-    Http(#[from] reqwest::Error),
+    #[error("request error: {0}")]
+    Request(#[from] reqwest::Error),
 
-    #[error("UDP error: {0}")]
-    Udp(#[from] std::io::Error),
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
 
     #[error("API error {code}: {message}")]
     Api { code: u16, message: String },
@@ -23,8 +23,8 @@ pub enum GoveeError {
     #[error("discovery timeout")]
     DiscoveryTimeout,
 
-    #[error("serialization error: {0}")]
-    Serialization(#[from] serde_json::Error),
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
 
     #[error("not implemented: {0}")]
     NotImplemented(String),
@@ -84,7 +84,7 @@ mod tests {
     fn error_from_io() {
         let io_err = std::io::Error::new(std::io::ErrorKind::AddrInUse, "port 4002 in use");
         let err: GoveeError = io_err.into();
-        assert!(matches!(err, GoveeError::Udp(_)));
+        assert!(matches!(err, GoveeError::Io(_)));
         assert!(err.to_string().contains("port 4002 in use"));
     }
 
@@ -92,6 +92,6 @@ mod tests {
     fn error_from_serde_json() {
         let json_err = serde_json::from_str::<serde_json::Value>("not json").unwrap_err();
         let err: GoveeError = json_err.into();
-        assert!(matches!(err, GoveeError::Serialization(_)));
+        assert!(matches!(err, GoveeError::Json(_)));
     }
 }
