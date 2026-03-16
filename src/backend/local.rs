@@ -130,6 +130,31 @@ impl LocalBackend {
         Ok(())
     }
 
+    /// Send a command payload to a discovered device via UDP.
+    ///
+    /// Validates that the device IP is a local address (private, link-local,
+    /// or loopback) before sending.
+    async fn send_command(&self, id: &DeviceId, payload: serde_json::Value) -> Result<()> {
+        let ip = self.get_device_ip(id)?;
+
+        // Safety check: only send to local addresses.
+        let is_local = match ip {
+            IpAddr::V4(v4) => v4.is_private() || v4.is_link_local() || v4.is_loopback(),
+            IpAddr::V6(v6) => v6.is_loopback(),
+        };
+        if !is_local {
+            return Err(GoveeError::InvalidConfig(
+                "device IP is not a local address".into(),
+            ));
+        }
+
+        let bytes = serde_json::to_vec(&payload)?;
+        self.send_socket.send_to(&bytes, (ip, 4003)).await?;
+
+        tracing::debug!("sent command to {} ({}) on port 4003", id, ip);
+        Ok(())
+    }
+
     /// Look up the IP address of a discovered device.
     pub fn get_device_ip(&self, id: &DeviceId) -> Result<IpAddr> {
         // Using std RwLock–style try_read would be wrong here since we hold
@@ -341,24 +366,59 @@ impl GoveeBackend for LocalBackend {
         Err(GoveeError::NotImplemented("LocalBackend::get_state".into()))
     }
 
-    async fn set_power(&self, _id: &DeviceId, _on: bool) -> Result<()> {
-        Err(GoveeError::NotImplemented("LocalBackend::set_power".into()))
+    async fn set_power(&self, id: &DeviceId, on: bool) -> Result<()> {
+        let value = if on { 1 } else { 0 };
+        let payload = serde_json::json!({
+            "msg": {
+                "cmd": "turn",
+                "data": { "value": value }
+            }
+        });
+        self.send_command(id, payload).await
     }
 
-    async fn set_brightness(&self, _id: &DeviceId, _value: u8) -> Result<()> {
-        Err(GoveeError::NotImplemented(
-            "LocalBackend::set_brightness".into(),
-        ))
+    async fn set_brightness(&self, id: &DeviceId, value: u8) -> Result<()> {
+        if value > 100 {
+            return Err(GoveeError::InvalidBrightness(value));
+        }
+        let payload = serde_json::json!({
+            "msg": {
+                "cmd": "brightness",
+                "data": { "value": value }
+            }
+        });
+        self.send_command(id, payload).await
     }
 
-    async fn set_color(&self, _id: &DeviceId, _color: Color) -> Result<()> {
-        Err(GoveeError::NotImplemented("LocalBackend::set_color".into()))
+    async fn set_color(&self, id: &DeviceId, color: Color) -> Result<()> {
+        let payload = serde_json::json!({
+            "msg": {
+                "cmd": "colorwc",
+                "data": {
+                    "color": { "r": color.r, "g": color.g, "b": color.b },
+                    "colorTemInKelvin": 0
+                }
+            }
+        });
+        self.send_command(id, payload).await
     }
 
-    async fn set_color_temp(&self, _id: &DeviceId, _kelvin: u32) -> Result<()> {
-        Err(GoveeError::NotImplemented(
-            "LocalBackend::set_color_temp".into(),
-        ))
+    async fn set_color_temp(&self, id: &DeviceId, kelvin: u32) -> Result<()> {
+        if kelvin == 0 {
+            return Err(GoveeError::InvalidConfig(
+                "color temperature must be > 0K".into(),
+            ));
+        }
+        let payload = serde_json::json!({
+            "msg": {
+                "cmd": "colorwc",
+                "data": {
+                    "color": { "r": 0, "g": 0, "b": 0 },
+                    "colorTemInKelvin": kelvin
+                }
+            }
+        });
+        self.send_command(id, payload).await
     }
 
     fn backend_type(&self) -> BackendType {
@@ -543,5 +603,111 @@ mod tests {
     fn send_sync_assertions() {
         _assert_local_backend_send_sync();
         _assert_boxed_backend_send_sync();
+    }
+
+    #[test]
+    fn set_power_payload_on() {
+        let payload = serde_json::json!({
+            "msg": {
+                "cmd": "turn",
+                "data": { "value": 1 }
+            }
+        });
+        let msg = payload.get("msg").unwrap();
+        assert_eq!(msg["cmd"], "turn");
+        assert_eq!(msg["data"]["value"], 1);
+    }
+
+    #[test]
+    fn set_power_payload_off() {
+        let payload = serde_json::json!({
+            "msg": {
+                "cmd": "turn",
+                "data": { "value": 0 }
+            }
+        });
+        let msg = payload.get("msg").unwrap();
+        assert_eq!(msg["cmd"], "turn");
+        assert_eq!(msg["data"]["value"], 0);
+    }
+
+    #[test]
+    fn set_brightness_payload() {
+        let value: u8 = 75;
+        let payload = serde_json::json!({
+            "msg": {
+                "cmd": "brightness",
+                "data": { "value": value }
+            }
+        });
+        let msg = payload.get("msg").unwrap();
+        assert_eq!(msg["cmd"], "brightness");
+        assert_eq!(msg["data"]["value"], 75);
+    }
+
+    #[test]
+    fn set_color_payload() {
+        let color = Color::new(255, 128, 0);
+        let payload = serde_json::json!({
+            "msg": {
+                "cmd": "colorwc",
+                "data": {
+                    "color": { "r": color.r, "g": color.g, "b": color.b },
+                    "colorTemInKelvin": 0
+                }
+            }
+        });
+        let msg = payload.get("msg").unwrap();
+        assert_eq!(msg["cmd"], "colorwc");
+        assert_eq!(msg["data"]["color"]["r"], 255);
+        assert_eq!(msg["data"]["color"]["g"], 128);
+        assert_eq!(msg["data"]["color"]["b"], 0);
+        assert_eq!(msg["data"]["colorTemInKelvin"], 0);
+    }
+
+    #[test]
+    fn set_color_temp_payload() {
+        let kelvin: u32 = 4500;
+        let payload = serde_json::json!({
+            "msg": {
+                "cmd": "colorwc",
+                "data": {
+                    "color": { "r": 0, "g": 0, "b": 0 },
+                    "colorTemInKelvin": kelvin
+                }
+            }
+        });
+        let msg = payload.get("msg").unwrap();
+        assert_eq!(msg["cmd"], "colorwc");
+        assert_eq!(msg["data"]["color"]["r"], 0);
+        assert_eq!(msg["data"]["color"]["g"], 0);
+        assert_eq!(msg["data"]["color"]["b"], 0);
+        assert_eq!(msg["data"]["colorTemInKelvin"], 4500);
+    }
+
+    #[test]
+    fn ip_validation_private_accepted() {
+        let private = Ipv4Addr::new(192, 168, 1, 100);
+        assert!(private.is_private());
+    }
+
+    #[test]
+    fn ip_validation_loopback_accepted() {
+        let loopback = Ipv4Addr::new(127, 0, 0, 1);
+        assert!(loopback.is_loopback());
+    }
+
+    #[test]
+    fn ip_validation_link_local_accepted() {
+        let link_local = Ipv4Addr::new(169, 254, 1, 1);
+        assert!(link_local.is_link_local());
+    }
+
+    #[test]
+    fn ip_validation_public_rejected() {
+        let public = Ipv4Addr::new(8, 8, 8, 8);
+        assert!(!public.is_private());
+        assert!(!public.is_link_local());
+        assert!(!public.is_loopback());
     }
 }

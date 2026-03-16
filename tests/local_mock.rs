@@ -100,9 +100,10 @@ async fn udp_loopback_discovery() {
     drop(backend);
 }
 
-/// Test that stub methods return NotImplemented.
+/// Test that get_state still returns NotImplemented, and control commands
+/// return DeviceNotFound when the device is not in the cache.
 #[tokio::test]
-async fn stub_methods_return_not_implemented() {
+async fn stub_and_control_errors_without_device() {
     let backend = LocalBackend::new(Duration::from_millis(100), 10).await;
 
     if let Err(GoveeError::BackendUnavailable(_)) = &backend {
@@ -119,24 +120,363 @@ async fn stub_methods_return_not_implemented() {
     ));
     assert!(matches!(
         backend.set_power(&id, true).await,
-        Err(GoveeError::NotImplemented(_))
+        Err(GoveeError::DeviceNotFound(_))
     ));
     assert!(matches!(
         backend.set_brightness(&id, 50).await,
-        Err(GoveeError::NotImplemented(_))
+        Err(GoveeError::DeviceNotFound(_))
     ));
     assert!(matches!(
         backend
             .set_color(&id, govee::types::Color::new(255, 0, 0))
             .await,
-        Err(GoveeError::NotImplemented(_))
+        Err(GoveeError::DeviceNotFound(_))
     ));
     assert!(matches!(
         backend.set_color_temp(&id, 4000).await,
-        Err(GoveeError::NotImplemented(_))
+        Err(GoveeError::DeviceNotFound(_))
     ));
 
     assert_eq!(backend.backend_type(), govee::types::BackendType::Local);
+
+    drop(backend);
+}
+
+/// Test that set_brightness rejects values > 100.
+#[tokio::test]
+async fn set_brightness_rejects_invalid_value() {
+    let backend = LocalBackend::new(Duration::from_millis(100), 10).await;
+
+    if let Err(GoveeError::BackendUnavailable(_)) = &backend {
+        eprintln!("skipping test: port 4002 in use");
+        return;
+    }
+
+    let backend = backend.unwrap();
+
+    // Inject a fake device at 127.0.0.1 via scan response.
+    let sender = tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0u16))
+        .await
+        .unwrap();
+    let scan_response = serde_json::json!({
+        "msg": {
+            "cmd": "scan",
+            "data": {
+                "ip": "127.0.0.1",
+                "device": "AA:BB:CC:DD:EE:FF:00:11",
+                "sku": "H6076"
+            }
+        }
+    });
+    sender
+        .send_to(
+            &serde_json::to_vec(&scan_response).unwrap(),
+            (Ipv4Addr::LOCALHOST, 4002u16),
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let id = govee::types::DeviceId::new("AA:BB:CC:DD:EE:FF:00:11").unwrap();
+    assert!(matches!(
+        backend.set_brightness(&id, 101).await,
+        Err(GoveeError::InvalidBrightness(101))
+    ));
+
+    drop(backend);
+}
+
+/// Test that set_color_temp rejects 0K.
+#[tokio::test]
+async fn set_color_temp_rejects_zero() {
+    let backend = LocalBackend::new(Duration::from_millis(100), 10).await;
+
+    if let Err(GoveeError::BackendUnavailable(_)) = &backend {
+        eprintln!("skipping test: port 4002 in use");
+        return;
+    }
+
+    let backend = backend.unwrap();
+
+    let sender = tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0u16))
+        .await
+        .unwrap();
+    let scan_response = serde_json::json!({
+        "msg": {
+            "cmd": "scan",
+            "data": {
+                "ip": "127.0.0.1",
+                "device": "AA:BB:CC:DD:EE:FF:00:11",
+                "sku": "H6076"
+            }
+        }
+    });
+    sender
+        .send_to(
+            &serde_json::to_vec(&scan_response).unwrap(),
+            (Ipv4Addr::LOCALHOST, 4002u16),
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let id = govee::types::DeviceId::new("AA:BB:CC:DD:EE:FF:00:11").unwrap();
+    assert!(matches!(
+        backend.set_color_temp(&id, 0).await,
+        Err(GoveeError::InvalidConfig(_))
+    ));
+
+    drop(backend);
+}
+
+/// UDP loopback test for set_power command.
+#[tokio::test]
+async fn udp_loopback_set_power() {
+    let backend = LocalBackend::new(Duration::from_millis(200), 60).await;
+
+    if let Err(GoveeError::BackendUnavailable(_)) = &backend {
+        eprintln!("skipping test: port 4002 in use");
+        return;
+    }
+
+    let backend = backend.unwrap();
+
+    // Bind a test socket on port 4003 to receive commands.
+    let receiver = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 4003u16)).await;
+    let receiver = match receiver {
+        Ok(r) => r,
+        Err(_) => {
+            eprintln!("skipping test: port 4003 in use");
+            return;
+        }
+    };
+
+    // Inject a fake device at 127.0.0.1.
+    let sender = tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0u16))
+        .await
+        .unwrap();
+    let scan_response = serde_json::json!({
+        "msg": {
+            "cmd": "scan",
+            "data": {
+                "ip": "127.0.0.1",
+                "device": "AA:BB:CC:DD:EE:FF:00:11",
+                "sku": "H6076"
+            }
+        }
+    });
+    sender
+        .send_to(
+            &serde_json::to_vec(&scan_response).unwrap(),
+            (Ipv4Addr::LOCALHOST, 4002u16),
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let id = govee::types::DeviceId::new("AA:BB:CC:DD:EE:FF:00:11").unwrap();
+
+    // Send set_power(on).
+    backend.set_power(&id, true).await.unwrap();
+
+    let mut buf = [0u8; 4096];
+    let (len, _) = tokio::time::timeout(Duration::from_secs(2), receiver.recv_from(&mut buf))
+        .await
+        .expect("timed out waiting for UDP packet")
+        .unwrap();
+
+    let received: serde_json::Value = serde_json::from_slice(&buf[..len]).unwrap();
+    assert_eq!(received["msg"]["cmd"], "turn");
+    assert_eq!(received["msg"]["data"]["value"], 1);
+
+    drop(backend);
+}
+
+/// UDP loopback test for set_brightness command.
+#[tokio::test]
+async fn udp_loopback_set_brightness() {
+    let backend = LocalBackend::new(Duration::from_millis(200), 60).await;
+
+    if let Err(GoveeError::BackendUnavailable(_)) = &backend {
+        eprintln!("skipping test: port 4002 in use");
+        return;
+    }
+
+    let backend = backend.unwrap();
+
+    let receiver = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 4003u16)).await;
+    let receiver = match receiver {
+        Ok(r) => r,
+        Err(_) => {
+            eprintln!("skipping test: port 4003 in use");
+            return;
+        }
+    };
+
+    let sender = tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0u16))
+        .await
+        .unwrap();
+    let scan_response = serde_json::json!({
+        "msg": {
+            "cmd": "scan",
+            "data": {
+                "ip": "127.0.0.1",
+                "device": "AA:BB:CC:DD:EE:FF:00:11",
+                "sku": "H6076"
+            }
+        }
+    });
+    sender
+        .send_to(
+            &serde_json::to_vec(&scan_response).unwrap(),
+            (Ipv4Addr::LOCALHOST, 4002u16),
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let id = govee::types::DeviceId::new("AA:BB:CC:DD:EE:FF:00:11").unwrap();
+
+    backend.set_brightness(&id, 75).await.unwrap();
+
+    let mut buf = [0u8; 4096];
+    let (len, _) = tokio::time::timeout(Duration::from_secs(2), receiver.recv_from(&mut buf))
+        .await
+        .expect("timed out waiting for UDP packet")
+        .unwrap();
+
+    let received: serde_json::Value = serde_json::from_slice(&buf[..len]).unwrap();
+    assert_eq!(received["msg"]["cmd"], "brightness");
+    assert_eq!(received["msg"]["data"]["value"], 75);
+
+    drop(backend);
+}
+
+/// UDP loopback test for set_color command.
+#[tokio::test]
+async fn udp_loopback_set_color() {
+    let backend = LocalBackend::new(Duration::from_millis(200), 60).await;
+
+    if let Err(GoveeError::BackendUnavailable(_)) = &backend {
+        eprintln!("skipping test: port 4002 in use");
+        return;
+    }
+
+    let backend = backend.unwrap();
+
+    let receiver = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 4003u16)).await;
+    let receiver = match receiver {
+        Ok(r) => r,
+        Err(_) => {
+            eprintln!("skipping test: port 4003 in use");
+            return;
+        }
+    };
+
+    let sender = tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0u16))
+        .await
+        .unwrap();
+    let scan_response = serde_json::json!({
+        "msg": {
+            "cmd": "scan",
+            "data": {
+                "ip": "127.0.0.1",
+                "device": "AA:BB:CC:DD:EE:FF:00:11",
+                "sku": "H6076"
+            }
+        }
+    });
+    sender
+        .send_to(
+            &serde_json::to_vec(&scan_response).unwrap(),
+            (Ipv4Addr::LOCALHOST, 4002u16),
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let id = govee::types::DeviceId::new("AA:BB:CC:DD:EE:FF:00:11").unwrap();
+
+    backend
+        .set_color(&id, govee::types::Color::new(255, 128, 0))
+        .await
+        .unwrap();
+
+    let mut buf = [0u8; 4096];
+    let (len, _) = tokio::time::timeout(Duration::from_secs(2), receiver.recv_from(&mut buf))
+        .await
+        .expect("timed out waiting for UDP packet")
+        .unwrap();
+
+    let received: serde_json::Value = serde_json::from_slice(&buf[..len]).unwrap();
+    assert_eq!(received["msg"]["cmd"], "colorwc");
+    assert_eq!(received["msg"]["data"]["color"]["r"], 255);
+    assert_eq!(received["msg"]["data"]["color"]["g"], 128);
+    assert_eq!(received["msg"]["data"]["color"]["b"], 0);
+    assert_eq!(received["msg"]["data"]["colorTemInKelvin"], 0);
+
+    drop(backend);
+}
+
+/// UDP loopback test for set_color_temp command.
+#[tokio::test]
+async fn udp_loopback_set_color_temp() {
+    let backend = LocalBackend::new(Duration::from_millis(200), 60).await;
+
+    if let Err(GoveeError::BackendUnavailable(_)) = &backend {
+        eprintln!("skipping test: port 4002 in use");
+        return;
+    }
+
+    let backend = backend.unwrap();
+
+    let receiver = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 4003u16)).await;
+    let receiver = match receiver {
+        Ok(r) => r,
+        Err(_) => {
+            eprintln!("skipping test: port 4003 in use");
+            return;
+        }
+    };
+
+    let sender = tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0u16))
+        .await
+        .unwrap();
+    let scan_response = serde_json::json!({
+        "msg": {
+            "cmd": "scan",
+            "data": {
+                "ip": "127.0.0.1",
+                "device": "AA:BB:CC:DD:EE:FF:00:11",
+                "sku": "H6076"
+            }
+        }
+    });
+    sender
+        .send_to(
+            &serde_json::to_vec(&scan_response).unwrap(),
+            (Ipv4Addr::LOCALHOST, 4002u16),
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let id = govee::types::DeviceId::new("AA:BB:CC:DD:EE:FF:00:11").unwrap();
+
+    backend.set_color_temp(&id, 4500).await.unwrap();
+
+    let mut buf = [0u8; 4096];
+    let (len, _) = tokio::time::timeout(Duration::from_secs(2), receiver.recv_from(&mut buf))
+        .await
+        .expect("timed out waiting for UDP packet")
+        .unwrap();
+
+    let received: serde_json::Value = serde_json::from_slice(&buf[..len]).unwrap();
+    assert_eq!(received["msg"]["cmd"], "colorwc");
+    assert_eq!(received["msg"]["data"]["color"]["r"], 0);
+    assert_eq!(received["msg"]["data"]["color"]["g"], 0);
+    assert_eq!(received["msg"]["data"]["color"]["b"], 0);
+    assert_eq!(received["msg"]["data"]["colorTemInKelvin"], 4500);
 
     drop(backend);
 }
