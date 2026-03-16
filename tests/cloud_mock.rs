@@ -9,9 +9,9 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Create a CloudBackend pointing at the mock server.
 ///
-/// Uses `new_for_testing` because `CloudBackend::new` rejects non-HTTPS URLs.
+/// `CloudBackend::new` allows HTTP for loopback addresses (wiremock binds to 127.0.0.1).
 fn backend_for(server: &MockServer, api_key: &str) -> CloudBackend {
-    CloudBackend::new_for_testing(api_key.to_string(), server.uri())
+    CloudBackend::new(api_key.to_string(), Some(server.uri())).unwrap()
 }
 
 const HAPPY_RESPONSE: &str = r#"{

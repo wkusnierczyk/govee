@@ -24,6 +24,17 @@ fn user_agent() -> String {
     format!("govee/{}", env!("CARGO_PKG_VERSION"))
 }
 
+/// Check if a URL points to a loopback address (127.0.0.1, ::1, localhost).
+fn is_loopback(url: &reqwest::Url) -> bool {
+    match url.host_str() {
+        Some("localhost") | Some("127.0.0.1") | Some("[::1]") => true,
+        Some(host) => host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback()),
+        None => false,
+    }
+}
+
 /// Build a configured `reqwest::Client` with timeouts and User-Agent.
 fn build_client() -> std::result::Result<Client, reqwest::Error> {
     Client::builder()
@@ -54,14 +65,15 @@ impl CloudBackend {
     /// Create a new `CloudBackend`.
     ///
     /// Returns `GoveeError::InvalidConfig` if `base_url` is not a valid URL
-    /// or does not use HTTPS.
+    /// or does not use HTTPS (unless the host is a loopback address, which
+    /// allows HTTP for local testing with wiremock).
     pub fn new(api_key: String, base_url: Option<String>) -> Result<Self> {
         let raw = base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
         let parsed = reqwest::Url::parse(&raw)
             .map_err(|e| GoveeError::InvalidConfig(format!("invalid base URL \"{raw}\": {e}")))?;
-        if parsed.scheme() != "https" {
+        if parsed.scheme() != "https" && !is_loopback(&parsed) {
             return Err(GoveeError::InvalidConfig(format!(
-                "base URL must use HTTPS, got: {raw}"
+                "base URL must use HTTPS (HTTP is only allowed for loopback addresses), got: {raw}"
             )));
         }
         let client = build_client()
@@ -72,23 +84,6 @@ impl CloudBackend {
             api_key,
             device_models: RwLock::new(HashMap::new()),
         })
-    }
-
-    /// Create a `CloudBackend` for testing with an arbitrary base URL.
-    ///
-    /// Skips HTTPS enforcement — intended for wiremock tests with `http://`
-    /// mock servers.
-    ///
-    /// Only available when the `test-utils` feature is enabled.
-    #[cfg(feature = "test-utils")]
-    pub fn new_for_testing(api_key: String, base_url: String) -> Self {
-        let parsed = reqwest::Url::parse(&base_url).expect("test base URL must be valid");
-        Self {
-            client: build_client().expect("failed to build test HTTP client"),
-            base_url: parsed,
-            api_key,
-            device_models: RwLock::new(HashMap::new()),
-        }
     }
 
     /// Look up the model for a device ID from the internal cache.
@@ -441,12 +436,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rejects_http_base_url() {
+    fn rejects_http_non_loopback() {
         let result = CloudBackend::new("key".into(), Some("http://example.com".into()));
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, GoveeError::InvalidConfig(_)));
         assert!(err.to_string().contains("HTTPS"));
+    }
+
+    #[test]
+    fn allows_http_loopback() {
+        assert!(CloudBackend::new("key".into(), Some("http://127.0.0.1:8080".into())).is_ok());
+        assert!(CloudBackend::new("key".into(), Some("http://localhost:8080".into())).is_ok());
     }
 
     #[test]
