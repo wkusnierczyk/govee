@@ -1,4 +1,4 @@
-# govee
+# `govee`
 
 A Rust library for controlling Govee smart lighting devices. Provides idiomatic async access to both the Govee cloud API (v1) and the local LAN API over UDP, a unified backend abstraction, device registry with name/alias resolution, and a scene system for multi-device presets.
 
