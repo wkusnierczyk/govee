@@ -301,3 +301,31 @@ async fn get_state_stale_when_offline() {
     assert!(!state.on);
     assert_eq!(state.brightness, 50);
 }
+
+#[tokio::test]
+async fn get_state_rate_limited() {
+    let server = MockServer::start().await;
+    let backend = backend_for(&server, "test-key");
+    populate_device_cache(&server, &backend).await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/devices/state"))
+        .and(header("Govee-API-Key", "test-key"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("Retry-After", "30")
+                .set_body_string("Too Many Requests"),
+        )
+        .mount(&server)
+        .await;
+
+    let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+    let result = backend.get_state(&id).await;
+
+    match result.unwrap_err() {
+        GoveeError::RateLimited { retry_after_secs } => {
+            assert_eq!(retry_after_secs, 30);
+        }
+        other => panic!("expected GoveeError::RateLimited, got: {other:?}"),
+    }
+}
