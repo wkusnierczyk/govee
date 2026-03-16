@@ -52,8 +52,10 @@ impl CloudBackend {
     /// Create a `CloudBackend` for testing with an arbitrary base URL.
     ///
     /// Skips HTTPS enforcement — intended for wiremock tests with `http://`
-    /// mock servers. Not part of the public API stability contract.
-    #[doc(hidden)]
+    /// mock servers.
+    ///
+    /// Only available when the `test-utils` feature is enabled.
+    #[cfg(feature = "test-utils")]
     pub fn new_for_testing(api_key: String, base_url: String) -> Self {
         let parsed = reqwest::Url::parse(&base_url).expect("test base URL must be valid");
         Self {

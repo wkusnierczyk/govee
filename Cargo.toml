@@ -9,6 +9,9 @@ repository = "https://github.com/wkusnierczyk/govee"
 keywords = ["govee", "smart-home", "iot", "lighting", "home-automation"]
 categories = ["api-bindings", "asynchronous"]
 
+[features]
+test-utils = []
+
 [dependencies]
 tokio = { version = "1.50", features = ["full"] }
 reqwest = { version = "0.13", features = ["json"] }
@@ -22,3 +25,4 @@ toml = "1.0"
 [dev-dependencies]
 wiremock = "0.6"
 tokio = { version = "1.50", features = ["test-util"] }
+govee = { path = ".", features = ["test-utils"] }
