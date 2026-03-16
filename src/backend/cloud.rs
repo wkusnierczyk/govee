@@ -1,5 +1,8 @@
+use std::time::Duration;
+
 use async_trait::async_trait;
 use reqwest::Client;
+use tracing::debug;
 
 use super::GoveeBackend;
 use crate::error::{GoveeError, Result};
@@ -8,31 +11,40 @@ use crate::types::{BackendType, Color, Device, DeviceId, DeviceState};
 /// Default base URL for the Govee cloud API.
 const DEFAULT_BASE_URL: &str = "https://developer-api.govee.com";
 
+/// Default request timeout.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Cloud API backend using the Govee v1 REST API.
 ///
 /// Authenticates via `Govee-API-Key` header. Base URL defaults to
 /// `https://developer-api.govee.com` but can be overridden for testing.
 pub struct CloudBackend {
     client: Client,
-    base_url: String,
+    base_url: reqwest::Url,
     api_key: String,
 }
 
 impl CloudBackend {
     /// Create a new `CloudBackend`.
     ///
-    /// Returns `GoveeError::InvalidConfig` if `base_url` does not use HTTPS.
+    /// Returns `GoveeError::InvalidConfig` if `base_url` is not a valid URL
+    /// or does not use HTTPS.
     pub fn new(api_key: String, base_url: Option<String>) -> Result<Self> {
-        let base_url = base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
-        if !base_url.starts_with("https://") {
+        let raw = base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
+        let parsed = reqwest::Url::parse(&raw)
+            .map_err(|e| GoveeError::InvalidConfig(format!("invalid base URL \"{raw}\": {e}")))?;
+        if parsed.scheme() != "https" {
             return Err(GoveeError::InvalidConfig(format!(
-                "base URL must use HTTPS, got: {}",
-                base_url
+                "base URL must use HTTPS, got: {raw}"
             )));
         }
+        let client = Client::builder()
+            .timeout(DEFAULT_TIMEOUT)
+            .build()
+            .map_err(|e| GoveeError::InvalidConfig(format!("failed to build HTTP client: {e}")))?;
         Ok(Self {
-            client: Client::new(),
-            base_url,
+            client,
+            base_url: parsed,
             api_key,
         })
     }
@@ -43,9 +55,13 @@ impl CloudBackend {
     /// mock servers. Not part of the public API stability contract.
     #[doc(hidden)]
     pub fn new_for_testing(api_key: String, base_url: String) -> Self {
+        let parsed = reqwest::Url::parse(&base_url).expect("test base URL must be valid");
         Self {
-            client: Client::new(),
-            base_url,
+            client: Client::builder()
+                .timeout(DEFAULT_TIMEOUT)
+                .build()
+                .expect("failed to build test HTTP client"),
+            base_url: parsed,
             api_key,
         }
     }
@@ -68,14 +84,15 @@ struct V1DevicesData {
 }
 
 /// A single device as returned by the v1 API.
+///
+/// Only fields we use are declared; extra API fields (`retrievable`,
+/// `supportCmds`, etc.) are silently ignored by serde.
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct V1Device {
     device: String,
     model: String,
     device_name: String,
-    #[allow(dead_code)]
-    controllable: bool,
 }
 
 impl V1Device {
@@ -94,20 +111,40 @@ impl V1Device {
     }
 }
 
+/// Parse the `Retry-After` header value as seconds.
+fn parse_retry_after(response: &reqwest::Response) -> u64 {
+    response
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(60)
+}
+
 #[async_trait]
 impl GoveeBackend for CloudBackend {
     async fn list_devices(&self) -> Result<Vec<Device>> {
-        let url = format!("{}/v1/devices", self.base_url);
+        let url = self
+            .base_url
+            .join("v1/devices")
+            .map_err(|e| GoveeError::InvalidConfig(format!("failed to build URL: {e}")))?;
         let response = self
             .client
-            .get(&url)
+            .get(url)
             .header("Govee-API-Key", &self.api_key)
             .send()
             .await?;
 
         let status = response.status();
+        if status.as_u16() == 429 {
+            let retry_after_secs = parse_retry_after(&response);
+            return Err(GoveeError::RateLimited { retry_after_secs });
+        }
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
             return Err(GoveeError::Api {
                 code: status.as_u16(),
                 message: body,
@@ -122,11 +159,15 @@ impl GoveeBackend for CloudBackend {
             });
         }
 
-        body.data
+        let devices: Vec<Device> = body
+            .data
             .devices
             .into_iter()
             .map(V1Device::into_domain)
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+
+        debug!(count = devices.len(), "listed cloud devices");
+        Ok(devices)
     }
 
     async fn get_state(&self, _id: &DeviceId) -> Result<DeviceState> {
@@ -161,7 +202,7 @@ impl GoveeBackend for CloudBackend {
 impl std::fmt::Debug for CloudBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CloudBackend")
-            .field("base_url", &self.base_url)
+            .field("base_url", &self.base_url.as_str())
             .field("api_key", &"[REDACTED]")
             .finish()
     }
@@ -181,6 +222,13 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_url() {
+        let result = CloudBackend::new("key".into(), Some("not a url".into()));
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), GoveeError::InvalidConfig(_)));
+    }
+
+    #[test]
     fn accepts_https_base_url() {
         let result = CloudBackend::new("key".into(), Some("https://example.com".into()));
         assert!(result.is_ok());
@@ -189,7 +237,14 @@ mod tests {
     #[test]
     fn default_base_url_is_https() {
         let backend = CloudBackend::new("key".into(), None).unwrap();
-        assert!(backend.base_url.starts_with("https://"));
+        assert_eq!(backend.base_url.scheme(), "https");
+    }
+
+    #[test]
+    fn trailing_slash_normalized() {
+        let backend = CloudBackend::new("key".into(), Some("https://example.com/".into())).unwrap();
+        let url = backend.base_url.join("v1/devices").unwrap();
+        assert_eq!(url.path(), "/v1/devices");
     }
 
     #[test]
@@ -206,7 +261,6 @@ mod tests {
             device: "AA:BB:CC:DD:EE:FF".into(),
             model: "H6076".into(),
             device_name: "Kitchen Light".into(),
-            controllable: true,
         };
         let device = v1.into_domain().unwrap();
         assert_eq!(device.id.as_str(), "AA:BB:CC:DD:EE:FF");
@@ -222,7 +276,6 @@ mod tests {
             device: "not-a-mac".into(),
             model: "H6076".into(),
             device_name: "Bad Device".into(),
-            controllable: true,
         };
         assert!(v1.into_domain().is_err());
     }

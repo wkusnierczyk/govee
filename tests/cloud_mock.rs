@@ -6,16 +6,10 @@ use govee::error::GoveeError;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-/// Helper: create a CloudBackend pointing at the mock server.
+/// Create a CloudBackend pointing at the mock server.
+///
+/// Uses `new_for_testing` because `CloudBackend::new` rejects non-HTTPS URLs.
 fn backend_for(server: &MockServer, api_key: &str) -> CloudBackend {
-    // CloudBackend::new rejects http://, so we use the test constructor.
-    // The test constructor is cfg(test) — available because this is a test binary
-    // that links against the crate. We need a public test helper instead.
-    //
-    // Since new_with_client is cfg(test) on the impl (not visible to integration
-    // tests), we use new() with a workaround: accept the mock server URL.
-    // Actually, we need to make the constructor accessible for integration tests.
-    // Let's use a different approach.
     CloudBackend::new_for_testing(api_key.to_string(), server.uri())
 }
 
@@ -70,6 +64,7 @@ async fn list_devices_auth_failure() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/v1/devices"))
+        .and(header("Govee-API-Key", "bad-key"))
         .respond_with(ResponseTemplate::new(401).set_body_string("Unauthorized"))
         .mount(&server)
         .await;
@@ -93,6 +88,7 @@ async fn list_devices_malformed_response() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/v1/devices"))
+        .and(header("Govee-API-Key", "test-key"))
         .respond_with(
             ResponseTemplate::new(200).set_body_raw("{not valid json", "application/json"),
         )
@@ -118,6 +114,7 @@ async fn list_devices_empty() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/v1/devices"))
+        .and(header("Govee-API-Key", "test-key"))
         .respond_with(ResponseTemplate::new(200).set_body_raw(response, "application/json"))
         .mount(&server)
         .await;
@@ -138,6 +135,7 @@ async fn list_devices_api_error_code_in_body() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/v1/devices"))
+        .and(header("Govee-API-Key", "test-key"))
         .respond_with(ResponseTemplate::new(200).set_body_raw(response, "application/json"))
         .mount(&server)
         .await;
@@ -152,5 +150,52 @@ async fn list_devices_api_error_code_in_body() {
             assert_eq!(message, "Invalid API key");
         }
         other => panic!("expected GoveeError::Api, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn list_devices_rate_limited() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/devices"))
+        .and(header("Govee-API-Key", "test-key"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("Retry-After", "120")
+                .set_body_string("Too Many Requests"),
+        )
+        .mount(&server)
+        .await;
+
+    let backend = backend_for(&server, "test-key");
+    let result = backend.list_devices().await;
+
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        GoveeError::RateLimited { retry_after_secs } => {
+            assert_eq!(retry_after_secs, 120);
+        }
+        other => panic!("expected GoveeError::RateLimited, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn list_devices_rate_limited_no_header() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/devices"))
+        .and(header("Govee-API-Key", "test-key"))
+        .respond_with(ResponseTemplate::new(429).set_body_string("Too Many Requests"))
+        .mount(&server)
+        .await;
+
+    let backend = backend_for(&server, "test-key");
+    let result = backend.list_devices().await;
+
+    match result.unwrap_err() {
+        GoveeError::RateLimited { retry_after_secs } => {
+            assert_eq!(retry_after_secs, 60); // default fallback
+        }
+        other => panic!("expected GoveeError::RateLimited, got: {other:?}"),
     }
 }
