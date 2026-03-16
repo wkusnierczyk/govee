@@ -27,6 +27,8 @@ const MULTICAST_ADDR: Ipv4Addr = Ipv4Addr::new(239, 255, 255, 250);
 const LISTEN_PORT: u16 = 4002;
 /// Port the device listens on for commands.
 const DEVICE_PORT: u16 = 4001;
+/// Port the device listens on for status queries.
+const STATUS_PORT: u16 = 4003;
 
 /// A device discovered via the Govee LAN protocol.
 struct DiscoveredDevice {
@@ -43,8 +45,7 @@ struct DiscoveredDevice {
 pub struct LocalBackend {
     send_socket: UdpSocket,
     devices: Arc<RwLock<HashMap<DeviceId, DiscoveredDevice>>>,
-    /// Used by Wave 2 command methods (get_state, etc.) to receive responses.
-    #[allow(dead_code)]
+    /// Used by command methods (get_state, etc.) to receive responses.
     pending_state: Arc<Mutex<HashMap<IpAddr, oneshot::Sender<DeviceState>>>>,
     cancel: CancellationToken,
     receiver_handle: JoinHandle<()>,
@@ -362,8 +363,56 @@ impl GoveeBackend for LocalBackend {
         Ok(result)
     }
 
-    async fn get_state(&self, _id: &DeviceId) -> Result<DeviceState> {
-        Err(GoveeError::NotImplemented("LocalBackend::get_state".into()))
+    async fn get_state(&self, id: &DeviceId) -> Result<DeviceState> {
+        let ip = self.get_device_ip(id)?;
+
+        // Validate IP is a local address.
+        match ip {
+            IpAddr::V4(v4) if v4.is_private() || v4.is_link_local() || v4.is_loopback() => {}
+            IpAddr::V6(v6) if v6.is_loopback() => {}
+            _ => {
+                return Err(GoveeError::InvalidConfig(
+                    "device IP is not a local address".into(),
+                ));
+            }
+        }
+
+        let (tx, rx) = oneshot::channel();
+
+        // Insert the sender into pending_state keyed by the device IP.
+        self.pending_state.lock().await.insert(ip, tx);
+
+        // Send devStatus request to the device on port 4003.
+        let status_msg = r#"{"msg":{"cmd":"devStatus","data":{}}}"#;
+        let target: SocketAddr = (ip, STATUS_PORT).into();
+        if let Err(e) = self
+            .send_socket
+            .send_to(status_msg.as_bytes(), target)
+            .await
+        {
+            self.pending_state.lock().await.remove(&ip);
+            return Err(e.into());
+        }
+
+        // Await the response with timeout.
+        match tokio::time::timeout(self.discovery_timeout, rx).await {
+            Ok(Ok(state)) => {
+                // Success — entry already removed by the receiver task.
+                Ok(state)
+            }
+            Ok(Err(_)) => {
+                // Sender was dropped (receiver task stopped).
+                self.pending_state.lock().await.remove(&ip);
+                Err(GoveeError::BackendUnavailable(
+                    "receiver task stopped".into(),
+                ))
+            }
+            Err(_) => {
+                // Timeout — clean up the pending entry.
+                self.pending_state.lock().await.remove(&ip);
+                Err(GoveeError::DiscoveryTimeout)
+            }
+        }
     }
 
     async fn set_power(&self, id: &DeviceId, on: bool) -> Result<()> {
@@ -709,5 +758,23 @@ mod tests {
         assert!(!public.is_private());
         assert!(!public.is_link_local());
         assert!(!public.is_loopback());
+    }
+
+    #[tokio::test]
+    async fn get_state_requires_cached_device() {
+        let backend = LocalBackend::new(Duration::from_millis(50), 60).await;
+        if backend.is_err() {
+            eprintln!("skipping get_state_requires_cached_device: port 4002 in use");
+            return;
+        }
+        let backend = backend.unwrap();
+        let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+
+        // No discovery has been done, so the device is not in the cache.
+        let result = backend.get_state(&id).await;
+        assert!(
+            matches!(result, Err(GoveeError::DeviceNotFound(_))),
+            "expected DeviceNotFound, got: {result:?}"
+        );
     }
 }
