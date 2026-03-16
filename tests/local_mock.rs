@@ -94,7 +94,7 @@ async fn udp_loopback_discovery() {
 
     // get_device_ip should return the IP from the scan response.
     let id = govee::types::DeviceId::new("AA:BB:CC:DD:EE:FF:00:11").unwrap();
-    let ip = backend.get_device_ip(&id).unwrap();
+    let ip = backend.get_device_ip(&id).await.unwrap();
     assert_eq!(ip, std::net::IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
 
     drop(backend);

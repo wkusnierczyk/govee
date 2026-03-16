@@ -21,6 +21,22 @@ fn json_error(msg: &str) -> GoveeError {
     GoveeError::Json(serde_json::Error::custom(msg))
 }
 
+/// Validate that an IP address is local (private, link-local, or loopback).
+///
+/// Returns `GoveeError::InvalidConfig` if the address is not local.
+fn validate_local_ip(ip: IpAddr) -> Result<()> {
+    let is_local = match ip {
+        IpAddr::V4(v4) => v4.is_private() || v4.is_link_local() || v4.is_loopback(),
+        IpAddr::V6(v6) => v6.is_loopback(),
+    };
+    if !is_local {
+        return Err(GoveeError::InvalidConfig(
+            "device IP is not a local address".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Multicast group used by Govee LAN protocol for discovery.
 const MULTICAST_ADDR: Ipv4Addr = Ipv4Addr::new(239, 255, 255, 250);
 /// Port the device sends responses to (we listen on this).
@@ -60,6 +76,16 @@ impl LocalBackend {
     /// background receiver task. `discovery_timeout` controls how long
     /// `discover()` waits after sending a scan. `discovery_interval_secs`
     /// determines the device TTL (3x the interval).
+    ///
+    /// # Platform note
+    ///
+    /// `SO_REUSEADDR` is set on the receive socket so that the library can
+    /// co-exist with other processes **on platforms where `SO_REUSEADDR`
+    /// actually prevents dual-bind conflicts** (Linux). On macOS and some
+    /// BSDs, `SO_REUSEADDR` silently allows two sockets to bind to the
+    /// same port, so the `AddrInUse` detection below may not trigger.
+    /// A future improvement could use `SO_REUSEPORT` probing or an
+    /// advisory lock file for more reliable conflict detection.
     pub async fn new(discovery_timeout: Duration, discovery_interval_secs: u64) -> Result<Self> {
         // Build receive socket via socket2 for SO_REUSEADDR + multicast join.
         let recv_socket = {
@@ -136,18 +162,8 @@ impl LocalBackend {
     /// Validates that the device IP is a local address (private, link-local,
     /// or loopback) before sending.
     async fn send_command(&self, id: &DeviceId, payload: serde_json::Value) -> Result<()> {
-        let ip = self.get_device_ip(id)?;
-
-        // Safety check: only send to local addresses.
-        let is_local = match ip {
-            IpAddr::V4(v4) => v4.is_private() || v4.is_link_local() || v4.is_loopback(),
-            IpAddr::V6(v6) => v6.is_loopback(),
-        };
-        if !is_local {
-            return Err(GoveeError::InvalidConfig(
-                "device IP is not a local address".into(),
-            ));
-        }
+        let ip = self.get_device_ip(id).await?;
+        validate_local_ip(ip)?;
 
         let bytes = serde_json::to_vec(&payload)?;
         self.send_socket.send_to(&bytes, (ip, 4003)).await?;
@@ -157,19 +173,8 @@ impl LocalBackend {
     }
 
     /// Look up the IP address of a discovered device.
-    pub fn get_device_ip(&self, id: &DeviceId) -> Result<IpAddr> {
-        // Using std RwLock–style try_read would be wrong here since we hold
-        // a tokio RwLock. However, `get_device_ip` is sync. We use
-        // `blocking_read` which is safe as long as it's not called from an
-        // async context where the lock is also acquired asynchronously.
-        // In practice the callers (Wave 2 command methods) will use the
-        // async version; this is a convenience for sync contexts.
-        //
-        // For now, we use try_read to avoid blocking.
-        let guard = self
-            .devices
-            .try_read()
-            .map_err(|_| GoveeError::BackendUnavailable("device cache lock contention".into()))?;
+    pub async fn get_device_ip(&self, id: &DeviceId) -> Result<IpAddr> {
+        let guard = self.devices.read().await;
         guard
             .get(id)
             .map(|d| d.ip)
@@ -347,40 +352,40 @@ impl GoveeBackend for LocalBackend {
         let now = Instant::now();
         cache.retain(|_, d| now.duration_since(d.last_seen) <= self.device_ttl);
 
+        // LAN discovery does not provide user-assigned device names — only
+        // the SKU/model string. User-friendly names are merged from the
+        // cloud backend in milestone M5.
         let mut result = Vec::new();
         for d in cache.values() {
-            if let Ok(id) = DeviceId::new(d.device_id.as_str()) {
-                result.push(Device {
-                    id,
-                    model: d.sku.clone(),
-                    name: d.sku.clone(),
-                    alias: None,
-                    backend: BackendType::Local,
-                });
-            }
+            result.push(Device {
+                id: d.device_id.clone(),
+                model: d.sku.clone(),
+                name: d.sku.clone(),
+                alias: None,
+                backend: BackendType::Local,
+            });
         }
 
         Ok(result)
     }
 
     async fn get_state(&self, id: &DeviceId) -> Result<DeviceState> {
-        let ip = self.get_device_ip(id)?;
-
-        // Validate IP is a local address.
-        match ip {
-            IpAddr::V4(v4) if v4.is_private() || v4.is_link_local() || v4.is_loopback() => {}
-            IpAddr::V6(v6) if v6.is_loopback() => {}
-            _ => {
-                return Err(GoveeError::InvalidConfig(
-                    "device IP is not a local address".into(),
-                ));
-            }
-        }
+        let ip = self.get_device_ip(id).await?;
+        validate_local_ip(ip)?;
 
         let (tx, rx) = oneshot::channel();
 
         // Insert the sender into pending_state keyed by the device IP.
-        self.pending_state.lock().await.insert(ip, tx);
+        // Reject if a concurrent query is already in progress for this IP.
+        {
+            let mut pending = self.pending_state.lock().await;
+            if pending.contains_key(&ip) {
+                return Err(GoveeError::BackendUnavailable(
+                    "concurrent state query already in progress for this device".into(),
+                ));
+            }
+            pending.insert(ip, tx);
+        }
 
         // Send devStatus request to the device on port 4003.
         let status_msg = r#"{"msg":{"cmd":"devStatus","data":{}}}"#;
@@ -439,6 +444,11 @@ impl GoveeBackend for LocalBackend {
         self.send_command(id, payload).await
     }
 
+    /// Set the device color via the LAN `colorwc` command.
+    ///
+    /// The Govee LAN protocol bundles color and color temperature into a
+    /// single `colorwc` command. Setting the RGB color resets the color
+    /// temperature to 0 (disabled).
     async fn set_color(&self, id: &DeviceId, color: Color) -> Result<()> {
         let payload = serde_json::json!({
             "msg": {
@@ -452,6 +462,11 @@ impl GoveeBackend for LocalBackend {
         self.send_command(id, payload).await
     }
 
+    /// Set the device color temperature via the LAN `colorwc` command.
+    ///
+    /// The Govee LAN protocol bundles color and color temperature into a
+    /// single `colorwc` command. Setting the color temperature resets the
+    /// RGB color to (0, 0, 0) (disabled).
     async fn set_color_temp(&self, id: &DeviceId, kelvin: u32) -> Result<()> {
         if kelvin == 0 {
             return Err(GoveeError::InvalidConfig(
