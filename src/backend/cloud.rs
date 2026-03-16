@@ -96,6 +96,54 @@ impl CloudBackend {
         })
     }
 
+    /// Send a control command to a device via `PUT /v1/devices/control`.
+    ///
+    /// Parses the response body for API-level errors (HTTP 200 with
+    /// `code != 200` in the JSON envelope).
+    async fn send_control(
+        &self,
+        id: &DeviceId,
+        cmd_name: &str,
+        cmd_value: serde_json::Value,
+    ) -> Result<()> {
+        let model = self.get_model(id)?;
+        let url = self
+            .base_url
+            .join("v1/devices/control")
+            .map_err(|e| GoveeError::InvalidConfig(format!("failed to build URL: {e}")))?;
+
+        let payload = serde_json::json!({
+            "device": id.as_str(),
+            "model": model,
+            "cmd": {
+                "name": cmd_name,
+                "value": cmd_value,
+            }
+        });
+
+        let response = self
+            .client
+            .put(url)
+            .header("Govee-API-Key", &self.api_key)
+            .json(&payload)
+            .send()
+            .await?;
+
+        let response = self.check_response(response).await?;
+
+        // Check API-level error code in response body.
+        let body: V1ControlResponse = response.json().await?;
+        if body.code != 200 {
+            return Err(GoveeError::Api {
+                code: body.code,
+                message: body.message,
+            });
+        }
+
+        debug!(device = %id, cmd = cmd_name, "sent control command");
+        Ok(())
+    }
+
     /// Check an HTTP response for rate limiting and error status codes.
     ///
     /// Returns the response unchanged on success (2xx). For 429, returns
@@ -222,6 +270,13 @@ fn build_state_from_properties(properties: Vec<serde_json::Value>) -> Result<Dev
     DeviceState::new(on, brightness, color, color_temp, !online)
 }
 
+/// Response envelope from `PUT /v1/devices/control`.
+#[derive(serde::Deserialize)]
+struct V1ControlResponse {
+    code: u16,
+    message: String,
+}
+
 /// Parse the `Retry-After` header value as seconds.
 fn parse_retry_after(response: &reqwest::Response) -> u64 {
     response
@@ -316,24 +371,41 @@ impl GoveeBackend for CloudBackend {
         Ok(state)
     }
 
-    async fn set_power(&self, _id: &DeviceId, _on: bool) -> Result<()> {
-        Err(GoveeError::NotImplemented("CloudBackend::set_power".into()))
+    async fn set_power(&self, id: &DeviceId, on: bool) -> Result<()> {
+        let value = if on { "on" } else { "off" };
+        self.send_control(id, "turn", serde_json::json!(value))
+            .await
     }
 
-    async fn set_brightness(&self, _id: &DeviceId, _value: u8) -> Result<()> {
-        Err(GoveeError::NotImplemented(
-            "CloudBackend::set_brightness".into(),
-        ))
+    async fn set_brightness(&self, id: &DeviceId, value: u8) -> Result<()> {
+        if value > 100 {
+            return Err(GoveeError::InvalidBrightness(value));
+        }
+        self.send_control(id, "brightness", serde_json::json!(value))
+            .await
     }
 
-    async fn set_color(&self, _id: &DeviceId, _color: Color) -> Result<()> {
-        Err(GoveeError::NotImplemented("CloudBackend::set_color".into()))
+    async fn set_color(&self, id: &DeviceId, color: Color) -> Result<()> {
+        self.send_control(
+            id,
+            "color",
+            serde_json::json!({"r": color.r, "g": color.g, "b": color.b}),
+        )
+        .await
     }
 
-    async fn set_color_temp(&self, _id: &DeviceId, _kelvin: u32) -> Result<()> {
-        Err(GoveeError::NotImplemented(
-            "CloudBackend::set_color_temp".into(),
-        ))
+    /// Set color temperature in Kelvin.
+    ///
+    /// No device-specific range validation — the Govee API rejects
+    /// unsupported values. We only reject `0` as physically meaningless.
+    async fn set_color_temp(&self, id: &DeviceId, kelvin: u32) -> Result<()> {
+        if kelvin == 0 {
+            return Err(GoveeError::InvalidConfig(
+                "color temperature must be > 0K".into(),
+            ));
+        }
+        self.send_control(id, "colorTem", serde_json::json!(kelvin))
+            .await
     }
 
     fn backend_type(&self) -> BackendType {
