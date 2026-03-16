@@ -26,6 +26,9 @@ pub enum GoveeError {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
+    #[error("config error: {0}")]
+    Config(#[from] toml::de::Error),
+
     #[error("not implemented: {0}")]
     NotImplemented(String),
 
