@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use reqwest::Client;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::GoveeBackend;
 use crate::error::{GoveeError, Result};
@@ -169,6 +169,7 @@ impl CloudBackend {
         let status = response.status();
         if status.as_u16() == 429 {
             let retry_after_secs = parse_retry_after(&response);
+            warn!(retry_after_secs, "rate limited by Govee API");
             return Err(GoveeError::RateLimited { retry_after_secs });
         }
         if !status.is_success() {
