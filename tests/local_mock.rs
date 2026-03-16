@@ -57,7 +57,7 @@ async fn udp_loopback_discovery() {
     let backend = backend.expect("LocalBackend should bind");
 
     // Send a fake scan response directly to the listen port on loopback.
-    let sender = tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0u16))
+    let sender = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0u16))
         .await
         .unwrap();
 
@@ -155,7 +155,7 @@ async fn set_brightness_rejects_invalid_value() {
     let backend = backend.unwrap();
 
     // Inject a fake device at 127.0.0.1 via scan response.
-    let sender = tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0u16))
+    let sender = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0u16))
         .await
         .unwrap();
 
@@ -201,7 +201,7 @@ async fn udp_loopback_state_query() {
     let backend = backend.expect("LocalBackend should bind");
 
     // First, inject a fake device into the cache via a scan response.
-    let sender = tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0u16))
+    let sender = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0u16))
         .await
         .unwrap();
 
@@ -255,7 +255,7 @@ async fn udp_loopback_state_query() {
 
             let resp = serde_json::to_vec(&status_response).unwrap();
             // Send response to the backend's listen port.
-            let reply_socket = tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0u16))
+            let reply_socket = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0u16))
                 .await
                 .unwrap();
             reply_socket
@@ -292,7 +292,7 @@ async fn set_color_temp_rejects_zero() {
 
     let backend = backend.unwrap();
 
-    let sender = tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0u16))
+    let sender = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0u16))
         .await
         .unwrap();
 
@@ -337,7 +337,7 @@ async fn get_state_timeout() {
     let backend = backend.expect("LocalBackend should bind");
 
     // Inject a fake device into the cache.
-    let sender = tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0u16))
+    let sender = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0u16))
         .await
         .unwrap();
 
@@ -399,7 +399,7 @@ async fn udp_loopback_set_power() {
     };
 
     // Inject a fake device at 127.0.0.1.
-    let sender = tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0u16))
+    let sender = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0u16))
         .await
         .unwrap();
     let scan_response = serde_json::json!({
@@ -460,7 +460,7 @@ async fn udp_loopback_set_brightness() {
         }
     };
 
-    let sender = tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0u16))
+    let sender = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0u16))
         .await
         .unwrap();
     let scan_response = serde_json::json!({
@@ -520,7 +520,7 @@ async fn udp_loopback_set_color() {
         }
     };
 
-    let sender = tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0u16))
+    let sender = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0u16))
         .await
         .unwrap();
     let scan_response = serde_json::json!({
@@ -586,7 +586,7 @@ async fn udp_loopback_set_color_temp() {
         }
     };
 
-    let sender = tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0u16))
+    let sender = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0u16))
         .await
         .unwrap();
     let scan_response = serde_json::json!({
