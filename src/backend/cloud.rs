@@ -97,6 +97,9 @@ impl CloudBackend {
     }
 
     /// Send a control command to a device via `PUT /v1/devices/control`.
+    ///
+    /// Parses the response body for API-level errors (HTTP 200 with
+    /// `code != 200` in the JSON envelope).
     async fn send_control(
         &self,
         id: &DeviceId,
@@ -126,7 +129,17 @@ impl CloudBackend {
             .send()
             .await?;
 
-        self.check_response(response).await?;
+        let response = self.check_response(response).await?;
+
+        // Check API-level error code in response body.
+        let body: V1ControlResponse = response.json().await?;
+        if body.code != 200 {
+            return Err(GoveeError::Api {
+                code: body.code,
+                message: body.message,
+            });
+        }
+
         debug!(device = %id, cmd = cmd_name, "sent control command");
         Ok(())
     }
@@ -257,6 +270,13 @@ fn build_state_from_properties(properties: Vec<serde_json::Value>) -> Result<Dev
     DeviceState::new(on, brightness, color, color_temp, !online)
 }
 
+/// Response envelope from `PUT /v1/devices/control`.
+#[derive(serde::Deserialize)]
+struct V1ControlResponse {
+    code: u16,
+    message: String,
+}
+
 /// Parse the `Retry-After` header value as seconds.
 fn parse_retry_after(response: &reqwest::Response) -> u64 {
     response
@@ -374,7 +394,16 @@ impl GoveeBackend for CloudBackend {
         .await
     }
 
+    /// Set color temperature in Kelvin.
+    ///
+    /// No device-specific range validation — the Govee API rejects
+    /// unsupported values. We only reject `0` as physically meaningless.
     async fn set_color_temp(&self, id: &DeviceId, kelvin: u32) -> Result<()> {
+        if kelvin == 0 {
+            return Err(GoveeError::InvalidConfig(
+                "color temperature must be > 0K".into(),
+            ));
+        }
         self.send_control(id, "colorTem", serde_json::json!(kelvin))
             .await
     }
