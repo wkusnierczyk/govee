@@ -1,4 +1,8 @@
 //! Integration tests for the local LAN backend (UDP loopback).
+//!
+//! These tests bind to fixed ports (4002, 4003) and may skip when those ports
+//! are already in use. Running tests in parallel can cause port contention;
+//! see [#67](https://github.com/wkusnierczyk/govee/issues/67) for details.
 
 use std::net::Ipv4Addr;
 use std::time::Duration;
@@ -100,8 +104,8 @@ async fn udp_loopback_discovery() {
     drop(backend);
 }
 
-/// Test that get_state still returns NotImplemented, and control commands
-/// return DeviceNotFound when the device is not in the cache.
+/// Test that get_state returns DeviceNotFound for an uncached device, and
+/// control commands also return DeviceNotFound when the device is not in the cache.
 #[tokio::test]
 async fn stub_and_control_errors_without_device() {
     let backend = LocalBackend::new(Duration::from_millis(100), 10).await;

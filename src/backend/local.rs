@@ -23,6 +23,10 @@ fn json_error(msg: &str) -> GoveeError {
 
 /// Validate that an IP address is local (private, link-local, or loopback).
 ///
+/// For IPv4, accepts private (RFC 1918), link-local (169.254.x.x), and
+/// loopback (127.x.x.x) addresses. For IPv6, only loopback (::1) is
+/// accepted since Govee devices don't use IPv6.
+///
 /// Returns `GoveeError::InvalidConfig` if the address is not local.
 fn validate_local_ip(ip: IpAddr) -> Result<()> {
     let is_local = match ip {
@@ -41,10 +45,10 @@ fn validate_local_ip(ip: IpAddr) -> Result<()> {
 const MULTICAST_ADDR: Ipv4Addr = Ipv4Addr::new(239, 255, 255, 250);
 /// Port the device sends responses to (we listen on this).
 const LISTEN_PORT: u16 = 4002;
-/// Port the device listens on for commands.
-const DEVICE_PORT: u16 = 4001;
-/// Port the device listens on for status queries.
-const STATUS_PORT: u16 = 4003;
+/// Port used for multicast discovery scan requests.
+const MULTICAST_PORT: u16 = 4001;
+/// Port the device listens on for commands and status queries.
+const COMMAND_PORT: u16 = 4003;
 
 /// A device discovered via the Govee LAN protocol.
 struct DiscoveredDevice {
@@ -94,6 +98,7 @@ impl LocalBackend {
                 socket2::Type::DGRAM,
                 Some(socket2::Protocol::UDP),
             )?;
+            // See constructor doc comment for platform limitations of SO_REUSEADDR.
             socket.set_reuse_address(true)?;
 
             let bind_addr: SocketAddr = (Ipv4Addr::UNSPECIFIED, LISTEN_PORT).into();
@@ -149,7 +154,7 @@ impl LocalBackend {
     /// Send a multicast scan request and wait for responses.
     pub async fn discover(&self) -> Result<()> {
         let scan_msg = r#"{"msg":{"cmd":"scan","data":{"account_topic":"reserve"}}}"#;
-        let target: SocketAddr = (MULTICAST_ADDR, DEVICE_PORT).into();
+        let target: SocketAddr = (MULTICAST_ADDR, MULTICAST_PORT).into();
         self.send_socket
             .send_to(scan_msg.as_bytes(), target)
             .await?;
@@ -260,7 +265,6 @@ async fn handle_scan_response(
     source_ip: IpAddr,
     devices: &Arc<RwLock<HashMap<DeviceId, DiscoveredDevice>>>,
 ) -> Result<()> {
-    let ip_str = data.get("ip").and_then(|v| v.as_str());
     let device_mac = data
         .get("device")
         .and_then(|v| v.as_str())
@@ -270,8 +274,19 @@ async fn handle_scan_response(
         .and_then(|v| v.as_str())
         .ok_or_else(|| json_error("missing 'sku' in scan"))?;
 
-    // Use the IP from the data field if present, otherwise fall back to source.
-    let ip: IpAddr = ip_str.and_then(|s| s.parse().ok()).unwrap_or(source_ip);
+    // Always use the UDP source IP as the device address to prevent a
+    // spoofed JSON `ip` field from injecting a wrong address. Log the
+    // payload IP for diagnostics if it differs.
+    let ip = source_ip;
+    if let Some(payload_ip) = data.get("ip").and_then(|v| v.as_str())
+        && payload_ip.parse::<IpAddr>().ok().as_ref() != Some(&source_ip)
+    {
+        tracing::debug!(
+            "scan response payload ip ({}) differs from source ({}), using source",
+            payload_ip,
+            source_ip,
+        );
+    }
 
     let device_id = DeviceId::new(device_mac)?;
 
@@ -322,10 +337,13 @@ fn parse_dev_status(data: &serde_json::Value) -> Result<DeviceState> {
         Color::new(0, 0, 0)
     };
 
+    // Treat 0 as absent (consistent with set_color_temp rejecting 0).
+    // Values that overflow u32 are also treated as absent (invalid data).
     let color_temp = data
         .get("colorTemInKelvin")
         .and_then(|v| v.as_u64())
-        .map(|v| u32::try_from(v).unwrap_or(u32::MAX));
+        .and_then(|v| u32::try_from(v).ok())
+        .filter(|&v| v > 0);
 
     DeviceState::new(on, brightness, color, color_temp, false)
 }
@@ -389,7 +407,7 @@ impl GoveeBackend for LocalBackend {
 
         // Send devStatus request to the device on port 4003.
         let status_msg = r#"{"msg":{"cmd":"devStatus","data":{}}}"#;
-        let target: SocketAddr = (ip, STATUS_PORT).into();
+        let target: SocketAddr = (ip, COMMAND_PORT).into();
         if let Err(e) = self
             .send_socket
             .send_to(status_msg.as_bytes(), target)
@@ -576,6 +594,8 @@ mod tests {
         let state = parse_dev_status(&json).unwrap();
         assert!(!state.on);
         assert_eq!(state.brightness, 50);
+        // colorTemInKelvin: 0 is treated as absent (consistent with set_color_temp rejecting 0).
+        assert_eq!(state.color_temp_kelvin, None);
     }
 
     #[test]
@@ -775,6 +795,10 @@ mod tests {
         assert!(!public.is_loopback());
     }
 
+    // Note: this test binds port 4002 and can conflict with integration tests
+    // or other unit tests running in parallel. It could be restructured to not
+    // need the real port (it only tests cache lookup, not UDP), but for now we
+    // skip gracefully when the port is busy.
     #[tokio::test]
     async fn get_state_requires_cached_device() {
         let backend = LocalBackend::new(Duration::from_millis(50), 60).await;
