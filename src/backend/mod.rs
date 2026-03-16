@@ -41,11 +41,13 @@ mod tests {
 
     /// A configurable mock backend for testing trait consumers.
     ///
-    /// Responses are set via closures. Unset methods return
-    /// `GoveeError::NotImplemented`.
+    /// Devices and state are set via builder methods. `get_state` returns
+    /// `DeviceNotFound` when no state is configured. Setter methods always
+    /// return `Ok(())`.
     struct MockBackend {
         devices: Vec<Device>,
         state: Option<DeviceState>,
+        backend_type: BackendType,
     }
 
     impl MockBackend {
@@ -53,6 +55,7 @@ mod tests {
             Self {
                 devices: Vec::new(),
                 state: None,
+                backend_type: BackendType::Cloud,
             }
         }
 
@@ -63,6 +66,11 @@ mod tests {
 
         fn with_state(mut self, state: DeviceState) -> Self {
             self.state = Some(state);
+            self
+        }
+
+        fn with_backend_type(mut self, backend_type: BackendType) -> Self {
+            self.backend_type = backend_type;
             self
         }
     }
@@ -96,7 +104,7 @@ mod tests {
         }
 
         fn backend_type(&self) -> BackendType {
-            BackendType::Cloud
+            self.backend_type
         }
     }
 
@@ -160,9 +168,15 @@ mod tests {
     }
 
     #[test]
-    fn mock_backend_type() {
+    fn mock_backend_type_default_cloud() {
         let mock = MockBackend::new();
         assert_eq!(mock.backend_type(), BackendType::Cloud);
+    }
+
+    #[test]
+    fn mock_backend_type_configurable() {
+        let mock = MockBackend::new().with_backend_type(BackendType::Local);
+        assert_eq!(mock.backend_type(), BackendType::Local);
     }
 
     #[tokio::test]
