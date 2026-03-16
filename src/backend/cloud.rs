@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::sync::RwLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -18,10 +20,17 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 ///
 /// Authenticates via `Govee-API-Key` header. Base URL defaults to
 /// `https://developer-api.govee.com` but can be overridden for testing.
+///
+/// **Note:** `std::sync::RwLock` is used for the device cache because the
+/// lock is held only for brief HashMap lookups/swaps and never across
+/// `.await` points. This avoids the overhead of `tokio::sync::RwLock`.
 pub struct CloudBackend {
     client: Client,
     base_url: reqwest::Url,
     api_key: String,
+    /// Device ID → model mapping, populated by `list_devices`.
+    /// Required because `GET /v1/devices/state` needs both `device` and `model`.
+    device_models: RwLock<HashMap<DeviceId, String>>,
 }
 
 impl CloudBackend {
@@ -46,6 +55,7 @@ impl CloudBackend {
             client,
             base_url: parsed,
             api_key,
+            device_models: RwLock::new(HashMap::new()),
         })
     }
 
@@ -65,7 +75,48 @@ impl CloudBackend {
                 .expect("failed to build test HTTP client"),
             base_url: parsed,
             api_key,
+            device_models: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Look up the model for a device ID from the internal cache.
+    ///
+    /// Returns `DeviceNotFound` if the device is not cached.
+    /// Call `list_devices` first to populate the cache.
+    fn get_model(&self, id: &DeviceId) -> Result<String> {
+        let models = self
+            .device_models
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        models.get(id).cloned().ok_or_else(|| {
+            GoveeError::DeviceNotFound(format!(
+                "{} (call list_devices first to populate the device cache)",
+                id
+            ))
+        })
+    }
+
+    /// Check an HTTP response for rate limiting and error status codes.
+    ///
+    /// Returns the response unchanged on success (2xx). For 429, returns
+    /// `RateLimited`. For other non-2xx, returns `Api` with the response body.
+    async fn check_response(&self, response: reqwest::Response) -> Result<reqwest::Response> {
+        let status = response.status();
+        if status.as_u16() == 429 {
+            let retry_after_secs = parse_retry_after(&response);
+            return Err(GoveeError::RateLimited { retry_after_secs });
+        }
+        if !status.is_success() {
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+            return Err(GoveeError::Api {
+                code: status.as_u16(),
+                message: body,
+            });
+        }
+        Ok(response)
     }
 }
 
@@ -113,6 +164,64 @@ impl V1Device {
     }
 }
 
+/// Top-level response envelope from `GET /v1/devices/state`.
+#[derive(serde::Deserialize)]
+struct V1StateResponse {
+    data: V1StateData,
+    code: u16,
+    message: String,
+}
+
+/// The `data` field inside a v1 state response.
+///
+/// Only `properties` is used; `device` and `model` echo back the request
+/// params and are ignored by serde's default permissive parsing.
+#[derive(serde::Deserialize)]
+struct V1StateData {
+    properties: Vec<serde_json::Value>,
+}
+
+/// Build a `DeviceState` from the v1 property array.
+///
+/// The v1 API returns state as `[{"online": true}, {"powerState": "on"}, ...]`
+/// — each element is a JSON object with a single key. We parse each as a
+/// `serde_json::Value` map and extract known keys.
+///
+/// Values are clamped to valid ranges before construction:
+/// - brightness: clamped to 0–100 on the u64 before cast
+/// - color components: clamped to 0–255 on the u64 before cast
+/// - colorTem: clamped to u32::MAX via saturating conversion
+fn build_state_from_properties(properties: Vec<serde_json::Value>) -> Result<DeviceState> {
+    let mut on = false;
+    let mut brightness: u8 = 0;
+    let mut color = Color::new(0, 0, 0);
+    let mut color_temp: Option<u32> = None;
+    let mut online = true;
+
+    for prop in properties {
+        if let Some(v) = prop.get("online").and_then(|v| v.as_bool()) {
+            online = v;
+        }
+        if let Some(v) = prop.get("powerState").and_then(|v| v.as_str()) {
+            on = v == "on";
+        }
+        if let Some(v) = prop.get("brightness").and_then(|v| v.as_u64()) {
+            brightness = v.min(100) as u8;
+        }
+        if let Some(obj) = prop.get("color").and_then(|v| v.as_object()) {
+            let r = obj.get("r").and_then(|v| v.as_u64()).unwrap_or(0).min(255) as u8;
+            let g = obj.get("g").and_then(|v| v.as_u64()).unwrap_or(0).min(255) as u8;
+            let b = obj.get("b").and_then(|v| v.as_u64()).unwrap_or(0).min(255) as u8;
+            color = Color::new(r, g, b);
+        }
+        if let Some(v) = prop.get("colorTem").and_then(|v| v.as_u64()) {
+            color_temp = Some(u32::try_from(v).unwrap_or(u32::MAX));
+        }
+    }
+
+    DeviceState::new(on, brightness, color, color_temp, !online)
+}
+
 /// Parse the `Retry-After` header value as seconds.
 fn parse_retry_after(response: &reqwest::Response) -> u64 {
     response
@@ -137,21 +246,7 @@ impl GoveeBackend for CloudBackend {
             .send()
             .await?;
 
-        let status = response.status();
-        if status.as_u16() == 429 {
-            let retry_after_secs = parse_retry_after(&response);
-            return Err(GoveeError::RateLimited { retry_after_secs });
-        }
-        if !status.is_success() {
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
-            return Err(GoveeError::Api {
-                code: status.as_u16(),
-                message: body,
-            });
-        }
+        let response = self.check_response(response).await?;
 
         let body: V1DevicesResponse = response.json().await?;
         if body.code != 200 {
@@ -168,12 +263,57 @@ impl GoveeBackend for CloudBackend {
             .map(V1Device::into_domain)
             .collect::<Result<Vec<_>>>()?;
 
+        // Cache device→model mappings for get_state (atomic swap).
+        {
+            let new_map: HashMap<DeviceId, String> = devices
+                .iter()
+                .map(|d| (d.id.clone(), d.model.clone()))
+                .collect();
+            let mut models = self
+                .device_models
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *models = new_map;
+        }
+
         debug!(count = devices.len(), "listed cloud devices");
         Ok(devices)
     }
 
-    async fn get_state(&self, _id: &DeviceId) -> Result<DeviceState> {
-        Err(GoveeError::NotImplemented("CloudBackend::get_state".into()))
+    /// Query the current state of a device.
+    ///
+    /// Requires a prior `list_devices` call to populate the device→model
+    /// cache. Returns `DeviceNotFound` if the device is not cached.
+    async fn get_state(&self, id: &DeviceId) -> Result<DeviceState> {
+        let model = self.get_model(id)?;
+        let mut url = self
+            .base_url
+            .join("v1/devices/state")
+            .map_err(|e| GoveeError::InvalidConfig(format!("failed to build URL: {e}")))?;
+        url.query_pairs_mut()
+            .append_pair("device", id.as_str())
+            .append_pair("model", &model);
+
+        let response = self
+            .client
+            .get(url)
+            .header("Govee-API-Key", &self.api_key)
+            .send()
+            .await?;
+
+        let response = self.check_response(response).await?;
+
+        let body: V1StateResponse = response.json().await?;
+        if body.code != 200 {
+            return Err(GoveeError::Api {
+                code: body.code,
+                message: body.message,
+            });
+        }
+
+        let state = build_state_from_properties(body.data.properties)?;
+        debug!(device = %id, stale = state.stale, "queried device state");
+        Ok(state)
     }
 
     async fn set_power(&self, _id: &DeviceId, _on: bool) -> Result<()> {
@@ -203,9 +343,11 @@ impl GoveeBackend for CloudBackend {
 
 impl std::fmt::Debug for CloudBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let cached = self.device_models.read().map(|m| m.len()).unwrap_or(0);
         f.debug_struct("CloudBackend")
             .field("base_url", &self.base_url.as_str())
             .field("api_key", &"[REDACTED]")
+            .field("cached_devices", &cached)
             .finish()
     }
 }
@@ -280,5 +422,69 @@ mod tests {
             device_name: "Bad Device".into(),
         };
         assert!(v1.into_domain().is_err());
+    }
+
+    #[test]
+    fn build_state_all_properties() {
+        let props: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[
+                {"online": true},
+                {"powerState": "on"},
+                {"brightness": 75},
+                {"color": {"r": 255, "g": 128, "b": 0}},
+                {"colorTem": 5000}
+            ]"#,
+        )
+        .unwrap();
+        let state = build_state_from_properties(props).unwrap();
+        assert!(state.on);
+        assert_eq!(state.brightness, 75);
+        assert_eq!(state.color, Color::new(255, 128, 0));
+        assert_eq!(state.color_temp_kelvin, Some(5000));
+        assert!(!state.stale);
+    }
+
+    #[test]
+    fn build_state_offline_is_stale() {
+        let props: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[{"online": false}, {"powerState": "off"}, {"brightness": 50}]"#,
+        )
+        .unwrap();
+        let state = build_state_from_properties(props).unwrap();
+        assert!(state.stale);
+        assert!(!state.on);
+    }
+
+    #[test]
+    fn build_state_clamps_brightness() {
+        let props: Vec<serde_json::Value> =
+            serde_json::from_str(r#"[{"brightness": 200}]"#).unwrap();
+        let state = build_state_from_properties(props).unwrap();
+        assert_eq!(state.brightness, 100);
+    }
+
+    #[test]
+    fn build_state_clamps_brightness_above_255() {
+        let props: Vec<serde_json::Value> =
+            serde_json::from_str(r#"[{"brightness": 300}]"#).unwrap();
+        let state = build_state_from_properties(props).unwrap();
+        assert_eq!(state.brightness, 100);
+    }
+
+    #[test]
+    fn build_state_clamps_color_above_255() {
+        let props: Vec<serde_json::Value> =
+            serde_json::from_str(r#"[{"color": {"r": 300, "g": 500, "b": 1000}}]"#).unwrap();
+        let state = build_state_from_properties(props).unwrap();
+        assert_eq!(state.color, Color::new(255, 255, 255));
+    }
+
+    #[test]
+    fn build_state_unknown_properties_ignored() {
+        let props: Vec<serde_json::Value> =
+            serde_json::from_str(r#"[{"unknownProp": 42}]"#).unwrap();
+        let state = build_state_from_properties(props).unwrap();
+        assert!(!state.on);
+        assert_eq!(state.brightness, 0);
     }
 }
