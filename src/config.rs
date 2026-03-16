@@ -20,7 +20,8 @@ pub enum BackendPreference {
 
 /// Library configuration.
 ///
-/// Loaded from TOML. Default config path: `~/.config/govee/config.toml`.
+/// Loaded from TOML. Consumer binaries are responsible for resolving the
+/// config file path (conventionally `~/.config/govee/config.toml`).
 #[derive(Clone, Deserialize)]
 pub struct Config {
     /// Cloud API key. `None` means local-only mode.
@@ -162,7 +163,9 @@ mod tests {
 
     #[test]
     fn config_load_missing_file() {
-        let result = Config::load(Path::new("/nonexistent/config.toml"));
+        let mut path = std::env::temp_dir();
+        path.push("govee-test-nonexistent-config.toml");
+        let result = Config::load(&path);
         assert!(result.is_err());
     }
 }
