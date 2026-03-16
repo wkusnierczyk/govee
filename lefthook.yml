@@ -12,4 +12,4 @@ pre-push:
     build:
       run: cargo build
     test:
-      run: cargo test
+      run: cargo test --features test-utils
