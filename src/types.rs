@@ -92,6 +92,10 @@ impl fmt::Display for BackendType {
 }
 
 /// Point-in-time device state.
+///
+/// - `brightness`: 0–100 (validated on construction and deserialization)
+/// - `color`: RGB, each component 0–255 (bounded by `u8`)
+/// - `color_temp_kelvin`: device-dependent Kelvin range, or `None`
 #[derive(Debug, Clone, Serialize)]
 pub struct DeviceState {
     pub on: bool,
@@ -149,7 +153,10 @@ impl<'de> Deserialize<'de> for DeviceState {
     }
 }
 
-/// RGB color value.
+/// RGB color value (sRGB, each component 0–255).
+///
+/// Components are bounded by `u8` — no additional validation needed.
+/// Display format: `#RRGGBB` (e.g., `#FF8000`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Color {
     pub r: u8,

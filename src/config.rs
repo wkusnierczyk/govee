@@ -2,12 +2,12 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-use crate::error::Result;
+use crate::error::{GoveeError, Result};
 
 /// Backend selection preference.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BackendPreference {
     #[default]
@@ -18,30 +18,31 @@ pub enum BackendPreference {
     LocalOnly,
 }
 
+/// Minimum allowed discovery interval in seconds.
+pub const MIN_DISCOVERY_INTERVAL_SECS: u64 = 5;
+
 /// Library configuration.
 ///
 /// Loaded from TOML. Consumer binaries are responsible for resolving the
 /// config file path (conventionally `~/.config/govee/config.toml`).
-#[derive(Clone, Deserialize)]
+///
+/// - `discovery_interval_secs`: minimum 5 seconds (validated on construction
+///   and deserialization)
+#[derive(Clone, Serialize)]
 pub struct Config {
     /// Cloud API key. `None` means local-only mode.
-    #[serde(default)]
     pub api_key: Option<String>,
 
     /// Backend selection preference.
-    #[serde(default)]
     pub backend: BackendPreference,
 
-    /// Local discovery interval in seconds.
-    #[serde(default = "default_discovery_interval")]
+    /// Local discovery interval in seconds (minimum 5).
     pub discovery_interval_secs: u64,
 
     /// User-defined aliases: alias → canonical device name.
-    #[serde(default)]
     pub aliases: HashMap<String, String>,
 
     /// Device groups: group name → list of device names/aliases.
-    #[serde(default)]
     pub groups: HashMap<String, Vec<String>>,
 }
 
@@ -62,10 +63,53 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Validate a config, returning an error if any values are out of range.
+    fn validate(&self) -> Result<()> {
+        if self.discovery_interval_secs < MIN_DISCOVERY_INTERVAL_SECS {
+            return Err(GoveeError::InvalidConfig(format!(
+                "discovery_interval_secs must be >= {}s, got {}s",
+                MIN_DISCOVERY_INTERVAL_SECS, self.discovery_interval_secs
+            )));
+        }
+        Ok(())
+    }
+
     /// Load configuration from a TOML file.
     pub fn load(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)?;
         let config: Config = toml::from_str(&content)?;
+        Ok(config)
+    }
+}
+
+impl<'de> Deserialize<'de> for Config {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Raw {
+            #[serde(default)]
+            api_key: Option<String>,
+            #[serde(default)]
+            backend: BackendPreference,
+            #[serde(default = "default_discovery_interval")]
+            discovery_interval_secs: u64,
+            #[serde(default)]
+            aliases: HashMap<String, String>,
+            #[serde(default)]
+            groups: HashMap<String, Vec<String>>,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        let config = Config {
+            api_key: raw.api_key,
+            backend: raw.backend,
+            discovery_interval_secs: raw.discovery_interval_secs,
+            aliases: raw.aliases,
+            groups: raw.groups,
+        };
+        config.validate().map_err(serde::de::Error::custom)?;
         Ok(config)
     }
 }
@@ -166,6 +210,29 @@ mod tests {
         let mut path = std::env::temp_dir();
         path.push("govee-test-nonexistent-config.toml");
         let result = Config::load(&path);
+        assert!(result.is_err());
+    }
+
+    // Discovery interval validation
+
+    #[test]
+    fn config_discovery_interval_at_minimum() {
+        let toml = "discovery_interval_secs = 5";
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.discovery_interval_secs, 5);
+    }
+
+    #[test]
+    fn config_discovery_interval_below_minimum() {
+        let toml = "discovery_interval_secs = 4";
+        let result: std::result::Result<Config, _> = toml::from_str(toml);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn config_discovery_interval_zero() {
+        let toml = "discovery_interval_secs = 0";
+        let result: std::result::Result<Config, _> = toml::from_str(toml);
         assert!(result.is_err());
     }
 }
