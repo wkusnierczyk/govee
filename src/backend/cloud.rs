@@ -13,8 +13,25 @@ use crate::types::{BackendType, Color, Device, DeviceId, DeviceState};
 /// Default base URL for the Govee cloud API.
 const DEFAULT_BASE_URL: &str = "https://developer-api.govee.com";
 
-/// Default request timeout.
+/// Default request timeout (covers the entire request lifecycle).
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Default connection timeout (TCP + TLS handshake).
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// User-Agent header identifying the library and version.
+fn user_agent() -> String {
+    format!("govee/{}", env!("CARGO_PKG_VERSION"))
+}
+
+/// Build a configured `reqwest::Client` with timeouts and User-Agent.
+fn build_client() -> std::result::Result<Client, reqwest::Error> {
+    Client::builder()
+        .timeout(DEFAULT_TIMEOUT)
+        .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
+        .user_agent(user_agent())
+        .build()
+}
 
 /// Cloud API backend using the Govee v1 REST API.
 ///
@@ -47,9 +64,7 @@ impl CloudBackend {
                 "base URL must use HTTPS, got: {raw}"
             )));
         }
-        let client = Client::builder()
-            .timeout(DEFAULT_TIMEOUT)
-            .build()
+        let client = build_client()
             .map_err(|e| GoveeError::InvalidConfig(format!("failed to build HTTP client: {e}")))?;
         Ok(Self {
             client,
@@ -69,10 +84,7 @@ impl CloudBackend {
     pub fn new_for_testing(api_key: String, base_url: String) -> Self {
         let parsed = reqwest::Url::parse(&base_url).expect("test base URL must be valid");
         Self {
-            client: Client::builder()
-                .timeout(DEFAULT_TIMEOUT)
-                .build()
-                .expect("failed to build test HTTP client"),
+            client: build_client().expect("failed to build test HTTP client"),
             base_url: parsed,
             api_key,
             device_models: RwLock::new(HashMap::new()),
@@ -558,5 +570,12 @@ mod tests {
         let state = build_state_from_properties(props).unwrap();
         assert!(!state.on);
         assert_eq!(state.brightness, 0);
+    }
+
+    #[test]
+    fn user_agent_contains_version() {
+        let ua = user_agent();
+        assert!(ua.starts_with("govee/"));
+        assert!(ua.contains(env!("CARGO_PKG_VERSION")));
     }
 }

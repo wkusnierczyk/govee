@@ -61,6 +61,24 @@ async fn list_devices_happy_path() {
 }
 
 #[tokio::test]
+async fn requests_include_user_agent() {
+    let server = MockServer::start().await;
+
+    let expected_ua = format!("govee/{}", env!("CARGO_PKG_VERSION"));
+    Mock::given(method("GET"))
+        .and(path("/v1/devices"))
+        .and(header("Govee-API-Key", "test-key"))
+        .and(header("user-agent", expected_ua.as_str()))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(HAPPY_RESPONSE, "application/json"))
+        .mount(&server)
+        .await;
+
+    let backend = backend_for(&server, "test-key");
+    // If User-Agent doesn't match, wiremock returns 404 and the call fails.
+    backend.list_devices().await.unwrap();
+}
+
+#[tokio::test]
 async fn list_devices_auth_failure() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
