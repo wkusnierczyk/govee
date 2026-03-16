@@ -7,13 +7,13 @@ Designed as a foundation for `govee-cli`, `govee-server`, and `govee-mcp` — it
 ## Status
 
 **WIP**: This project is currently in development and not ready for production use.  
-**Done**: [M1](#development-plan) in v0.1.0
+**Done**: [M1](#development-plan) in v0.1.0, [M2](#development-plan) in v0.2.0, [M3](#development-plan) in v0.3.0
 
 ## Getting started
 
 ### Prerequisites
 
-- [Rust](https://www.rust-lang.org/tools/install) (1.85+ for edition 2024)
+- [Rust](https://www.rust-lang.org/tools/install) (1.91+ for edition 2024)
 - [Lefthook](https://github.com/evilmartians/lefthook) — git hooks manager
 
 ### Set up git hooks
@@ -59,8 +59,8 @@ cargo clippy
 | Milestone | Scope | Status |
 |-----------|-------|--------|
 | **M1 — Scaffold & CI/CD** | Cargo project, module stubs, GitHub Actions for CI (fmt + clippy, build, test) and two-step immutable release on tag | v0.1.0 |
-| **M2 — Core types & configuration** | `DeviceId`, `Device`, `DeviceState`, `Color`, `GoveeError`, `Config` with TOML parsing, input validation | Pending |
-| **M3 — Cloud backend (v1)** | `GoveeBackend` trait, `CloudBackend` implementation (list, state, control), rate limit handling, wiremock tests | Pending |
+| **M2 — Core types & configuration** | `DeviceId`, `Device`, `DeviceState`, `Color`, `GoveeError`, `Config` with TOML parsing, input validation | v0.2.0 |
+| **M3 — Cloud backend (v1)** | `GoveeBackend` trait, `CloudBackend` (list, state, control), rate limit handling, User-Agent, timeouts, 84 wiremock+unit tests | v0.3.0 |
 | **M4 — Local LAN backend** | `LocalBackend` with UDP multicast discovery, unicast control, state queries, port conflict detection | Pending |
 | **M5 — Device registry** | `DeviceRegistry`: cloud+local merge, name/alias resolution, backend auto-selection, optimistic state cache, groups | Pending |
 | **M6 — Scenes & workflow stub** | Built-in + user-defined scene presets, `apply_scene`, workflow engine stub (`NotImplemented`) | Pending |
