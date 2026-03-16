@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::sync::RwLock;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -22,6 +24,9 @@ pub struct CloudBackend {
     client: Client,
     base_url: reqwest::Url,
     api_key: String,
+    /// Device ID → model mapping, populated by `list_devices`.
+    /// Required because `GET /v1/devices/state` needs both `device` and `model`.
+    device_models: RwLock<HashMap<DeviceId, String>>,
 }
 
 impl CloudBackend {
@@ -46,6 +51,7 @@ impl CloudBackend {
             client,
             base_url: parsed,
             api_key,
+            device_models: RwLock::new(HashMap::new()),
         })
     }
 
@@ -65,7 +71,23 @@ impl CloudBackend {
                 .expect("failed to build test HTTP client"),
             base_url: parsed,
             api_key,
+            device_models: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Look up the model for a device ID from the internal cache.
+    fn get_model(&self, id: &DeviceId) -> Result<String> {
+        self.device_models
+            .read()
+            .expect("device_models lock poisoned")
+            .get(id)
+            .cloned()
+            .ok_or_else(|| {
+                GoveeError::DeviceNotFound(format!(
+                    "{} (call list_devices first to populate the device cache)",
+                    id
+                ))
+            })
     }
 }
 
@@ -110,6 +132,66 @@ impl V1Device {
             alias: None,
             backend: BackendType::Cloud,
         })
+    }
+}
+
+/// Top-level response envelope from `GET /v1/devices/state`.
+#[derive(serde::Deserialize)]
+struct V1StateResponse {
+    data: V1StateData,
+    code: u16,
+    message: String,
+}
+
+/// The `data` field inside a v1 state response.
+#[derive(serde::Deserialize)]
+struct V1StateData {
+    #[allow(dead_code)]
+    device: String,
+    #[allow(dead_code)]
+    model: String,
+    properties: Vec<serde_json::Value>,
+}
+
+/// Build a `DeviceState` from the v1 property array.
+///
+/// The v1 API returns state as `[{"online": true}, {"powerState": "on"}, ...]`
+/// — each element is a JSON object with a single key. We parse each as a
+/// `serde_json::Value` map and extract known keys.
+fn build_state_from_properties(properties: Vec<serde_json::Value>) -> DeviceState {
+    let mut on = false;
+    let mut brightness: u8 = 0;
+    let mut color = Color::new(0, 0, 0);
+    let mut color_temp: Option<u32> = None;
+    let mut online = true;
+
+    for prop in properties {
+        if let Some(v) = prop.get("online").and_then(|v| v.as_bool()) {
+            online = v;
+        }
+        if let Some(v) = prop.get("powerState").and_then(|v| v.as_str()) {
+            on = v == "on";
+        }
+        if let Some(v) = prop.get("brightness").and_then(|v| v.as_u64()) {
+            brightness = (v as u8).min(100);
+        }
+        if let Some(obj) = prop.get("color").and_then(|v| v.as_object()) {
+            let r = obj.get("r").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+            let g = obj.get("g").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+            let b = obj.get("b").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+            color = Color::new(r, g, b);
+        }
+        if let Some(v) = prop.get("colorTem").and_then(|v| v.as_u64()) {
+            color_temp = Some(v as u32);
+        }
+    }
+
+    DeviceState {
+        on,
+        brightness,
+        color,
+        color_temp_kelvin: color_temp,
+        stale: !online,
     }
 }
 
@@ -168,12 +250,66 @@ impl GoveeBackend for CloudBackend {
             .map(V1Device::into_domain)
             .collect::<Result<Vec<_>>>()?;
 
+        // Cache device→model mappings for get_state.
+        {
+            let mut models = self
+                .device_models
+                .write()
+                .expect("device_models lock poisoned");
+            models.clear();
+            for device in &devices {
+                models.insert(device.id.clone(), device.model.clone());
+            }
+        }
+
         debug!(count = devices.len(), "listed cloud devices");
         Ok(devices)
     }
 
-    async fn get_state(&self, _id: &DeviceId) -> Result<DeviceState> {
-        Err(GoveeError::NotImplemented("CloudBackend::get_state".into()))
+    async fn get_state(&self, id: &DeviceId) -> Result<DeviceState> {
+        let model = self.get_model(id)?;
+        let mut url = self
+            .base_url
+            .join("v1/devices/state")
+            .map_err(|e| GoveeError::InvalidConfig(format!("failed to build URL: {e}")))?;
+        url.query_pairs_mut()
+            .append_pair("device", id.as_str())
+            .append_pair("model", &model);
+
+        let response = self
+            .client
+            .get(url)
+            .header("Govee-API-Key", &self.api_key)
+            .send()
+            .await?;
+
+        let status = response.status();
+        if status.as_u16() == 429 {
+            let retry_after_secs = parse_retry_after(&response);
+            return Err(GoveeError::RateLimited { retry_after_secs });
+        }
+        if !status.is_success() {
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("<failed to read response body: {e}>"));
+            return Err(GoveeError::Api {
+                code: status.as_u16(),
+                message: body,
+            });
+        }
+
+        let body: V1StateResponse = response.json().await?;
+        if body.code != 200 {
+            return Err(GoveeError::Api {
+                code: body.code,
+                message: body.message,
+            });
+        }
+
+        let state = build_state_from_properties(body.data.properties);
+        debug!(device = %id, stale = state.stale, "queried device state");
+        Ok(state)
     }
 
     async fn set_power(&self, _id: &DeviceId, _on: bool) -> Result<()> {
@@ -203,9 +339,11 @@ impl GoveeBackend for CloudBackend {
 
 impl std::fmt::Debug for CloudBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let cached = self.device_models.read().map(|m| m.len()).unwrap_or(0);
         f.debug_struct("CloudBackend")
             .field("base_url", &self.base_url.as_str())
             .field("api_key", &"[REDACTED]")
+            .field("cached_devices", &cached)
             .finish()
     }
 }
@@ -280,5 +418,53 @@ mod tests {
             device_name: "Bad Device".into(),
         };
         assert!(v1.into_domain().is_err());
+    }
+
+    #[test]
+    fn build_state_all_properties() {
+        let props: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[
+                {"online": true},
+                {"powerState": "on"},
+                {"brightness": 75},
+                {"color": {"r": 255, "g": 128, "b": 0}},
+                {"colorTem": 5000}
+            ]"#,
+        )
+        .unwrap();
+        let state = build_state_from_properties(props);
+        assert!(state.on);
+        assert_eq!(state.brightness, 75);
+        assert_eq!(state.color, Color::new(255, 128, 0));
+        assert_eq!(state.color_temp_kelvin, Some(5000));
+        assert!(!state.stale);
+    }
+
+    #[test]
+    fn build_state_offline_is_stale() {
+        let props: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[{"online": false}, {"powerState": "off"}, {"brightness": 50}]"#,
+        )
+        .unwrap();
+        let state = build_state_from_properties(props);
+        assert!(state.stale);
+        assert!(!state.on);
+    }
+
+    #[test]
+    fn build_state_clamps_brightness() {
+        let props: Vec<serde_json::Value> =
+            serde_json::from_str(r#"[{"brightness": 200}]"#).unwrap();
+        let state = build_state_from_properties(props);
+        assert_eq!(state.brightness, 100);
+    }
+
+    #[test]
+    fn build_state_unknown_properties_ignored() {
+        let props: Vec<serde_json::Value> =
+            serde_json::from_str(r#"[{"unknownProp": 42}]"#).unwrap();
+        let state = build_state_from_properties(props);
+        assert!(!state.on);
+        assert_eq!(state.brightness, 0);
     }
 }

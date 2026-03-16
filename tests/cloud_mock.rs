@@ -3,7 +3,8 @@
 use govee::backend::GoveeBackend;
 use govee::backend::cloud::CloudBackend;
 use govee::error::GoveeError;
-use wiremock::matchers::{header, method, path};
+use govee::types::DeviceId;
+use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Create a CloudBackend pointing at the mock server.
@@ -198,4 +199,105 @@ async fn list_devices_rate_limited_no_header() {
         }
         other => panic!("expected GoveeError::RateLimited, got: {other:?}"),
     }
+}
+
+// --- get_state tests ---
+
+const STATE_RESPONSE: &str = r#"{
+    "data": {
+        "device": "AA:BB:CC:DD:EE:FF",
+        "model": "H6076",
+        "properties": [
+            { "online": true },
+            { "powerState": "on" },
+            { "brightness": 75 },
+            { "color": { "r": 255, "g": 128, "b": 0 } },
+            { "colorTem": 5000 }
+        ]
+    },
+    "code": 200,
+    "message": "Success"
+}"#;
+
+/// Helper: mount list_devices mock and call it to populate device cache.
+async fn populate_device_cache(server: &MockServer, backend: &CloudBackend) {
+    Mock::given(method("GET"))
+        .and(path("/v1/devices"))
+        .and(header("Govee-API-Key", "test-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(HAPPY_RESPONSE, "application/json"))
+        .mount(server)
+        .await;
+    backend.list_devices().await.unwrap();
+}
+
+#[tokio::test]
+async fn get_state_happy_path() {
+    let server = MockServer::start().await;
+    let backend = backend_for(&server, "test-key");
+    populate_device_cache(&server, &backend).await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/devices/state"))
+        .and(header("Govee-API-Key", "test-key"))
+        .and(query_param("device", "AA:BB:CC:DD:EE:FF"))
+        .and(query_param("model", "H6076"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(STATE_RESPONSE, "application/json"))
+        .mount(&server)
+        .await;
+
+    let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+    let state = backend.get_state(&id).await.unwrap();
+    assert!(state.on);
+    assert_eq!(state.brightness, 75);
+    assert_eq!(state.color, govee::types::Color::new(255, 128, 0));
+    assert_eq!(state.color_temp_kelvin, Some(5000));
+    assert!(!state.stale);
+}
+
+#[tokio::test]
+async fn get_state_device_not_found_without_cache() {
+    let server = MockServer::start().await;
+    let backend = backend_for(&server, "test-key");
+
+    let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+    let result = backend.get_state(&id).await;
+
+    assert!(result.is_err());
+    assert!(matches!(result.unwrap_err(), GoveeError::DeviceNotFound(_)));
+}
+
+#[tokio::test]
+async fn get_state_stale_when_offline() {
+    let offline_response = r#"{
+        "data": {
+            "device": "AA:BB:CC:DD:EE:FF",
+            "model": "H6076",
+            "properties": [
+                { "online": false },
+                { "powerState": "off" },
+                { "brightness": 50 },
+                { "color": { "r": 0, "g": 0, "b": 0 } }
+            ]
+        },
+        "code": 200,
+        "message": "Success"
+    }"#;
+
+    let server = MockServer::start().await;
+    let backend = backend_for(&server, "test-key");
+    populate_device_cache(&server, &backend).await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/devices/state"))
+        .and(header("Govee-API-Key", "test-key"))
+        .and(query_param("device", "AA:BB:CC:DD:EE:FF"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(offline_response, "application/json"))
+        .mount(&server)
+        .await;
+
+    let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+    let state = backend.get_state(&id).await.unwrap();
+    assert!(state.stale);
+    assert!(!state.on);
+    assert_eq!(state.brightness, 50);
 }
