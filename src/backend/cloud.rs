@@ -25,10 +25,20 @@ fn user_agent() -> String {
 }
 
 /// Check if a URL points to a loopback address (127.0.0.1, ::1, localhost).
+///
+/// This allows HTTP for local test servers (e.g., wiremock) while enforcing
+/// HTTPS for all remote hosts. Callers should not rely on this for production
+/// configurations — if a production config accidentally resolves to localhost,
+/// API keys would be sent over plaintext.
 fn is_loopback(url: &reqwest::Url) -> bool {
     match url.host_str() {
         Some("localhost") | Some("127.0.0.1") | Some("[::1]") => true,
+        // Url::host_str() returns IPv6 in brackets (e.g., "[::1]"),
+        // but IpAddr::parse expects bare addresses. Strip brackets.
         Some(host) => host
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(host)
             .parse::<std::net::IpAddr>()
             .is_ok_and(|ip| ip.is_loopback()),
         None => false,
@@ -448,6 +458,7 @@ mod tests {
     fn allows_http_loopback() {
         assert!(CloudBackend::new("key".into(), Some("http://127.0.0.1:8080".into())).is_ok());
         assert!(CloudBackend::new("key".into(), Some("http://localhost:8080".into())).is_ok());
+        assert!(CloudBackend::new("key".into(), Some("http://[::1]:8080".into())).is_ok());
     }
 
     #[test]
