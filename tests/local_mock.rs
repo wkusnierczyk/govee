@@ -1,20 +1,25 @@
 //! Integration tests for the local LAN backend (UDP loopback).
 //!
-//! These tests bind to fixed ports (4002, 4003) and may skip when those ports
-//! are already in use. Running tests in parallel can cause port contention;
-//! see [#67](https://github.com/wkusnierczyk/govee/issues/67) for details.
+//! All tests bind to fixed port 4002 and must not run in parallel.
+//! A shared mutex serializes access to prevent port contention.
 
 use std::net::Ipv4Addr;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use govee::backend::GoveeBackend;
 use govee::backend::local::LocalBackend;
 use govee::error::GoveeError;
+use tokio::sync::Mutex;
+
+/// Serializes all tests that bind port 4002.
+static PORT_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 /// Test that creating a LocalBackend succeeds, then a second bind to
 /// the same port fails with `BackendUnavailable`.
 #[tokio::test]
 async fn port_conflict_detection() {
+    let _lock = PORT_LOCK.lock().await;
     // First backend grabs port 4002.
     let backend1 = LocalBackend::new(Duration::from_millis(100), 10).await;
 
@@ -50,6 +55,7 @@ async fn port_conflict_detection() {
 /// to the listen port on loopback.
 #[tokio::test]
 async fn udp_loopback_discovery() {
+    let _lock = PORT_LOCK.lock().await;
     let backend = LocalBackend::new(Duration::from_millis(200), 60).await;
 
     if let Err(GoveeError::BackendUnavailable(_)) = &backend {
@@ -108,6 +114,7 @@ async fn udp_loopback_discovery() {
 /// control commands also return DeviceNotFound when the device is not in the cache.
 #[tokio::test]
 async fn stub_and_control_errors_without_device() {
+    let _lock = PORT_LOCK.lock().await;
     let backend = LocalBackend::new(Duration::from_millis(100), 10).await;
 
     if let Err(GoveeError::BackendUnavailable(_)) = &backend {
@@ -149,6 +156,7 @@ async fn stub_and_control_errors_without_device() {
 /// Test that set_brightness rejects values > 100.
 #[tokio::test]
 async fn set_brightness_rejects_invalid_value() {
+    let _lock = PORT_LOCK.lock().await;
     let backend = LocalBackend::new(Duration::from_millis(100), 10).await;
 
     if let Err(GoveeError::BackendUnavailable(_)) = &backend {
@@ -195,6 +203,7 @@ async fn set_brightness_rejects_invalid_value() {
 /// have a test task send a devStatus response back, and verify the result.
 #[tokio::test]
 async fn udp_loopback_state_query() {
+    let _lock = PORT_LOCK.lock().await;
     let backend = LocalBackend::new(Duration::from_millis(500), 60).await;
 
     if let Err(GoveeError::BackendUnavailable(_)) = &backend {
@@ -287,6 +296,7 @@ async fn udp_loopback_state_query() {
 /// Test that set_color_temp rejects 0K.
 #[tokio::test]
 async fn set_color_temp_rejects_zero() {
+    let _lock = PORT_LOCK.lock().await;
     let backend = LocalBackend::new(Duration::from_millis(100), 10).await;
 
     if let Err(GoveeError::BackendUnavailable(_)) = &backend {
@@ -331,6 +341,7 @@ async fn set_color_temp_rejects_zero() {
 /// Test that get_state times out when no response is sent.
 #[tokio::test]
 async fn get_state_timeout() {
+    let _lock = PORT_LOCK.lock().await;
     let backend = LocalBackend::new(Duration::from_millis(50), 60).await;
 
     if let Err(GoveeError::BackendUnavailable(_)) = &backend {
@@ -383,6 +394,7 @@ async fn get_state_timeout() {
 /// UDP loopback test for set_power command.
 #[tokio::test]
 async fn udp_loopback_set_power() {
+    let _lock = PORT_LOCK.lock().await;
     let backend = LocalBackend::new(Duration::from_millis(200), 60).await;
 
     if let Err(GoveeError::BackendUnavailable(_)) = &backend {
@@ -446,6 +458,7 @@ async fn udp_loopback_set_power() {
 /// UDP loopback test for set_brightness command.
 #[tokio::test]
 async fn udp_loopback_set_brightness() {
+    let _lock = PORT_LOCK.lock().await;
     let backend = LocalBackend::new(Duration::from_millis(200), 60).await;
 
     if let Err(GoveeError::BackendUnavailable(_)) = &backend {
@@ -506,6 +519,7 @@ async fn udp_loopback_set_brightness() {
 /// UDP loopback test for set_color command.
 #[tokio::test]
 async fn udp_loopback_set_color() {
+    let _lock = PORT_LOCK.lock().await;
     let backend = LocalBackend::new(Duration::from_millis(200), 60).await;
 
     if let Err(GoveeError::BackendUnavailable(_)) = &backend {
@@ -572,6 +586,7 @@ async fn udp_loopback_set_color() {
 /// UDP loopback test for set_color_temp command.
 #[tokio::test]
 async fn udp_loopback_set_color_temp() {
+    let _lock = PORT_LOCK.lock().await;
     let backend = LocalBackend::new(Duration::from_millis(200), 60).await;
 
     if let Err(GoveeError::BackendUnavailable(_)) = &backend {

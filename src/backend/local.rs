@@ -794,26 +794,4 @@ mod tests {
         assert!(!public.is_link_local());
         assert!(!public.is_loopback());
     }
-
-    // Note: this test binds port 4002 and can conflict with integration tests
-    // or other unit tests running in parallel. It could be restructured to not
-    // need the real port (it only tests cache lookup, not UDP), but for now we
-    // skip gracefully when the port is busy.
-    #[tokio::test]
-    async fn get_state_requires_cached_device() {
-        let backend = LocalBackend::new(Duration::from_millis(50), 60).await;
-        if backend.is_err() {
-            eprintln!("skipping get_state_requires_cached_device: port 4002 in use");
-            return;
-        }
-        let backend = backend.unwrap();
-        let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
-
-        // No discovery has been done, so the device is not in the cache.
-        let result = backend.get_state(&id).await;
-        assert!(
-            matches!(result, Err(GoveeError::DeviceNotFound(_))),
-            "expected DeviceNotFound, got: {result:?}"
-        );
-    }
 }
