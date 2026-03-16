@@ -10,6 +10,7 @@ use crate::error::{GoveeError, Result};
 /// Accepts colon-separated hex MAC addresses with 6 or 8 octets
 /// (e.g., `"AA:BB:CC:DD:EE:FF"` or `"AA:BB:CC:DD:EE:FF:00:11"`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
 pub struct DeviceId(pub(crate) String);
 
 impl DeviceId {
@@ -28,6 +29,20 @@ impl DeviceId {
 impl fmt::Display for DeviceId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+impl TryFrom<String> for DeviceId {
+    type Error = GoveeError;
+
+    fn try_from(s: String) -> Result<Self> {
+        s.parse()
+    }
+}
+
+impl From<DeviceId> for String {
+    fn from(id: DeviceId) -> Self {
+        id.0
     }
 }
 
@@ -61,6 +76,7 @@ pub struct Device {
 
 /// Which backend is active for a device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum BackendType {
     Cloud,
     Local,
@@ -76,7 +92,7 @@ impl fmt::Display for BackendType {
 }
 
 /// Point-in-time device state.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DeviceState {
     pub on: bool,
     pub brightness: u8,
@@ -104,6 +120,32 @@ impl DeviceState {
             color_temp_kelvin,
             stale,
         })
+    }
+}
+
+impl<'de> Deserialize<'de> for DeviceState {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Raw {
+            on: bool,
+            brightness: u8,
+            color: Color,
+            color_temp_kelvin: Option<u32>,
+            stale: bool,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        DeviceState::new(
+            raw.on,
+            raw.brightness,
+            raw.color,
+            raw.color_temp_kelvin,
+            raw.stale,
+        )
+        .map_err(serde::de::Error::custom)
     }
 }
 
@@ -202,5 +244,40 @@ mod tests {
     fn backend_type_display() {
         assert_eq!(BackendType::Cloud.to_string(), "cloud");
         assert_eq!(BackendType::Local.to_string(), "local");
+    }
+
+    // Serde invariant tests
+
+    #[test]
+    fn device_id_deserialize_validates() {
+        let valid: std::result::Result<DeviceId, _> =
+            serde_json::from_str(r#""AA:BB:CC:DD:EE:FF""#);
+        assert!(valid.is_ok());
+        assert_eq!(valid.unwrap().as_str(), "AA:BB:CC:DD:EE:FF");
+
+        let invalid: std::result::Result<DeviceId, _> = serde_json::from_str(r#""not-a-mac""#);
+        assert!(invalid.is_err());
+    }
+
+    #[test]
+    fn device_state_deserialize_validates_brightness() {
+        let valid: std::result::Result<DeviceState, _> = serde_json::from_str(
+            r#"{"on":true,"brightness":50,"color":{"r":255,"g":0,"b":0},"color_temp_kelvin":null,"stale":false}"#,
+        );
+        assert!(valid.is_ok());
+
+        let invalid: std::result::Result<DeviceState, _> = serde_json::from_str(
+            r#"{"on":true,"brightness":150,"color":{"r":255,"g":0,"b":0},"color_temp_kelvin":null,"stale":false}"#,
+        );
+        assert!(invalid.is_err());
+    }
+
+    #[test]
+    fn backend_type_serde_lowercase() {
+        let json = serde_json::to_string(&BackendType::Cloud).unwrap();
+        assert_eq!(json, r#""cloud""#);
+
+        let parsed: BackendType = serde_json::from_str(r#""local""#).unwrap();
+        assert_eq!(parsed, BackendType::Local);
     }
 }
