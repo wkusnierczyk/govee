@@ -118,7 +118,7 @@ async fn stub_and_control_errors_without_device() {
     let backend = LocalBackend::new(Duration::from_millis(100), 10).await;
 
     if let Err(GoveeError::BackendUnavailable(_)) = &backend {
-        eprintln!("skipping stub_methods test: port 4002 in use");
+        eprintln!("skipping stub_and_control_errors_without_device: port 4002 in use");
         return;
     }
 

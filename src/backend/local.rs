@@ -91,6 +91,14 @@ impl LocalBackend {
     /// A future improvement could use `SO_REUSEPORT` probing or an
     /// advisory lock file for more reliable conflict detection.
     pub async fn new(discovery_timeout: Duration, discovery_interval_secs: u64) -> Result<Self> {
+        if discovery_interval_secs < crate::config::MIN_DISCOVERY_INTERVAL_SECS {
+            return Err(GoveeError::InvalidConfig(format!(
+                "discovery_interval_secs must be >= {}s, got {}s",
+                crate::config::MIN_DISCOVERY_INTERVAL_SECS,
+                discovery_interval_secs
+            )));
+        }
+
         // Build receive socket via socket2 for SO_REUSEADDR + multicast join.
         let recv_socket = {
             let socket = socket2::Socket::new(
@@ -171,9 +179,9 @@ impl LocalBackend {
         validate_local_ip(ip)?;
 
         let bytes = serde_json::to_vec(&payload)?;
-        self.send_socket.send_to(&bytes, (ip, 4003)).await?;
+        self.send_socket.send_to(&bytes, (ip, COMMAND_PORT)).await?;
 
-        tracing::debug!("sent command to {} ({}) on port 4003", id, ip);
+        tracing::debug!("sent command to {} ({}) on port {}", id, ip, COMMAND_PORT);
         Ok(())
     }
 
@@ -771,27 +779,22 @@ mod tests {
 
     #[test]
     fn ip_validation_private_accepted() {
-        let private = Ipv4Addr::new(192, 168, 1, 100);
-        assert!(private.is_private());
+        assert!(validate_local_ip(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 100))).is_ok());
     }
 
     #[test]
     fn ip_validation_loopback_accepted() {
-        let loopback = Ipv4Addr::new(127, 0, 0, 1);
-        assert!(loopback.is_loopback());
+        assert!(validate_local_ip(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))).is_ok());
     }
 
     #[test]
     fn ip_validation_link_local_accepted() {
-        let link_local = Ipv4Addr::new(169, 254, 1, 1);
-        assert!(link_local.is_link_local());
+        assert!(validate_local_ip(IpAddr::V4(Ipv4Addr::new(169, 254, 1, 1))).is_ok());
     }
 
     #[test]
     fn ip_validation_public_rejected() {
-        let public = Ipv4Addr::new(8, 8, 8, 8);
-        assert!(!public.is_private());
-        assert!(!public.is_link_local());
-        assert!(!public.is_loopback());
+        let result = validate_local_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
+        assert!(matches!(result, Err(GoveeError::InvalidConfig(_))));
     }
 }

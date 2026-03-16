@@ -55,10 +55,14 @@ cargo test
 use govee::backend::cloud::CloudBackend;
 use govee::backend::GoveeBackend;
 
-let backend = CloudBackend::new("your-api-key".into(), None)?;
-let devices = backend.list_devices().await?;
-let state = backend.get_state(&devices[0].id).await?;
-backend.set_brightness(&devices[0].id, 75).await?;
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let backend = CloudBackend::new("your-api-key".into(), None)?;
+    let devices = backend.list_devices().await?;
+    let state = backend.get_state(&devices[0].id).await?;
+    backend.set_brightness(&devices[0].id, 75).await?;
+    Ok(())
+}
 ```
 
 The API key is obtained from the Govee Home mobile app. HTTPS is enforced for all remote URLs.
@@ -70,9 +74,13 @@ use govee::backend::local::LocalBackend;
 use govee::backend::GoveeBackend;
 use std::time::Duration;
 
-let backend = LocalBackend::new(Duration::from_secs(2), 60).await?;
-let devices = backend.list_devices().await?;
-backend.set_color(&devices[0].id, govee::types::Color::new(255, 0, 128)).await?;
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let backend = LocalBackend::new(Duration::from_secs(2), 60).await?;
+    let devices = backend.list_devices().await?;
+    backend.set_color(&devices[0].id, govee::types::Color::new(255, 0, 128)).await?;
+    Ok(())
+}
 ```
 
 Requires the device to be on the same LAN segment. Port 4002 must be available (not used by Home Assistant, govee2mqtt, etc.).
