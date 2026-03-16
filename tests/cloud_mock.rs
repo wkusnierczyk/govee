@@ -3,8 +3,8 @@
 use govee::backend::GoveeBackend;
 use govee::backend::cloud::CloudBackend;
 use govee::error::GoveeError;
-use govee::types::DeviceId;
-use wiremock::matchers::{header, method, path, query_param};
+use govee::types::{Color, DeviceId};
+use wiremock::matchers::{body_json, header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Create a CloudBackend pointing at the mock server.
@@ -327,5 +327,189 @@ async fn get_state_rate_limited() {
             assert_eq!(retry_after_secs, 30);
         }
         other => panic!("expected GoveeError::RateLimited, got: {other:?}"),
+    }
+}
+
+// --- control command tests ---
+
+#[tokio::test]
+async fn set_power_on() {
+    let server = MockServer::start().await;
+    let backend = backend_for(&server, "test-key");
+    populate_device_cache(&server, &backend).await;
+
+    Mock::given(method("PUT"))
+        .and(path("/v1/devices/control"))
+        .and(header("Govee-API-Key", "test-key"))
+        .and(body_json(serde_json::json!({
+            "device": "AA:BB:CC:DD:EE:FF",
+            "model": "H6076",
+            "cmd": { "name": "turn", "value": "on" }
+        })))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+    backend.set_power(&id, true).await.unwrap();
+}
+
+#[tokio::test]
+async fn set_power_off() {
+    let server = MockServer::start().await;
+    let backend = backend_for(&server, "test-key");
+    populate_device_cache(&server, &backend).await;
+
+    Mock::given(method("PUT"))
+        .and(path("/v1/devices/control"))
+        .and(header("Govee-API-Key", "test-key"))
+        .and(body_json(serde_json::json!({
+            "device": "AA:BB:CC:DD:EE:FF",
+            "model": "H6076",
+            "cmd": { "name": "turn", "value": "off" }
+        })))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+    backend.set_power(&id, false).await.unwrap();
+}
+
+#[tokio::test]
+async fn set_brightness_valid() {
+    let server = MockServer::start().await;
+    let backend = backend_for(&server, "test-key");
+    populate_device_cache(&server, &backend).await;
+
+    Mock::given(method("PUT"))
+        .and(path("/v1/devices/control"))
+        .and(header("Govee-API-Key", "test-key"))
+        .and(body_json(serde_json::json!({
+            "device": "AA:BB:CC:DD:EE:FF",
+            "model": "H6076",
+            "cmd": { "name": "brightness", "value": 75 }
+        })))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+    backend.set_brightness(&id, 75).await.unwrap();
+}
+
+#[tokio::test]
+async fn set_brightness_over_100_rejected() {
+    let server = MockServer::start().await;
+    let backend = backend_for(&server, "test-key");
+    populate_device_cache(&server, &backend).await;
+
+    let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+    let result = backend.set_brightness(&id, 101).await;
+    assert!(result.is_err());
+    assert!(matches!(
+        result.unwrap_err(),
+        GoveeError::InvalidBrightness(101)
+    ));
+}
+
+#[tokio::test]
+async fn set_color_rgb() {
+    let server = MockServer::start().await;
+    let backend = backend_for(&server, "test-key");
+    populate_device_cache(&server, &backend).await;
+
+    Mock::given(method("PUT"))
+        .and(path("/v1/devices/control"))
+        .and(header("Govee-API-Key", "test-key"))
+        .and(body_json(serde_json::json!({
+            "device": "AA:BB:CC:DD:EE:FF",
+            "model": "H6076",
+            "cmd": { "name": "color", "value": {"r": 255, "g": 0, "b": 128} }
+        })))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+    backend
+        .set_color(&id, Color::new(255, 0, 128))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn set_color_temp_valid() {
+    let server = MockServer::start().await;
+    let backend = backend_for(&server, "test-key");
+    populate_device_cache(&server, &backend).await;
+
+    Mock::given(method("PUT"))
+        .and(path("/v1/devices/control"))
+        .and(header("Govee-API-Key", "test-key"))
+        .and(body_json(serde_json::json!({
+            "device": "AA:BB:CC:DD:EE:FF",
+            "model": "H6076",
+            "cmd": { "name": "colorTem", "value": 5000 }
+        })))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+    backend.set_color_temp(&id, 5000).await.unwrap();
+}
+
+#[tokio::test]
+async fn control_command_device_not_found() {
+    let server = MockServer::start().await;
+    let backend = backend_for(&server, "test-key");
+
+    let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+    let result = backend.set_power(&id, true).await;
+    assert!(matches!(result.unwrap_err(), GoveeError::DeviceNotFound(_)));
+}
+
+#[tokio::test]
+async fn control_command_rate_limited() {
+    let server = MockServer::start().await;
+    let backend = backend_for(&server, "test-key");
+    populate_device_cache(&server, &backend).await;
+
+    Mock::given(method("PUT"))
+        .and(path("/v1/devices/control"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("Retry-After", "45")
+                .set_body_string("Too Many Requests"),
+        )
+        .mount(&server)
+        .await;
+
+    let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+    let result = backend.set_power(&id, true).await;
+    match result.unwrap_err() {
+        GoveeError::RateLimited { retry_after_secs } => assert_eq!(retry_after_secs, 45),
+        other => panic!("expected RateLimited, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn control_command_api_error() {
+    let server = MockServer::start().await;
+    let backend = backend_for(&server, "test-key");
+    populate_device_cache(&server, &backend).await;
+
+    Mock::given(method("PUT"))
+        .and(path("/v1/devices/control"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
+        .mount(&server)
+        .await;
+
+    let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+    let result = backend.set_brightness(&id, 50).await;
+    match result.unwrap_err() {
+        GoveeError::Api { code, .. } => assert_eq!(code, 500),
+        other => panic!("expected Api error, got: {other:?}"),
     }
 }

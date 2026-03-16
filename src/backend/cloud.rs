@@ -96,6 +96,41 @@ impl CloudBackend {
         })
     }
 
+    /// Send a control command to a device via `PUT /v1/devices/control`.
+    async fn send_control(
+        &self,
+        id: &DeviceId,
+        cmd_name: &str,
+        cmd_value: serde_json::Value,
+    ) -> Result<()> {
+        let model = self.get_model(id)?;
+        let url = self
+            .base_url
+            .join("v1/devices/control")
+            .map_err(|e| GoveeError::InvalidConfig(format!("failed to build URL: {e}")))?;
+
+        let payload = serde_json::json!({
+            "device": id.as_str(),
+            "model": model,
+            "cmd": {
+                "name": cmd_name,
+                "value": cmd_value,
+            }
+        });
+
+        let response = self
+            .client
+            .put(url)
+            .header("Govee-API-Key", &self.api_key)
+            .json(&payload)
+            .send()
+            .await?;
+
+        self.check_response(response).await?;
+        debug!(device = %id, cmd = cmd_name, "sent control command");
+        Ok(())
+    }
+
     /// Check an HTTP response for rate limiting and error status codes.
     ///
     /// Returns the response unchanged on success (2xx). For 429, returns
@@ -316,24 +351,32 @@ impl GoveeBackend for CloudBackend {
         Ok(state)
     }
 
-    async fn set_power(&self, _id: &DeviceId, _on: bool) -> Result<()> {
-        Err(GoveeError::NotImplemented("CloudBackend::set_power".into()))
+    async fn set_power(&self, id: &DeviceId, on: bool) -> Result<()> {
+        let value = if on { "on" } else { "off" };
+        self.send_control(id, "turn", serde_json::json!(value))
+            .await
     }
 
-    async fn set_brightness(&self, _id: &DeviceId, _value: u8) -> Result<()> {
-        Err(GoveeError::NotImplemented(
-            "CloudBackend::set_brightness".into(),
-        ))
+    async fn set_brightness(&self, id: &DeviceId, value: u8) -> Result<()> {
+        if value > 100 {
+            return Err(GoveeError::InvalidBrightness(value));
+        }
+        self.send_control(id, "brightness", serde_json::json!(value))
+            .await
     }
 
-    async fn set_color(&self, _id: &DeviceId, _color: Color) -> Result<()> {
-        Err(GoveeError::NotImplemented("CloudBackend::set_color".into()))
+    async fn set_color(&self, id: &DeviceId, color: Color) -> Result<()> {
+        self.send_control(
+            id,
+            "color",
+            serde_json::json!({"r": color.r, "g": color.g, "b": color.b}),
+        )
+        .await
     }
 
-    async fn set_color_temp(&self, _id: &DeviceId, _kelvin: u32) -> Result<()> {
-        Err(GoveeError::NotImplemented(
-            "CloudBackend::set_color_temp".into(),
-        ))
+    async fn set_color_temp(&self, id: &DeviceId, kelvin: u32) -> Result<()> {
+        self.send_control(id, "colorTem", serde_json::json!(kelvin))
+            .await
     }
 
     fn backend_type(&self) -> BackendType {
