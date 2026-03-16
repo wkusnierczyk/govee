@@ -26,24 +26,15 @@ pub const MIN_DISCOVERY_INTERVAL_SECS: u64 = 5;
 /// Loaded from TOML. Consumer binaries are responsible for resolving the
 /// config file path (conventionally `~/.config/govee/config.toml`).
 ///
-/// - `discovery_interval_secs`: minimum 5 seconds (validated on construction
-///   and deserialization)
+/// All construction paths (`new`, `load`, `Deserialize`) validate that
+/// `discovery_interval_secs >= 5`.
 #[derive(Clone, Serialize)]
 pub struct Config {
-    /// Cloud API key. `None` means local-only mode.
-    pub api_key: Option<String>,
-
-    /// Backend selection preference.
-    pub backend: BackendPreference,
-
-    /// Local discovery interval in seconds (minimum 5).
-    pub discovery_interval_secs: u64,
-
-    /// User-defined aliases: alias → canonical device name.
-    pub aliases: HashMap<String, String>,
-
-    /// Device groups: group name → list of device names/aliases.
-    pub groups: HashMap<String, Vec<String>>,
+    api_key: Option<String>,
+    backend: BackendPreference,
+    discovery_interval_secs: u64,
+    aliases: HashMap<String, String>,
+    groups: HashMap<String, Vec<String>>,
 }
 
 fn default_discovery_interval() -> u64 {
@@ -63,8 +54,27 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Validate a config, returning an error if any values are out of range.
-    fn validate(&self) -> Result<()> {
+    /// Create a new `Config`, validating all fields.
+    pub fn new(
+        api_key: Option<String>,
+        backend: BackendPreference,
+        discovery_interval_secs: u64,
+        aliases: HashMap<String, String>,
+        groups: HashMap<String, Vec<String>>,
+    ) -> Result<Self> {
+        let config = Self {
+            api_key,
+            backend,
+            discovery_interval_secs,
+            aliases,
+            groups,
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Validate config values, returning `GoveeError::InvalidConfig` on failure.
+    pub fn validate(&self) -> Result<()> {
         if self.discovery_interval_secs < MIN_DISCOVERY_INTERVAL_SECS {
             return Err(GoveeError::InvalidConfig(format!(
                 "discovery_interval_secs must be >= {}s, got {}s",
@@ -75,10 +85,37 @@ impl Config {
     }
 
     /// Load configuration from a TOML file.
+    ///
+    /// Returns `GoveeError::Io` if the file cannot be read,
+    /// `GoveeError::Config` for TOML syntax errors, or
+    /// `GoveeError::InvalidConfig` for out-of-range values.
     pub fn load(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)?;
+        // Parse TOML (syntax errors → GoveeError::Config)
         let config: Config = toml::from_str(&content)?;
+        // Re-validate to surface as GoveeError::InvalidConfig
+        config.validate()?;
         Ok(config)
+    }
+
+    pub fn api_key(&self) -> Option<&str> {
+        self.api_key.as_deref()
+    }
+
+    pub fn backend(&self) -> BackendPreference {
+        self.backend
+    }
+
+    pub fn discovery_interval_secs(&self) -> u64 {
+        self.discovery_interval_secs
+    }
+
+    pub fn aliases(&self) -> &HashMap<String, String> {
+        &self.aliases
+    }
+
+    pub fn groups(&self) -> &HashMap<String, Vec<String>> {
+        &self.groups
     }
 }
 
@@ -133,11 +170,40 @@ mod tests {
     #[test]
     fn config_default() {
         let cfg = Config::default();
-        assert!(cfg.api_key.is_none());
-        assert_eq!(cfg.backend, BackendPreference::Auto);
-        assert_eq!(cfg.discovery_interval_secs, 60);
-        assert!(cfg.aliases.is_empty());
-        assert!(cfg.groups.is_empty());
+        assert!(cfg.api_key().is_none());
+        assert_eq!(cfg.backend(), BackendPreference::Auto);
+        assert_eq!(cfg.discovery_interval_secs(), 60);
+        assert!(cfg.aliases().is_empty());
+        assert!(cfg.groups().is_empty());
+    }
+
+    #[test]
+    fn config_new_valid() {
+        let cfg = Config::new(
+            Some("key".into()),
+            BackendPreference::CloudOnly,
+            30,
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(cfg.api_key(), Some("key"));
+        assert_eq!(cfg.discovery_interval_secs(), 30);
+    }
+
+    #[test]
+    fn config_new_invalid_interval() {
+        let result = Config::new(
+            None,
+            BackendPreference::Auto,
+            2,
+            HashMap::new(),
+            HashMap::new(),
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, GoveeError::InvalidConfig(_)));
+        assert!(err.to_string().contains("must be >= 5s"));
     }
 
     #[test]
@@ -157,28 +223,28 @@ mod tests {
         "#;
 
         let cfg: Config = toml::from_str(toml).unwrap();
-        assert_eq!(cfg.api_key.as_deref(), Some("gv-test-key-123"));
-        assert_eq!(cfg.backend, BackendPreference::CloudOnly);
-        assert_eq!(cfg.discovery_interval_secs, 30);
-        assert_eq!(cfg.aliases.len(), 2);
-        assert_eq!(cfg.aliases["bedroom"], "H6078 Bedroom Light");
-        assert_eq!(cfg.groups["upstairs"], vec!["bedroom"]);
+        assert_eq!(cfg.api_key(), Some("gv-test-key-123"));
+        assert_eq!(cfg.backend(), BackendPreference::CloudOnly);
+        assert_eq!(cfg.discovery_interval_secs(), 30);
+        assert_eq!(cfg.aliases().len(), 2);
+        assert_eq!(cfg.aliases()["bedroom"], "H6078 Bedroom Light");
+        assert_eq!(cfg.groups()["upstairs"], vec!["bedroom"]);
     }
 
     #[test]
     fn config_parse_minimal() {
         let toml = "";
         let cfg: Config = toml::from_str(toml).unwrap();
-        assert!(cfg.api_key.is_none());
-        assert_eq!(cfg.backend, BackendPreference::Auto);
-        assert_eq!(cfg.discovery_interval_secs, 60);
+        assert!(cfg.api_key().is_none());
+        assert_eq!(cfg.backend(), BackendPreference::Auto);
+        assert_eq!(cfg.discovery_interval_secs(), 60);
     }
 
     #[test]
     fn config_parse_local_only() {
         let toml = r#"backend = "local""#;
         let cfg: Config = toml::from_str(toml).unwrap();
-        assert_eq!(cfg.backend, BackendPreference::LocalOnly);
+        assert_eq!(cfg.backend(), BackendPreference::LocalOnly);
     }
 
     #[test]
@@ -189,10 +255,14 @@ mod tests {
 
     #[test]
     fn config_debug_redacts_api_key() {
-        let cfg = Config {
-            api_key: Some("secret-key-12345".into()),
-            ..Config::default()
-        };
+        let cfg = Config::new(
+            Some("secret-key-12345".into()),
+            BackendPreference::Auto,
+            60,
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .unwrap();
         let debug = format!("{:?}", cfg);
         assert!(!debug.contains("secret-key-12345"));
         assert!(debug.contains("[REDACTED]"));
@@ -219,7 +289,7 @@ mod tests {
     fn config_discovery_interval_at_minimum() {
         let toml = "discovery_interval_secs = 5";
         let cfg: Config = toml::from_str(toml).unwrap();
-        assert_eq!(cfg.discovery_interval_secs, 5);
+        assert_eq!(cfg.discovery_interval_secs(), 5);
     }
 
     #[test]
