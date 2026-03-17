@@ -270,10 +270,17 @@ impl DeviceRegistry {
                 let key = member.to_lowercase();
                 let resolved = name_map.get(&key).or_else(|| alias_map.get(&key));
                 match resolved {
-                    Some(id) => {
+                    Some(id) if devices.contains_key(id) => {
                         if seen.insert(id.clone()) {
                             members.push(id.clone());
                         }
+                    }
+                    Some(_) => {
+                        tracing::warn!(
+                            group = %group_name,
+                            member = %member,
+                            "group member resolved but device was pruned by backend selection, skipping"
+                        );
                     }
                     None => {
                         tracing::warn!(
