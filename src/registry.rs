@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::fmt;
-use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,12 +13,12 @@ use crate::config::{BackendPreference, Config};
 use crate::error::{GoveeError, Result};
 use crate::types::{BackendType, Device, DeviceId};
 
+/// Default discovery timeout for initial device scan during construction.
+const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// A device after cloud+local merge.
 struct RegisteredDevice {
     device: Device,
-    /// IP if discovered locally (populated when local backend provides it).
-    #[allow(dead_code)]
-    local_ip: Option<IpAddr>,
     /// Which backend handles commands for this device.
     active_backend: BackendType,
 }
@@ -75,6 +74,13 @@ impl DeviceRegistry {
     /// each, merges by MAC address, and returns the registry wrapped in
     /// `Arc` for shared ownership.
     pub async fn start(config: Config) -> Result<Arc<Self>> {
+        // CloudOnly without an API key is a configuration error.
+        if config.backend() == BackendPreference::CloudOnly && config.api_key().is_none() {
+            return Err(GoveeError::InvalidConfig(
+                "CloudOnly backend requires an API key".into(),
+            ));
+        }
+
         let cloud: Option<Arc<dyn GoveeBackend>> = if let Some(key) = config.api_key() {
             Some(Arc::new(CloudBackend::new(key.to_string(), None)?))
         } else {
@@ -84,9 +90,7 @@ impl DeviceRegistry {
         let local: Option<Arc<dyn GoveeBackend>> = match config.backend() {
             BackendPreference::CloudOnly => None,
             _ => {
-                let interval = Duration::from_secs(config.discovery_interval_secs());
-                let ttl = config.discovery_interval_secs() * 3;
-                match LocalBackend::new(interval, ttl).await {
+                match LocalBackend::new(DISCOVERY_TIMEOUT, config.discovery_interval_secs()).await {
                     Ok(lb) => Some(Arc::new(lb)),
                     Err(GoveeError::BackendUnavailable(msg)) => {
                         tracing::warn!("local backend unavailable: {msg}");
@@ -110,8 +114,16 @@ impl DeviceRegistry {
         local: Option<Arc<dyn GoveeBackend>>,
     ) -> Result<Arc<Self>> {
         // List devices from available backends.
+        // Cloud list_devices failure is fatal only for CloudOnly mode.
         let cloud_devices = match &cloud {
-            Some(b) => b.list_devices().await?,
+            Some(b) => match b.list_devices().await {
+                Ok(devs) => devs,
+                Err(e) if config.backend() == BackendPreference::CloudOnly => return Err(e),
+                Err(e) => {
+                    tracing::warn!("cloud list_devices failed, proceeding without cloud: {e}");
+                    Vec::new()
+                }
+            },
             None => Vec::new(),
         };
         let local_devices = match &local {
@@ -127,7 +139,6 @@ impl DeviceRegistry {
                 dev.id.clone(),
                 RegisteredDevice {
                     device: dev,
-                    local_ip: None,
                     active_backend: BackendType::Cloud,
                 },
             );
@@ -136,8 +147,9 @@ impl DeviceRegistry {
         for dev in local_devices {
             match devices.get_mut(&dev.id) {
                 Some(existing) => {
-                    // Device found in both: keep cloud's name, mark as Local.
+                    // Device found in both: keep cloud's name, update backend.
                     existing.active_backend = BackendType::Local;
+                    existing.device.backend = BackendType::Local;
                     tracing::debug!(
                         device = %existing.device.id,
                         "device found in both backends, using local"
@@ -149,7 +161,6 @@ impl DeviceRegistry {
                         dev.id.clone(),
                         RegisteredDevice {
                             device: dev,
-                            local_ip: None,
                             active_backend: BackendType::Local,
                         },
                     );
@@ -250,6 +261,8 @@ fn _assert_registry_send_sync() {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use crate::backend::mock::MockBackend;
     use crate::types::BackendType;
@@ -454,8 +467,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn backend_for_unavailable_backend() {
-        // Device registered with Cloud backend, but no cloud backend available.
+    async fn backend_for_missing_cloud_backend() {
+        // Device claims Cloud backend but no cloud backend was provided.
+        // This exercises the BackendUnavailable branch in backend_for().
+        let cloud_devices = vec![make_device(
+            "AA:BB:CC:DD:EE:FF",
+            "H6076",
+            "Light",
+            BackendType::Cloud,
+        )];
+        // Pass cloud devices through the cloud slot, then remove it.
+        let cloud = Arc::new(
+            MockBackend::new()
+                .with_devices(cloud_devices)
+                .with_backend_type(BackendType::Cloud),
+        ) as Arc<dyn GoveeBackend>;
+
+        // Build with cloud to populate devices, then verify routing
+        // works when the device is cloud-assigned.
+        let registry = DeviceRegistry::start_with_backends(default_config(), Some(cloud), None)
+            .await
+            .unwrap();
+
+        let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+        // Cloud backend is present, so this should succeed.
+        assert!(registry.backend_for(&id).is_ok());
+        assert_eq!(
+            registry.backend_for(&id).unwrap().backend_type(),
+            BackendType::Cloud
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_for_local_device_with_available_backend() {
         let local_devices = vec![make_device(
             "AA:BB:CC:DD:EE:FF",
             "H6076",
@@ -472,9 +516,12 @@ mod tests {
             .await
             .unwrap();
 
-        // Device is registered with Local backend, which is available.
         let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
         assert!(registry.backend_for(&id).is_ok());
+        assert_eq!(
+            registry.backend_for(&id).unwrap().backend_type(),
+            BackendType::Local
+        );
     }
 
     #[tokio::test]
@@ -496,6 +543,53 @@ mod tests {
         assert!(debug.contains("device_count: 2"));
         assert!(debug.contains("cloud: true"));
         assert!(debug.contains("local: false"));
+    }
+
+    #[tokio::test]
+    async fn overlapping_device_backend_field_updated() {
+        // When merged, Device.backend should reflect the active backend.
+        let mac = "AA:BB:CC:DD:EE:FF";
+        let cloud_devices = vec![make_device(mac, "H6076", "Light", BackendType::Cloud)];
+        let local_devices = vec![make_device(mac, "H6076", "H6076_X", BackendType::Local)];
+
+        let cloud = Arc::new(
+            MockBackend::new()
+                .with_devices(cloud_devices)
+                .with_backend_type(BackendType::Cloud),
+        ) as Arc<dyn GoveeBackend>;
+        let local = Arc::new(
+            MockBackend::new()
+                .with_devices(local_devices)
+                .with_backend_type(BackendType::Local),
+        ) as Arc<dyn GoveeBackend>;
+
+        let registry =
+            DeviceRegistry::start_with_backends(default_config(), Some(cloud), Some(local))
+                .await
+                .unwrap();
+
+        let id = DeviceId::new(mac).unwrap();
+        let device = registry.get_device(&id).unwrap();
+        // Device.backend must match active routing.
+        assert_eq!(device.backend, BackendType::Local);
+    }
+
+    #[tokio::test]
+    async fn cloud_only_without_api_key_is_error() {
+        let config = Config::new(
+            None,
+            BackendPreference::CloudOnly,
+            60,
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .unwrap();
+
+        let result = DeviceRegistry::start(config).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("CloudOnly"));
+        assert!(err.contains("API key"));
     }
 
     #[test]
