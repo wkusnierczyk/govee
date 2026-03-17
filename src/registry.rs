@@ -46,10 +46,8 @@ enum CacheSource {
 /// Central device registry with backend selection and state caching.
 ///
 /// Created via [`DeviceRegistry::start`], which returns an `Arc<Self>`.
-/// The registry merges device lists from cloud and local backends,
-/// provides name/alias resolution, per-device backend routing,
-/// and (in future waves) optimistic state caching with background
-/// reconciliation.
+/// The registry merges device lists from cloud and local backends
+/// and routes commands to the appropriate backend per device.
 pub struct DeviceRegistry {
     devices: HashMap<DeviceId, RegisteredDevice>,
     cloud: Option<Arc<dyn GoveeBackend>>,
@@ -132,7 +130,14 @@ impl DeviceRegistry {
             None => Vec::new(),
         };
         let local_devices = match &local {
-            Some(b) => b.list_devices().await?,
+            Some(b) => match b.list_devices().await {
+                Ok(devs) => devs,
+                Err(e) if config.backend() == BackendPreference::LocalOnly => return Err(e),
+                Err(e) => {
+                    tracing::warn!("local list_devices failed, proceeding without local: {e}");
+                    Vec::new()
+                }
+            },
             None => Vec::new(),
         };
 
