@@ -2320,18 +2320,9 @@ mod tests {
 
     #[tokio::test]
     async fn group_partial_failure() {
-        // Create a group with two devices. One backend will succeed,
-        // the other will fail because it's routed to a missing backend.
-        //
-        // Device 1: cloud backend (present, succeeds)
-        // Device 2: local backend (not present → BackendUnavailable)
-        //
-        // We achieve this by using two mocks: cloud has device 1,
-        // local has device 2. Then we drop local after construction
-        // by using CloudOnly mode to force device 2 to Cloud, but
-        // device 2 is only in local... Actually this is tricky.
-        //
-        // Simpler: use a FailingBackend for one device.
+        // Two devices in one group: cloud mock succeeds for device 1,
+        // FailingBackend always returns errors for device 2.
+        // Result: PartialFailure with one succeeded, one failed.
         use async_trait::async_trait;
 
         struct FailingBackend;
