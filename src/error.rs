@@ -40,6 +40,14 @@ pub enum GoveeError {
 
     #[error("invalid config: {0}")]
     InvalidConfig(String),
+
+    #[error("partial failure: {succeeded_count} succeeded, {failed_count} failed")]
+    PartialFailure {
+        succeeded: Vec<crate::types::DeviceId>,
+        failed: Vec<(crate::types::DeviceId, Box<GoveeError>)>,
+        succeeded_count: usize,
+        failed_count: usize,
+    },
 }
 
 /// Convenience alias used throughout the crate.

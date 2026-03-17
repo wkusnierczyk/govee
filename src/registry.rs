@@ -260,7 +260,46 @@ impl DeviceRegistry {
             }
         }
 
-        // -- group resolution (#28) --
+        // Populate group_map: lowercased group name → Vec<DeviceId>.
+        // Members resolve via name_map first, then alias_map (same as resolve()).
+        let mut group_map = HashMap::new();
+        for (group_name, member_names) in config.groups() {
+            let mut members = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            for member in member_names {
+                let key = member.to_lowercase();
+                let resolved = name_map.get(&key).or_else(|| alias_map.get(&key));
+                match resolved {
+                    Some(id) if devices.contains_key(id) => {
+                        if seen.insert(id.clone()) {
+                            members.push(id.clone());
+                        }
+                    }
+                    Some(_) => {
+                        tracing::warn!(
+                            group = %group_name,
+                            member = %member,
+                            "group member resolved but device was pruned by backend selection, skipping"
+                        );
+                    }
+                    None => {
+                        tracing::warn!(
+                            group = %group_name,
+                            member = %member,
+                            "group member does not match any device or alias, skipping"
+                        );
+                    }
+                }
+            }
+            let group_key = group_name.to_lowercase();
+            if let Some(prev) = group_map.insert(group_key, members) {
+                tracing::warn!(
+                    group = %group_name,
+                    previous_size = prev.len(),
+                    "case-insensitive group name collision, overwriting"
+                );
+            }
+        }
 
         let cancel = CancellationToken::new();
         let interval = Duration::from_secs(config.discovery_interval_secs());
@@ -272,7 +311,7 @@ impl DeviceRegistry {
             local,
             alias_map,
             name_map,
-            group_map: HashMap::new(),
+            group_map,
             state_cache: RwLock::new(HashMap::new()),
             cancel,
             config,
@@ -476,6 +515,78 @@ impl DeviceRegistry {
         Ok(())
     }
 
+    /// Resolve a group name to its member device IDs.
+    ///
+    /// Returns `DeviceNotFound` if no group with the given name exists.
+    pub fn resolve_group(&self, name: &str) -> Result<Vec<DeviceId>> {
+        self.group_map
+            .get(&name.to_lowercase())
+            .cloned()
+            .ok_or_else(|| GoveeError::DeviceNotFound(format!("group: {name}")))
+    }
+
+    /// Turn all devices in a group on or off.
+    ///
+    /// Executes commands concurrently via `join_all` (unbounded). Designed
+    /// for typical Govee setups with fewer than ~20 devices per group.
+    /// Larger groups may trigger cloud API rate limits or flood the LAN
+    /// with UDP packets. Returns `Ok(())` if all succeed, or
+    /// `PartialFailure` if any fail.
+    pub async fn group_set_power(self: &Arc<Self>, group: &str, on: bool) -> Result<()> {
+        let ids = self.resolve_group(group)?;
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let results: Vec<_> =
+            futures::future::join_all(ids.iter().map(|id| self.set_power(id, on))).await;
+        collect_group_results(&ids, results)
+    }
+
+    /// Set brightness for all devices in a group.
+    ///
+    /// Executes commands concurrently (unbounded; see [`group_set_power`]
+    /// for concurrency notes). Returns `Ok(())` if all succeed, or
+    /// `PartialFailure` if any fail.
+    pub async fn group_set_brightness(self: &Arc<Self>, group: &str, value: u8) -> Result<()> {
+        let ids = self.resolve_group(group)?;
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let results: Vec<_> =
+            futures::future::join_all(ids.iter().map(|id| self.set_brightness(id, value))).await;
+        collect_group_results(&ids, results)
+    }
+
+    /// Set color for all devices in a group.
+    ///
+    /// Executes commands concurrently (unbounded; see [`group_set_power`]
+    /// for concurrency notes). Returns `Ok(())` if all succeed, or
+    /// `PartialFailure` if any fail.
+    pub async fn group_set_color(self: &Arc<Self>, group: &str, color: Color) -> Result<()> {
+        let ids = self.resolve_group(group)?;
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let results: Vec<_> =
+            futures::future::join_all(ids.iter().map(|id| self.set_color(id, color))).await;
+        collect_group_results(&ids, results)
+    }
+
+    /// Set color temperature for all devices in a group.
+    ///
+    /// Executes commands concurrently (unbounded; see [`group_set_power`]
+    /// for concurrency notes). Returns `Ok(())` if all succeed, or
+    /// `PartialFailure` if any fail.
+    pub async fn group_set_color_temp(self: &Arc<Self>, group: &str, kelvin: u32) -> Result<()> {
+        let ids = self.resolve_group(group)?;
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let results: Vec<_> =
+            futures::future::join_all(ids.iter().map(|id| self.set_color_temp(id, kelvin))).await;
+        collect_group_results(&ids, results)
+    }
+
     /// Test-only constructor that accepts pre-built backends.
     #[cfg(test)]
     pub(crate) async fn start_with_backends(
@@ -484,6 +595,33 @@ impl DeviceRegistry {
         local: Option<Arc<dyn GoveeBackend>>,
     ) -> Result<Arc<Self>> {
         Self::build(config, cloud, local).await
+    }
+}
+
+/// Collect results from concurrent group commands.
+///
+/// Returns `Ok(())` if all results succeeded, or `PartialFailure` with
+/// details of which devices succeeded and which failed.
+fn collect_group_results(ids: &[DeviceId], results: Vec<Result<()>>) -> Result<()> {
+    let mut succeeded = Vec::new();
+    let mut failed = Vec::new();
+
+    for (id, result) in ids.iter().zip(results) {
+        match result {
+            Ok(()) => succeeded.push(id.clone()),
+            Err(e) => failed.push((id.clone(), Box::new(e))),
+        }
+    }
+
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(GoveeError::PartialFailure {
+            succeeded_count: succeeded.len(),
+            failed_count: failed.len(),
+            succeeded,
+            failed,
+        })
     }
 }
 
@@ -1851,5 +1989,428 @@ mod tests {
         let unknown = DeviceId::new("FF:FF:FF:FF:FF:FF").unwrap();
         let err = registry.set_color_temp(&unknown, 4000).await.unwrap_err();
         assert!(matches!(err, GoveeError::DeviceNotFound(_)));
+    }
+
+    // -- group resolution and group commands (#28) --
+
+    fn config_with_groups(groups: HashMap<String, Vec<String>>) -> Config {
+        Config::new(None, BackendPreference::Auto, 60, HashMap::new(), groups).unwrap()
+    }
+
+    #[tokio::test]
+    async fn resolve_group_known_group() {
+        let cloud_devices = vec![
+            make_device(
+                "AA:BB:CC:DD:EE:01",
+                "H6076",
+                "Kitchen Light",
+                BackendType::Cloud,
+            ),
+            make_device(
+                "AA:BB:CC:DD:EE:02",
+                "H6078",
+                "Bedroom Light",
+                BackendType::Cloud,
+            ),
+        ];
+        let cloud = Arc::new(
+            MockBackend::new()
+                .with_devices(cloud_devices)
+                .with_backend_type(BackendType::Cloud),
+        ) as Arc<dyn GoveeBackend>;
+
+        let mut groups = HashMap::new();
+        groups.insert(
+            "all".to_string(),
+            vec!["Kitchen Light".to_string(), "Bedroom Light".to_string()],
+        );
+        let config = config_with_groups(groups);
+
+        let registry = DeviceRegistry::start_with_backends(config, Some(cloud), None)
+            .await
+            .unwrap();
+
+        let ids = registry.resolve_group("all").unwrap();
+        assert_eq!(ids.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn resolve_group_case_insensitive() {
+        let cloud_devices = vec![make_device(
+            "AA:BB:CC:DD:EE:01",
+            "H6076",
+            "Kitchen Light",
+            BackendType::Cloud,
+        )];
+        let cloud = Arc::new(
+            MockBackend::new()
+                .with_devices(cloud_devices)
+                .with_backend_type(BackendType::Cloud),
+        ) as Arc<dyn GoveeBackend>;
+
+        let mut groups = HashMap::new();
+        groups.insert("MyGroup".to_string(), vec!["Kitchen Light".to_string()]);
+        let config = config_with_groups(groups);
+
+        let registry = DeviceRegistry::start_with_backends(config, Some(cloud), None)
+            .await
+            .unwrap();
+
+        let ids = registry.resolve_group("MYGROUP").unwrap();
+        assert_eq!(ids.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn resolve_group_unknown_returns_error() {
+        let registry = DeviceRegistry::start_with_backends(default_config(), None, None)
+            .await
+            .unwrap();
+
+        let err = registry.resolve_group("nonexistent").unwrap_err();
+        assert!(matches!(err, GoveeError::DeviceNotFound(ref s) if s.contains("group")));
+    }
+
+    #[tokio::test]
+    async fn group_unresolvable_member_excluded() {
+        let cloud_devices = vec![make_device(
+            "AA:BB:CC:DD:EE:01",
+            "H6076",
+            "Kitchen Light",
+            BackendType::Cloud,
+        )];
+        let cloud = Arc::new(
+            MockBackend::new()
+                .with_devices(cloud_devices)
+                .with_backend_type(BackendType::Cloud),
+        ) as Arc<dyn GoveeBackend>;
+
+        let mut groups = HashMap::new();
+        groups.insert(
+            "partial".to_string(),
+            vec![
+                "Kitchen Light".to_string(),
+                "Nonexistent Device".to_string(),
+            ],
+        );
+        let config = config_with_groups(groups);
+
+        let registry = DeviceRegistry::start_with_backends(config, Some(cloud), None)
+            .await
+            .unwrap();
+
+        let ids = registry.resolve_group("partial").unwrap();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(ids[0], DeviceId::new("AA:BB:CC:DD:EE:01").unwrap());
+    }
+
+    #[tokio::test]
+    async fn group_set_power_empty_group_ok() {
+        let mut groups = HashMap::new();
+        groups.insert("empty".to_string(), vec!["No Such Device".to_string()]);
+        let config = config_with_groups(groups);
+
+        let registry = DeviceRegistry::start_with_backends(config, None, None)
+            .await
+            .unwrap();
+
+        // All members unresolvable → empty group → Ok(())
+        registry.group_set_power("empty", true).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn group_set_power_all_succeed() {
+        let state = make_state(false, 50, 0, 0, 0);
+        let cloud_devices = vec![
+            make_device(
+                "AA:BB:CC:DD:EE:01",
+                "H6076",
+                "Kitchen Light",
+                BackendType::Cloud,
+            ),
+            make_device(
+                "AA:BB:CC:DD:EE:02",
+                "H6078",
+                "Bedroom Light",
+                BackendType::Cloud,
+            ),
+        ];
+        let cloud = Arc::new(
+            MockBackend::new()
+                .with_devices(cloud_devices)
+                .with_state(state)
+                .with_backend_type(BackendType::Cloud),
+        ) as Arc<dyn GoveeBackend>;
+
+        let mut groups = HashMap::new();
+        groups.insert(
+            "all".to_string(),
+            vec!["Kitchen Light".to_string(), "Bedroom Light".to_string()],
+        );
+        let config = config_with_groups(groups);
+
+        let registry = DeviceRegistry::start_with_backends(config, Some(cloud), None)
+            .await
+            .unwrap();
+
+        registry.group_set_power("all", true).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn group_set_brightness_all_succeed() {
+        let state = make_state(true, 50, 0, 0, 0);
+        let cloud_devices = vec![make_device(
+            "AA:BB:CC:DD:EE:01",
+            "H6076",
+            "Kitchen Light",
+            BackendType::Cloud,
+        )];
+        let cloud = Arc::new(
+            MockBackend::new()
+                .with_devices(cloud_devices)
+                .with_state(state)
+                .with_backend_type(BackendType::Cloud),
+        ) as Arc<dyn GoveeBackend>;
+
+        let mut groups = HashMap::new();
+        groups.insert("lights".to_string(), vec!["Kitchen Light".to_string()]);
+        let config = config_with_groups(groups);
+
+        let registry = DeviceRegistry::start_with_backends(config, Some(cloud), None)
+            .await
+            .unwrap();
+
+        registry.group_set_brightness("lights", 80).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn group_set_color_all_succeed() {
+        use crate::types::Color;
+
+        let state = make_state(true, 50, 0, 0, 0);
+        let cloud_devices = vec![make_device(
+            "AA:BB:CC:DD:EE:01",
+            "H6076",
+            "Kitchen Light",
+            BackendType::Cloud,
+        )];
+        let cloud = Arc::new(
+            MockBackend::new()
+                .with_devices(cloud_devices)
+                .with_state(state)
+                .with_backend_type(BackendType::Cloud),
+        ) as Arc<dyn GoveeBackend>;
+
+        let mut groups = HashMap::new();
+        groups.insert("lights".to_string(), vec!["Kitchen Light".to_string()]);
+        let config = config_with_groups(groups);
+
+        let registry = DeviceRegistry::start_with_backends(config, Some(cloud), None)
+            .await
+            .unwrap();
+
+        registry
+            .group_set_color("lights", Color::new(255, 0, 0))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn group_set_color_temp_all_succeed() {
+        let state = make_state(true, 50, 0, 0, 0);
+        let cloud_devices = vec![make_device(
+            "AA:BB:CC:DD:EE:01",
+            "H6076",
+            "Kitchen Light",
+            BackendType::Cloud,
+        )];
+        let cloud = Arc::new(
+            MockBackend::new()
+                .with_devices(cloud_devices)
+                .with_state(state)
+                .with_backend_type(BackendType::Cloud),
+        ) as Arc<dyn GoveeBackend>;
+
+        let mut groups = HashMap::new();
+        groups.insert("lights".to_string(), vec!["Kitchen Light".to_string()]);
+        let config = config_with_groups(groups);
+
+        let registry = DeviceRegistry::start_with_backends(config, Some(cloud), None)
+            .await
+            .unwrap();
+
+        registry.group_set_color_temp("lights", 4000).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn group_command_unknown_group_returns_error() {
+        let registry = DeviceRegistry::start_with_backends(default_config(), None, None)
+            .await
+            .unwrap();
+
+        let err = registry
+            .group_set_power("nonexistent", true)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, GoveeError::DeviceNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn group_resolves_alias_members() {
+        let mut aliases = HashMap::new();
+        aliases.insert("bed".to_string(), "Bedroom Light".to_string());
+
+        let mut groups = HashMap::new();
+        groups.insert("upstairs".to_string(), vec!["bed".to_string()]);
+
+        let config = Config::new(None, BackendPreference::Auto, 60, aliases, groups).unwrap();
+
+        let cloud = Arc::new(
+            MockBackend::new()
+                .with_devices(vec![make_device(
+                    "AA:BB:CC:DD:EE:01",
+                    "H6076",
+                    "Bedroom Light",
+                    BackendType::Cloud,
+                )])
+                .with_backend_type(BackendType::Cloud),
+        ) as Arc<dyn GoveeBackend>;
+
+        let registry = DeviceRegistry::start_with_backends(config, Some(cloud), None)
+            .await
+            .unwrap();
+
+        let members = registry.resolve_group("upstairs").unwrap();
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0], DeviceId::new("AA:BB:CC:DD:EE:01").unwrap());
+    }
+
+    #[tokio::test]
+    async fn group_deduplicates_members() {
+        // Both canonical name and alias resolve to the same device.
+        let mut aliases = HashMap::new();
+        aliases.insert("bed".to_string(), "Bedroom Light".to_string());
+
+        let mut groups = HashMap::new();
+        groups.insert(
+            "upstairs".to_string(),
+            vec!["Bedroom Light".to_string(), "bed".to_string()],
+        );
+
+        let config = Config::new(None, BackendPreference::Auto, 60, aliases, groups).unwrap();
+
+        let cloud = Arc::new(
+            MockBackend::new()
+                .with_devices(vec![make_device(
+                    "AA:BB:CC:DD:EE:01",
+                    "H6076",
+                    "Bedroom Light",
+                    BackendType::Cloud,
+                )])
+                .with_backend_type(BackendType::Cloud),
+        ) as Arc<dyn GoveeBackend>;
+
+        let registry = DeviceRegistry::start_with_backends(config, Some(cloud), None)
+            .await
+            .unwrap();
+
+        // Should have only 1 member, not 2.
+        let members = registry.resolve_group("upstairs").unwrap();
+        assert_eq!(members.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn group_partial_failure() {
+        // Two devices in one group: cloud mock succeeds for device 1,
+        // FailingBackend always returns errors for device 2.
+        // Result: PartialFailure with one succeeded, one failed.
+        use async_trait::async_trait;
+
+        struct FailingBackend;
+
+        #[async_trait]
+        impl GoveeBackend for FailingBackend {
+            async fn list_devices(&self) -> crate::error::Result<Vec<Device>> {
+                Ok(vec![Device {
+                    id: DeviceId::new("AA:BB:CC:DD:EE:02").unwrap(),
+                    model: "H6078".into(),
+                    name: "Failing Light".into(),
+                    alias: None,
+                    backend: BackendType::Local,
+                }])
+            }
+            async fn get_state(
+                &self,
+                _id: &DeviceId,
+            ) -> crate::error::Result<crate::types::DeviceState> {
+                Err(GoveeError::DiscoveryTimeout)
+            }
+            async fn set_power(&self, _id: &DeviceId, _on: bool) -> crate::error::Result<()> {
+                Err(GoveeError::DiscoveryTimeout)
+            }
+            async fn set_brightness(&self, _id: &DeviceId, _value: u8) -> crate::error::Result<()> {
+                Err(GoveeError::DiscoveryTimeout)
+            }
+            async fn set_color(
+                &self,
+                _id: &DeviceId,
+                _color: crate::types::Color,
+            ) -> crate::error::Result<()> {
+                Err(GoveeError::DiscoveryTimeout)
+            }
+            async fn set_color_temp(
+                &self,
+                _id: &DeviceId,
+                _kelvin: u32,
+            ) -> crate::error::Result<()> {
+                Err(GoveeError::DiscoveryTimeout)
+            }
+            fn backend_type(&self) -> BackendType {
+                BackendType::Local
+            }
+        }
+
+        let state = make_state(true, 50, 0, 255, 0);
+
+        let mut groups = HashMap::new();
+        groups.insert(
+            "all".to_string(),
+            vec!["Test Light".to_string(), "Failing Light".to_string()],
+        );
+
+        let config =
+            Config::new(None, BackendPreference::Auto, 60, HashMap::new(), groups).unwrap();
+
+        let cloud = Arc::new(
+            MockBackend::new()
+                .with_devices(vec![make_device(
+                    "AA:BB:CC:DD:EE:01",
+                    "H6076",
+                    "Test Light",
+                    BackendType::Cloud,
+                )])
+                .with_state(state)
+                .with_backend_type(BackendType::Cloud),
+        ) as Arc<dyn GoveeBackend>;
+
+        let local = Arc::new(FailingBackend) as Arc<dyn GoveeBackend>;
+
+        let registry = DeviceRegistry::start_with_backends(config, Some(cloud), Some(local))
+            .await
+            .unwrap();
+
+        let result = registry.group_set_power("all", true).await;
+        assert!(result.is_err());
+
+        match result.unwrap_err() {
+            GoveeError::PartialFailure {
+                succeeded, failed, ..
+            } => {
+                assert_eq!(succeeded.len(), 1);
+                assert_eq!(failed.len(), 1);
+                assert_eq!(succeeded[0], DeviceId::new("AA:BB:CC:DD:EE:01").unwrap());
+                assert_eq!(failed[0].0, DeviceId::new("AA:BB:CC:DD:EE:02").unwrap());
+            }
+            other => panic!("expected PartialFailure, got {:?}", other),
+        }
     }
 }
