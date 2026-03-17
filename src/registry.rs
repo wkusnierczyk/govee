@@ -180,7 +180,40 @@ impl DeviceRegistry {
 
         // -- name resolution (#24) --
 
-        // -- backend selection refinement (#25) --
+        // Backend selection refinement: adjust active_backend per preference.
+        match config.backend() {
+            BackendPreference::CloudOnly => {
+                for reg in devices.values_mut() {
+                    reg.active_backend = BackendType::Cloud;
+                    reg.device.backend = BackendType::Cloud;
+                }
+                tracing::debug!("CloudOnly mode: all devices assigned to cloud backend");
+            }
+            BackendPreference::LocalOnly => {
+                let before = devices.len();
+                devices.retain(|_id, reg| reg.active_backend == BackendType::Local);
+                let removed = before - devices.len();
+                if removed > 0 {
+                    tracing::info!(
+                        removed,
+                        "LocalOnly mode: removed cloud-only device(s) from registry"
+                    );
+                }
+                tracing::debug!(
+                    remaining = devices.len(),
+                    "LocalOnly mode: all remaining devices assigned to local backend"
+                );
+            }
+            BackendPreference::Auto => {
+                for reg in devices.values() {
+                    tracing::debug!(
+                        device = %reg.device.id,
+                        backend = %reg.active_backend,
+                        "Auto mode: device backend assignment"
+                    );
+                }
+            }
+        }
 
         // -- group resolution (#28) --
 
@@ -234,6 +267,14 @@ impl DeviceRegistry {
                 .as_deref()
                 .ok_or_else(|| GoveeError::BackendUnavailable("local".into())),
         }
+    }
+
+    /// Return `(DeviceId, BackendType)` for every registered device.
+    pub fn backend_status(&self) -> Vec<(DeviceId, BackendType)> {
+        self.devices
+            .iter()
+            .map(|(id, reg)| (id.clone(), reg.active_backend))
+            .collect()
     }
 
     /// Test-only constructor that accepts pre-built backends.
@@ -643,6 +684,213 @@ mod tests {
         let err = result.unwrap_err().to_string();
         assert!(err.contains("CloudOnly"));
         assert!(err.contains("API key"));
+    }
+
+    // -- Backend selection (#25) tests --
+
+    #[tokio::test]
+    async fn auto_mode_local_for_discovered_cloud_for_rest() {
+        let cloud_devices = vec![
+            make_device("AA:BB:CC:DD:EE:01", "H6076", "Light A", BackendType::Cloud),
+            make_device("AA:BB:CC:DD:EE:02", "H6078", "Light B", BackendType::Cloud),
+        ];
+        let local_devices = vec![make_device(
+            "AA:BB:CC:DD:EE:01",
+            "H6076",
+            "H6076_X",
+            BackendType::Local,
+        )];
+
+        let cloud = Arc::new(
+            MockBackend::new()
+                .with_devices(cloud_devices)
+                .with_backend_type(BackendType::Cloud),
+        ) as Arc<dyn GoveeBackend>;
+        let local = Arc::new(
+            MockBackend::new()
+                .with_devices(local_devices)
+                .with_backend_type(BackendType::Local),
+        ) as Arc<dyn GoveeBackend>;
+
+        // Auto mode (default config).
+        let registry =
+            DeviceRegistry::start_with_backends(default_config(), Some(cloud), Some(local))
+                .await
+                .unwrap();
+
+        let id_local = DeviceId::new("AA:BB:CC:DD:EE:01").unwrap();
+        let id_cloud = DeviceId::new("AA:BB:CC:DD:EE:02").unwrap();
+
+        // Discovered locally → Local.
+        assert_eq!(
+            registry.backend_for(&id_local).unwrap().backend_type(),
+            BackendType::Local
+        );
+        // Cloud only → Cloud.
+        assert_eq!(
+            registry.backend_for(&id_cloud).unwrap().backend_type(),
+            BackendType::Cloud
+        );
+    }
+
+    #[tokio::test]
+    async fn cloud_only_mode_all_cloud() {
+        let cloud_devices = vec![
+            make_device("AA:BB:CC:DD:EE:01", "H6076", "Light A", BackendType::Cloud),
+            make_device("AA:BB:CC:DD:EE:02", "H6078", "Light B", BackendType::Cloud),
+        ];
+        let local_devices = vec![make_device(
+            "AA:BB:CC:DD:EE:01",
+            "H6076",
+            "H6076_X",
+            BackendType::Local,
+        )];
+
+        let cloud = Arc::new(
+            MockBackend::new()
+                .with_devices(cloud_devices)
+                .with_backend_type(BackendType::Cloud),
+        ) as Arc<dyn GoveeBackend>;
+        let local = Arc::new(
+            MockBackend::new()
+                .with_devices(local_devices)
+                .with_backend_type(BackendType::Local),
+        ) as Arc<dyn GoveeBackend>;
+
+        let config = Config::new(
+            Some("test-key".into()),
+            BackendPreference::CloudOnly,
+            60,
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .unwrap();
+
+        let registry = DeviceRegistry::start_with_backends(config, Some(cloud), Some(local))
+            .await
+            .unwrap();
+
+        let devices = registry.devices();
+        assert_eq!(devices.len(), 2);
+
+        // All devices should be Cloud.
+        for dev in &devices {
+            assert_eq!(dev.backend, BackendType::Cloud);
+        }
+    }
+
+    #[tokio::test]
+    async fn local_only_mode_excludes_cloud_only_devices() {
+        let cloud_devices = vec![
+            make_device("AA:BB:CC:DD:EE:01", "H6076", "Light A", BackendType::Cloud),
+            make_device("AA:BB:CC:DD:EE:02", "H6078", "Light B", BackendType::Cloud),
+        ];
+        let local_devices = vec![make_device(
+            "AA:BB:CC:DD:EE:01",
+            "H6076",
+            "H6076_X",
+            BackendType::Local,
+        )];
+
+        let cloud = Arc::new(
+            MockBackend::new()
+                .with_devices(cloud_devices)
+                .with_backend_type(BackendType::Cloud),
+        ) as Arc<dyn GoveeBackend>;
+        let local = Arc::new(
+            MockBackend::new()
+                .with_devices(local_devices)
+                .with_backend_type(BackendType::Local),
+        ) as Arc<dyn GoveeBackend>;
+
+        let config = Config::new(
+            None,
+            BackendPreference::LocalOnly,
+            60,
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .unwrap();
+
+        let registry = DeviceRegistry::start_with_backends(config, Some(cloud), Some(local))
+            .await
+            .unwrap();
+
+        let devices = registry.devices();
+        // Only the locally-discovered device remains.
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].id, DeviceId::new("AA:BB:CC:DD:EE:01").unwrap());
+        assert_eq!(devices[0].backend, BackendType::Local);
+
+        // Cloud-only device is gone.
+        let cloud_only_id = DeviceId::new("AA:BB:CC:DD:EE:02").unwrap();
+        assert!(registry.get_device(&cloud_only_id).is_err());
+    }
+
+    #[tokio::test]
+    async fn auto_no_api_key_local_only() {
+        // Auto mode without an API key → no cloud backend, only local devices.
+        let local_devices = vec![make_device(
+            "AA:BB:CC:DD:EE:01",
+            "H6076",
+            "H6076_X",
+            BackendType::Local,
+        )];
+
+        let local = Arc::new(
+            MockBackend::new()
+                .with_devices(local_devices)
+                .with_backend_type(BackendType::Local),
+        ) as Arc<dyn GoveeBackend>;
+
+        // default_config() → Auto, no API key.
+        let registry = DeviceRegistry::start_with_backends(default_config(), None, Some(local))
+            .await
+            .unwrap();
+
+        let devices = registry.devices();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].backend, BackendType::Local);
+    }
+
+    #[tokio::test]
+    async fn backend_status_reflects_assignments() {
+        let cloud_devices = vec![
+            make_device("AA:BB:CC:DD:EE:01", "H6076", "Light A", BackendType::Cloud),
+            make_device("AA:BB:CC:DD:EE:02", "H6078", "Light B", BackendType::Cloud),
+        ];
+        let local_devices = vec![make_device(
+            "AA:BB:CC:DD:EE:01",
+            "H6076",
+            "H6076_X",
+            BackendType::Local,
+        )];
+
+        let cloud = Arc::new(
+            MockBackend::new()
+                .with_devices(cloud_devices)
+                .with_backend_type(BackendType::Cloud),
+        ) as Arc<dyn GoveeBackend>;
+        let local = Arc::new(
+            MockBackend::new()
+                .with_devices(local_devices)
+                .with_backend_type(BackendType::Local),
+        ) as Arc<dyn GoveeBackend>;
+
+        let registry =
+            DeviceRegistry::start_with_backends(default_config(), Some(cloud), Some(local))
+                .await
+                .unwrap();
+
+        let status = registry.backend_status();
+        assert_eq!(status.len(), 2);
+
+        let status_map: HashMap<DeviceId, BackendType> = status.into_iter().collect();
+        let id1 = DeviceId::new("AA:BB:CC:DD:EE:01").unwrap();
+        let id2 = DeviceId::new("AA:BB:CC:DD:EE:02").unwrap();
+
+        assert_eq!(status_map[&id1], BackendType::Local);
+        assert_eq!(status_map[&id2], BackendType::Cloud);
     }
 
     #[tokio::test]
