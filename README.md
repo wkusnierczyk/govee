@@ -2,12 +2,22 @@
 
 A Rust library for controlling Govee smart lighting devices. Provides idiomatic async access to both the Govee cloud API (v1) and the local LAN API over UDP, a unified backend abstraction, device registry with name/alias resolution, and a scene system for multi-device presets.
 
-Designed as a foundation for `govee-cli`, `govee-server`, and `govee-mcp` — it has no opinion about how it is invoked.
+Designed as a foundation for higher-level consumers — it has no opinion about how it is invoked.
+
+## Ecosystem
+
+| Crate | Description | Repo |
+|-------|-------------|------|
+| **govee** | Core library — backends, registry, scenes | [wkusnierczyk/govee](https://github.com/wkusnierczyk/govee) |
+| **govee-workflow** | Workflow engine — timed command sequences, choreography | [wkusnierczyk/govee-workflow](https://github.com/wkusnierczyk/govee-workflow) |
+| **govee-cli** | Command-line interface | [wkusnierczyk/govee-cli](https://github.com/wkusnierczyk/govee-cli) |
+| **govee-server** | HTTP/WebSocket server for remote control | [wkusnierczyk/govee-server](https://github.com/wkusnierczyk/govee-server) |
+| **govee-mcp** | Model Context Protocol server for AI agents | [wkusnierczyk/govee-mcp](https://github.com/wkusnierczyk/govee-mcp) |
 
 ## Status
 
 **WIP**: This project is currently in development and not ready for production use.  
-**Done**: [M1](#development-plan) in v0.1.0, [M2](#development-plan) in v0.2.0, [M3](#development-plan) in v0.3.0, [M4](#development-plan) in v0.4.0
+**Done**: [M1-M5](#development-plan) in v0.5.0
 
 ## Getting started
 
@@ -111,6 +121,6 @@ cargo clippy
 | **M2 — Core types & configuration** | `DeviceId`, `Device`, `DeviceState`, `Color`, `GoveeError`, `Config` with TOML parsing, input validation | v0.2.0 |
 | **M3 — Cloud backend (v1)** | `GoveeBackend` trait, `CloudBackend` (list, state, control), rate limit handling, User-Agent, timeouts, 84 wiremock+unit tests | v0.3.0 |
 | **M4 — Local LAN backend** | `LocalBackend` with UDP multicast discovery, unicast control, state queries, port conflict detection, TTL-based device cache | v0.4.0 |
-| **M5 — Device registry** | `DeviceRegistry`: cloud+local merge, name/alias resolution, backend auto-selection, optimistic state cache, groups | Pending |
-| **M6 — Scenes & workflow stub** | Built-in + user-defined scene presets, `apply_scene`, workflow engine stub (`NotImplemented`) | Pending |
+| **M5 — Device registry** | `DeviceRegistry`: cloud+local merge, name/alias resolution, backend auto-selection, optimistic state cache, groups | v0.5.0 |
+| **M6 — Scenes** | Built-in + user-defined scene presets, `apply_scene` with device/group targeting | Pending |
 | **M7 — SRE & hardening** | Structured tracing, retry/backoff, graceful degradation, security audit, integration test suite, threat model docs | Pending |
