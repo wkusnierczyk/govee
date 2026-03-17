@@ -178,7 +178,55 @@ impl DeviceRegistry {
             }
         }
 
-        // -- name resolution (#24) --
+        // Populate name_map: lowercased device name → device ID.
+        // Sort by DeviceId for deterministic collision resolution.
+        let mut name_map = HashMap::new();
+        let mut sorted_devices: Vec<_> = devices.values().collect();
+        sorted_devices.sort_by(|a, b| a.device.id.as_str().cmp(b.device.id.as_str()));
+        for reg in sorted_devices {
+            let key = reg.device.name.to_lowercase();
+            use std::collections::hash_map::Entry;
+            match name_map.entry(key) {
+                Entry::Occupied(mut e) => {
+                    tracing::warn!(
+                        name = %reg.device.name,
+                        new_device = %reg.device.id,
+                        previous_device = %e.get(),
+                        "duplicate device name, overwriting previous mapping"
+                    );
+                    e.insert(reg.device.id.clone());
+                }
+                Entry::Vacant(e) => {
+                    e.insert(reg.device.id.clone());
+                }
+            }
+        }
+
+        // Populate alias_map: lowercased alias → device ID (resolved via target name).
+        let mut alias_map = HashMap::new();
+        for (alias, target) in config.aliases() {
+            let alias_key = alias.to_lowercase();
+            let target_key = target.to_lowercase();
+            match name_map.get(&target_key) {
+                Some(device_id) => {
+                    if let Some(prev) = alias_map.insert(alias_key, device_id.clone()) {
+                        tracing::warn!(
+                            alias = %alias,
+                            new_target = %device_id,
+                            previous_target = %prev,
+                            "case-insensitive alias collision, overwriting"
+                        );
+                    }
+                }
+                None => {
+                    tracing::warn!(
+                        alias = %alias,
+                        target = %target,
+                        "alias target does not match any device name"
+                    );
+                }
+            }
+        }
 
         // Backend selection refinement: adjust active_backend per preference.
         match config.backend() {
@@ -223,8 +271,8 @@ impl DeviceRegistry {
             devices,
             cloud,
             local,
-            alias_map: HashMap::new(),
-            name_map: HashMap::new(),
+            alias_map,
+            name_map,
             group_map: HashMap::new(),
             state_cache: RwLock::new(HashMap::new()),
             cancel,
@@ -247,6 +295,21 @@ impl DeviceRegistry {
             .get(id)
             .map(|r| &r.device)
             .ok_or_else(|| GoveeError::DeviceNotFound(id.to_string()))
+    }
+
+    /// Resolve a device by name or alias.
+    ///
+    /// Looks up the lowercased `name` in the name map first, then the alias
+    /// map. Returns `DeviceNotFound` if neither matches.
+    pub fn resolve(&self, name: &str) -> Result<DeviceId> {
+        let key = name.to_lowercase();
+        if let Some(id) = self.name_map.get(&key) {
+            return Ok(id.clone());
+        }
+        if let Some(id) = self.alias_map.get(&key) {
+            return Ok(id.clone());
+        }
+        Err(GoveeError::DeviceNotFound(name.to_string()))
     }
 
     /// Return a reference to the backend responsible for the given device.
@@ -912,5 +975,218 @@ mod tests {
 
         let clone = Arc::clone(&registry);
         assert_eq!(registry.devices().len(), clone.devices().len());
+    }
+
+    // -- name resolution tests (#24) --
+
+    #[tokio::test]
+    async fn resolve_by_canonical_name_exact_case() {
+        let cloud = Arc::new(
+            MockBackend::new()
+                .with_devices(vec![make_device(
+                    "AA:BB:CC:DD:EE:01",
+                    "H6076",
+                    "Kitchen Light",
+                    BackendType::Cloud,
+                )])
+                .with_backend_type(BackendType::Cloud),
+        ) as Arc<dyn GoveeBackend>;
+
+        let registry = DeviceRegistry::start_with_backends(default_config(), Some(cloud), None)
+            .await
+            .unwrap();
+
+        let id = registry.resolve("Kitchen Light").unwrap();
+        assert_eq!(id, DeviceId::new("AA:BB:CC:DD:EE:01").unwrap());
+    }
+
+    #[tokio::test]
+    async fn resolve_by_canonical_name_different_case() {
+        let cloud = Arc::new(
+            MockBackend::new()
+                .with_devices(vec![make_device(
+                    "AA:BB:CC:DD:EE:01",
+                    "H6076",
+                    "Kitchen Light",
+                    BackendType::Cloud,
+                )])
+                .with_backend_type(BackendType::Cloud),
+        ) as Arc<dyn GoveeBackend>;
+
+        let registry = DeviceRegistry::start_with_backends(default_config(), Some(cloud), None)
+            .await
+            .unwrap();
+
+        let id = registry.resolve("kitchen light").unwrap();
+        assert_eq!(id, DeviceId::new("AA:BB:CC:DD:EE:01").unwrap());
+
+        let id = registry.resolve("KITCHEN LIGHT").unwrap();
+        assert_eq!(id, DeviceId::new("AA:BB:CC:DD:EE:01").unwrap());
+    }
+
+    #[tokio::test]
+    async fn resolve_by_alias() {
+        let mut aliases = HashMap::new();
+        aliases.insert("kitchen".to_string(), "Kitchen Light".to_string());
+
+        let config =
+            Config::new(None, BackendPreference::Auto, 60, aliases, HashMap::new()).unwrap();
+
+        let cloud = Arc::new(
+            MockBackend::new()
+                .with_devices(vec![make_device(
+                    "AA:BB:CC:DD:EE:01",
+                    "H6076",
+                    "Kitchen Light",
+                    BackendType::Cloud,
+                )])
+                .with_backend_type(BackendType::Cloud),
+        ) as Arc<dyn GoveeBackend>;
+
+        let registry = DeviceRegistry::start_with_backends(config, Some(cloud), None)
+            .await
+            .unwrap();
+
+        let id = registry.resolve("kitchen").unwrap();
+        assert_eq!(id, DeviceId::new("AA:BB:CC:DD:EE:01").unwrap());
+    }
+
+    #[tokio::test]
+    async fn resolve_unknown_name_returns_error() {
+        let cloud = Arc::new(
+            MockBackend::new()
+                .with_devices(vec![make_device(
+                    "AA:BB:CC:DD:EE:01",
+                    "H6076",
+                    "Kitchen Light",
+                    BackendType::Cloud,
+                )])
+                .with_backend_type(BackendType::Cloud),
+        ) as Arc<dyn GoveeBackend>;
+
+        let registry = DeviceRegistry::start_with_backends(default_config(), Some(cloud), None)
+            .await
+            .unwrap();
+
+        let err = registry.resolve("Nonexistent").unwrap_err();
+        assert!(matches!(err, GoveeError::DeviceNotFound(name) if name == "Nonexistent"));
+    }
+
+    #[tokio::test]
+    async fn resolve_multiple_aliases_same_device() {
+        let mut aliases = HashMap::new();
+        aliases.insert("kitchen".to_string(), "Kitchen Light".to_string());
+        aliases.insert("k".to_string(), "Kitchen Light".to_string());
+
+        let config =
+            Config::new(None, BackendPreference::Auto, 60, aliases, HashMap::new()).unwrap();
+
+        let cloud = Arc::new(
+            MockBackend::new()
+                .with_devices(vec![make_device(
+                    "AA:BB:CC:DD:EE:01",
+                    "H6076",
+                    "Kitchen Light",
+                    BackendType::Cloud,
+                )])
+                .with_backend_type(BackendType::Cloud),
+        ) as Arc<dyn GoveeBackend>;
+
+        let registry = DeviceRegistry::start_with_backends(config, Some(cloud), None)
+            .await
+            .unwrap();
+
+        let expected = DeviceId::new("AA:BB:CC:DD:EE:01").unwrap();
+        assert_eq!(registry.resolve("kitchen").unwrap(), expected);
+        assert_eq!(registry.resolve("k").unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn resolve_alias_target_not_found_not_registered() {
+        let mut aliases = HashMap::new();
+        aliases.insert("ghost".to_string(), "Does Not Exist".to_string());
+
+        let config =
+            Config::new(None, BackendPreference::Auto, 60, aliases, HashMap::new()).unwrap();
+
+        let cloud = Arc::new(
+            MockBackend::new()
+                .with_devices(vec![make_device(
+                    "AA:BB:CC:DD:EE:01",
+                    "H6076",
+                    "Kitchen Light",
+                    BackendType::Cloud,
+                )])
+                .with_backend_type(BackendType::Cloud),
+        ) as Arc<dyn GoveeBackend>;
+
+        let registry = DeviceRegistry::start_with_backends(config, Some(cloud), None)
+            .await
+            .unwrap();
+
+        // The alias "ghost" should not be registered since its target doesn't exist.
+        let err = registry.resolve("ghost").unwrap_err();
+        assert!(matches!(err, GoveeError::DeviceNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn resolve_name_collision_last_by_id_wins() {
+        // Two devices with the same name (case-insensitive). Devices are
+        // sorted by DeviceId before populating name_map, so the
+        // lexicographically last ID wins deterministically.
+        let cloud = Arc::new(
+            MockBackend::new()
+                .with_devices(vec![
+                    make_device(
+                        "AA:BB:CC:DD:EE:01",
+                        "H6076",
+                        "Living Room",
+                        BackendType::Cloud,
+                    ),
+                    make_device(
+                        "AA:BB:CC:DD:EE:02",
+                        "H6078",
+                        "Living Room",
+                        BackendType::Cloud,
+                    ),
+                ])
+                .with_backend_type(BackendType::Cloud),
+        ) as Arc<dyn GoveeBackend>;
+
+        let registry = DeviceRegistry::start_with_backends(default_config(), Some(cloud), None)
+            .await
+            .unwrap();
+
+        // Last by DeviceId sort order wins.
+        let id = registry.resolve("Living Room").unwrap();
+        assert_eq!(id, DeviceId::new("AA:BB:CC:DD:EE:02").unwrap());
+    }
+
+    #[tokio::test]
+    async fn resolve_alias_case_insensitive() {
+        let mut aliases = HashMap::new();
+        aliases.insert("kitchen".to_string(), "Kitchen Light".to_string());
+
+        let config =
+            Config::new(None, BackendPreference::Auto, 60, aliases, HashMap::new()).unwrap();
+
+        let cloud = Arc::new(
+            MockBackend::new()
+                .with_devices(vec![make_device(
+                    "AA:BB:CC:DD:EE:01",
+                    "H6076",
+                    "Kitchen Light",
+                    BackendType::Cloud,
+                )])
+                .with_backend_type(BackendType::Cloud),
+        ) as Arc<dyn GoveeBackend>;
+
+        let registry = DeviceRegistry::start_with_backends(config, Some(cloud), None)
+            .await
+            .unwrap();
+
+        let expected = DeviceId::new("AA:BB:CC:DD:EE:01").unwrap();
+        assert_eq!(registry.resolve("KITCHEN").unwrap(), expected);
+        assert_eq!(registry.resolve("Kitchen").unwrap(), expected);
     }
 }
