@@ -409,15 +409,14 @@ impl DeviceRegistry {
     /// Delegates to the device's backend and updates the state cache
     /// optimistically on success.
     pub async fn set_power(self: &Arc<Self>, id: &DeviceId, on: bool) -> Result<()> {
-        self.get_device(id)?;
         let backend = self.backend_for(id)?;
         backend.set_power(id, on).await?;
 
-        let mut new_state = self.get_state(id).await?;
-        new_state.on = on;
-        new_state.stale = false;
-        self.update_cache(id, new_state, CacheSource::Optimistic)
-            .await;
+        if let Ok(mut state) = self.get_state(id).await {
+            state.on = on;
+            state.stale = false;
+            self.update_cache(id, state, CacheSource::Optimistic).await;
+        }
 
         Ok(())
     }
@@ -427,15 +426,14 @@ impl DeviceRegistry {
     /// Delegates to the device's backend and updates the state cache
     /// optimistically on success.
     pub async fn set_brightness(self: &Arc<Self>, id: &DeviceId, value: u8) -> Result<()> {
-        self.get_device(id)?;
         let backend = self.backend_for(id)?;
         backend.set_brightness(id, value).await?;
 
-        let mut new_state = self.get_state(id).await?;
-        new_state.brightness = value;
-        new_state.stale = false;
-        self.update_cache(id, new_state, CacheSource::Optimistic)
-            .await;
+        if let Ok(mut state) = self.get_state(id).await {
+            state.brightness = value;
+            state.stale = false;
+            self.update_cache(id, state, CacheSource::Optimistic).await;
+        }
 
         Ok(())
     }
@@ -446,16 +444,15 @@ impl DeviceRegistry {
     /// optimistically on success. Clears `color_temp_kelvin` since
     /// color and color temperature are mutually exclusive.
     pub async fn set_color(self: &Arc<Self>, id: &DeviceId, color: Color) -> Result<()> {
-        self.get_device(id)?;
         let backend = self.backend_for(id)?;
         backend.set_color(id, color).await?;
 
-        let mut new_state = self.get_state(id).await?;
-        new_state.color = color;
-        new_state.color_temp_kelvin = None;
-        new_state.stale = false;
-        self.update_cache(id, new_state, CacheSource::Optimistic)
-            .await;
+        if let Ok(mut state) = self.get_state(id).await {
+            state.color = color;
+            state.color_temp_kelvin = None;
+            state.stale = false;
+            self.update_cache(id, state, CacheSource::Optimistic).await;
+        }
 
         Ok(())
     }
@@ -466,16 +463,15 @@ impl DeviceRegistry {
     /// optimistically on success. Resets `color` to black since color
     /// temperature and RGB color are mutually exclusive.
     pub async fn set_color_temp(self: &Arc<Self>, id: &DeviceId, kelvin: u32) -> Result<()> {
-        self.get_device(id)?;
         let backend = self.backend_for(id)?;
         backend.set_color_temp(id, kelvin).await?;
 
-        let mut new_state = self.get_state(id).await?;
-        new_state.color_temp_kelvin = Some(kelvin);
-        new_state.color = Color::new(0, 0, 0);
-        new_state.stale = false;
-        self.update_cache(id, new_state, CacheSource::Optimistic)
-            .await;
+        if let Ok(mut state) = self.get_state(id).await {
+            state.color_temp_kelvin = Some(kelvin);
+            state.color = Color::new(0, 0, 0);
+            state.stale = false;
+            self.update_cache(id, state, CacheSource::Optimistic).await;
+        }
 
         Ok(())
     }
@@ -1728,7 +1724,7 @@ mod tests {
     // -- Command delegation tests (#27) --
 
     #[tokio::test]
-    async fn set_power_delegates_and_updates_cache() {
+    async fn set_power_updates_cache_optimistically() {
         let state = make_state(true, 50, 255, 0, 0);
         let (cloud, id) = mock_with_device_and_state("AA:BB:CC:DD:EE:01", state);
 
@@ -1746,7 +1742,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_brightness_delegates_and_updates_cache() {
+    async fn set_brightness_updates_cache_optimistically() {
         let state = make_state(true, 50, 0, 255, 0);
         let (cloud, id) = mock_with_device_and_state("AA:BB:CC:DD:EE:02", state);
 
