@@ -1,5 +1,7 @@
 pub mod cloud;
 pub mod local;
+#[cfg(test)]
+pub(crate) mod mock;
 
 use async_trait::async_trait;
 
@@ -37,76 +39,8 @@ pub trait GoveeBackend: Send + Sync {
 
 #[cfg(test)]
 mod tests {
+    use super::mock::MockBackend;
     use super::*;
-
-    /// A configurable mock backend for testing trait consumers.
-    ///
-    /// Devices and state are set via builder methods. `get_state` returns
-    /// `DeviceNotFound` when no state is configured. Setter methods always
-    /// return `Ok(())`.
-    struct MockBackend {
-        devices: Vec<Device>,
-        state: Option<DeviceState>,
-        backend_type: BackendType,
-    }
-
-    impl MockBackend {
-        fn new() -> Self {
-            Self {
-                devices: Vec::new(),
-                state: None,
-                backend_type: BackendType::Cloud,
-            }
-        }
-
-        fn with_devices(mut self, devices: Vec<Device>) -> Self {
-            self.devices = devices;
-            self
-        }
-
-        fn with_state(mut self, state: DeviceState) -> Self {
-            self.state = Some(state);
-            self
-        }
-
-        fn with_backend_type(mut self, backend_type: BackendType) -> Self {
-            self.backend_type = backend_type;
-            self
-        }
-    }
-
-    #[async_trait]
-    impl GoveeBackend for MockBackend {
-        async fn list_devices(&self) -> Result<Vec<Device>> {
-            Ok(self.devices.clone())
-        }
-
-        async fn get_state(&self, id: &DeviceId) -> Result<DeviceState> {
-            self.state
-                .clone()
-                .ok_or_else(|| crate::error::GoveeError::DeviceNotFound(id.to_string()))
-        }
-
-        async fn set_power(&self, _id: &DeviceId, _on: bool) -> Result<()> {
-            Ok(())
-        }
-
-        async fn set_brightness(&self, _id: &DeviceId, _value: u8) -> Result<()> {
-            Ok(())
-        }
-
-        async fn set_color(&self, _id: &DeviceId, _color: Color) -> Result<()> {
-            Ok(())
-        }
-
-        async fn set_color_temp(&self, _id: &DeviceId, _kelvin: u32) -> Result<()> {
-            Ok(())
-        }
-
-        fn backend_type(&self) -> BackendType {
-            self.backend_type
-        }
-    }
 
     // Compile-time verification: GoveeBackend is Send + Sync
     fn _assert_send_sync<T: Send + Sync>() {}
