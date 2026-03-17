@@ -527,8 +527,11 @@ impl DeviceRegistry {
 
     /// Turn all devices in a group on or off.
     ///
-    /// Executes commands concurrently. Returns `Ok(())` if all succeed,
-    /// or `PartialFailure` if any fail.
+    /// Executes commands concurrently via `join_all` (unbounded). Designed
+    /// for typical Govee setups with fewer than ~20 devices per group.
+    /// Larger groups may trigger cloud API rate limits or flood the LAN
+    /// with UDP packets. Returns `Ok(())` if all succeed, or
+    /// `PartialFailure` if any fail.
     pub async fn group_set_power(self: &Arc<Self>, group: &str, on: bool) -> Result<()> {
         let ids = self.resolve_group(group)?;
         if ids.is_empty() {
@@ -541,8 +544,9 @@ impl DeviceRegistry {
 
     /// Set brightness for all devices in a group.
     ///
-    /// Executes commands concurrently. Returns `Ok(())` if all succeed,
-    /// or `PartialFailure` if any fail.
+    /// Executes commands concurrently (unbounded; see [`group_set_power`]
+    /// for concurrency notes). Returns `Ok(())` if all succeed, or
+    /// `PartialFailure` if any fail.
     pub async fn group_set_brightness(self: &Arc<Self>, group: &str, value: u8) -> Result<()> {
         let ids = self.resolve_group(group)?;
         if ids.is_empty() {
@@ -555,8 +559,9 @@ impl DeviceRegistry {
 
     /// Set color for all devices in a group.
     ///
-    /// Executes commands concurrently. Returns `Ok(())` if all succeed,
-    /// or `PartialFailure` if any fail.
+    /// Executes commands concurrently (unbounded; see [`group_set_power`]
+    /// for concurrency notes). Returns `Ok(())` if all succeed, or
+    /// `PartialFailure` if any fail.
     pub async fn group_set_color(self: &Arc<Self>, group: &str, color: Color) -> Result<()> {
         let ids = self.resolve_group(group)?;
         if ids.is_empty() {
@@ -569,8 +574,9 @@ impl DeviceRegistry {
 
     /// Set color temperature for all devices in a group.
     ///
-    /// Executes commands concurrently. Returns `Ok(())` if all succeed,
-    /// or `PartialFailure` if any fail.
+    /// Executes commands concurrently (unbounded; see [`group_set_power`]
+    /// for concurrency notes). Returns `Ok(())` if all succeed, or
+    /// `PartialFailure` if any fail.
     pub async fn group_set_color_temp(self: &Arc<Self>, group: &str, kelvin: u32) -> Result<()> {
         let ids = self.resolve_group(group)?;
         if ids.is_empty() {
