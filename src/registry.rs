@@ -261,22 +261,37 @@ impl DeviceRegistry {
         }
 
         // Populate group_map: lowercased group name → Vec<DeviceId>.
+        // Members resolve via name_map first, then alias_map (same as resolve()).
         let mut group_map = HashMap::new();
         for (group_name, member_names) in config.groups() {
             let mut members = Vec::new();
+            let mut seen = std::collections::HashSet::new();
             for member in member_names {
                 let key = member.to_lowercase();
-                if let Some(id) = name_map.get(&key) {
-                    members.push(id.clone());
-                } else {
-                    tracing::warn!(
-                        group = %group_name,
-                        member = %member,
-                        "group member does not match any device name, skipping"
-                    );
+                let resolved = name_map.get(&key).or_else(|| alias_map.get(&key));
+                match resolved {
+                    Some(id) => {
+                        if seen.insert(id.clone()) {
+                            members.push(id.clone());
+                        }
+                    }
+                    None => {
+                        tracing::warn!(
+                            group = %group_name,
+                            member = %member,
+                            "group member does not match any device or alias, skipping"
+                        );
+                    }
                 }
             }
-            group_map.insert(group_name.to_lowercase(), members);
+            let group_key = group_name.to_lowercase();
+            if let Some(prev) = group_map.insert(group_key, members) {
+                tracing::warn!(
+                    group = %group_name,
+                    previous_size = prev.len(),
+                    "case-insensitive group name collision, overwriting"
+                );
+            }
         }
 
         let cancel = CancellationToken::new();
@@ -2224,5 +2239,174 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, GoveeError::DeviceNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn group_resolves_alias_members() {
+        let mut aliases = HashMap::new();
+        aliases.insert("bed".to_string(), "Bedroom Light".to_string());
+
+        let mut groups = HashMap::new();
+        groups.insert("upstairs".to_string(), vec!["bed".to_string()]);
+
+        let config = Config::new(None, BackendPreference::Auto, 60, aliases, groups).unwrap();
+
+        let cloud = Arc::new(
+            MockBackend::new()
+                .with_devices(vec![make_device(
+                    "AA:BB:CC:DD:EE:01",
+                    "H6076",
+                    "Bedroom Light",
+                    BackendType::Cloud,
+                )])
+                .with_backend_type(BackendType::Cloud),
+        ) as Arc<dyn GoveeBackend>;
+
+        let registry = DeviceRegistry::start_with_backends(config, Some(cloud), None)
+            .await
+            .unwrap();
+
+        let members = registry.resolve_group("upstairs").unwrap();
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0], DeviceId::new("AA:BB:CC:DD:EE:01").unwrap());
+    }
+
+    #[tokio::test]
+    async fn group_deduplicates_members() {
+        // Both canonical name and alias resolve to the same device.
+        let mut aliases = HashMap::new();
+        aliases.insert("bed".to_string(), "Bedroom Light".to_string());
+
+        let mut groups = HashMap::new();
+        groups.insert(
+            "upstairs".to_string(),
+            vec!["Bedroom Light".to_string(), "bed".to_string()],
+        );
+
+        let config = Config::new(None, BackendPreference::Auto, 60, aliases, groups).unwrap();
+
+        let cloud = Arc::new(
+            MockBackend::new()
+                .with_devices(vec![make_device(
+                    "AA:BB:CC:DD:EE:01",
+                    "H6076",
+                    "Bedroom Light",
+                    BackendType::Cloud,
+                )])
+                .with_backend_type(BackendType::Cloud),
+        ) as Arc<dyn GoveeBackend>;
+
+        let registry = DeviceRegistry::start_with_backends(config, Some(cloud), None)
+            .await
+            .unwrap();
+
+        // Should have only 1 member, not 2.
+        let members = registry.resolve_group("upstairs").unwrap();
+        assert_eq!(members.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn group_partial_failure() {
+        // Create a group with two devices. One backend will succeed,
+        // the other will fail because it's routed to a missing backend.
+        //
+        // Device 1: cloud backend (present, succeeds)
+        // Device 2: local backend (not present → BackendUnavailable)
+        //
+        // We achieve this by using two mocks: cloud has device 1,
+        // local has device 2. Then we drop local after construction
+        // by using CloudOnly mode to force device 2 to Cloud, but
+        // device 2 is only in local... Actually this is tricky.
+        //
+        // Simpler: use a FailingBackend for one device.
+        use async_trait::async_trait;
+
+        struct FailingBackend;
+
+        #[async_trait]
+        impl GoveeBackend for FailingBackend {
+            async fn list_devices(&self) -> crate::error::Result<Vec<Device>> {
+                Ok(vec![Device {
+                    id: DeviceId::new("AA:BB:CC:DD:EE:02").unwrap(),
+                    model: "H6078".into(),
+                    name: "Failing Light".into(),
+                    alias: None,
+                    backend: BackendType::Local,
+                }])
+            }
+            async fn get_state(
+                &self,
+                _id: &DeviceId,
+            ) -> crate::error::Result<crate::types::DeviceState> {
+                Err(GoveeError::DiscoveryTimeout)
+            }
+            async fn set_power(&self, _id: &DeviceId, _on: bool) -> crate::error::Result<()> {
+                Err(GoveeError::DiscoveryTimeout)
+            }
+            async fn set_brightness(&self, _id: &DeviceId, _value: u8) -> crate::error::Result<()> {
+                Err(GoveeError::DiscoveryTimeout)
+            }
+            async fn set_color(
+                &self,
+                _id: &DeviceId,
+                _color: crate::types::Color,
+            ) -> crate::error::Result<()> {
+                Err(GoveeError::DiscoveryTimeout)
+            }
+            async fn set_color_temp(
+                &self,
+                _id: &DeviceId,
+                _kelvin: u32,
+            ) -> crate::error::Result<()> {
+                Err(GoveeError::DiscoveryTimeout)
+            }
+            fn backend_type(&self) -> BackendType {
+                BackendType::Local
+            }
+        }
+
+        let state = make_state(true, 50, 0, 255, 0);
+
+        let mut groups = HashMap::new();
+        groups.insert(
+            "all".to_string(),
+            vec!["Test Light".to_string(), "Failing Light".to_string()],
+        );
+
+        let config =
+            Config::new(None, BackendPreference::Auto, 60, HashMap::new(), groups).unwrap();
+
+        let cloud = Arc::new(
+            MockBackend::new()
+                .with_devices(vec![make_device(
+                    "AA:BB:CC:DD:EE:01",
+                    "H6076",
+                    "Test Light",
+                    BackendType::Cloud,
+                )])
+                .with_state(state)
+                .with_backend_type(BackendType::Cloud),
+        ) as Arc<dyn GoveeBackend>;
+
+        let local = Arc::new(FailingBackend) as Arc<dyn GoveeBackend>;
+
+        let registry = DeviceRegistry::start_with_backends(config, Some(cloud), Some(local))
+            .await
+            .unwrap();
+
+        let result = registry.group_set_power("all", true).await;
+        assert!(result.is_err());
+
+        match result.unwrap_err() {
+            GoveeError::PartialFailure {
+                succeeded, failed, ..
+            } => {
+                assert_eq!(succeeded.len(), 1);
+                assert_eq!(failed.len(), 1);
+                assert_eq!(succeeded[0], DeviceId::new("AA:BB:CC:DD:EE:01").unwrap());
+                assert_eq!(failed[0].0, DeviceId::new("AA:BB:CC:DD:EE:02").unwrap());
+            }
+            other => panic!("expected PartialFailure, got {:?}", other),
+        }
     }
 }
