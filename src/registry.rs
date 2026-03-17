@@ -179,26 +179,44 @@ impl DeviceRegistry {
         }
 
         // Populate name_map: lowercased device name → device ID.
+        // Sort by DeviceId for deterministic collision resolution.
         let mut name_map = HashMap::new();
-        for reg in devices.values() {
+        let mut sorted_devices: Vec<_> = devices.values().collect();
+        sorted_devices.sort_by(|a, b| a.device.id.as_str().cmp(b.device.id.as_str()));
+        for reg in sorted_devices {
             let key = reg.device.name.to_lowercase();
-            if name_map.contains_key(&key) {
-                tracing::warn!(
-                    name = %reg.device.name,
-                    device = %reg.device.id,
-                    "duplicate device name, overwriting previous mapping"
-                );
+            use std::collections::hash_map::Entry;
+            match name_map.entry(key) {
+                Entry::Occupied(mut e) => {
+                    tracing::warn!(
+                        name = %reg.device.name,
+                        new_device = %reg.device.id,
+                        previous_device = %e.get(),
+                        "duplicate device name, overwriting previous mapping"
+                    );
+                    e.insert(reg.device.id.clone());
+                }
+                Entry::Vacant(e) => {
+                    e.insert(reg.device.id.clone());
+                }
             }
-            name_map.insert(key, reg.device.id.clone());
         }
 
         // Populate alias_map: lowercased alias → device ID (resolved via target name).
         let mut alias_map = HashMap::new();
         for (alias, target) in config.aliases() {
+            let alias_key = alias.to_lowercase();
             let target_key = target.to_lowercase();
             match name_map.get(&target_key) {
                 Some(device_id) => {
-                    alias_map.insert(alias.to_lowercase(), device_id.clone());
+                    if let Some(prev) = alias_map.insert(alias_key, device_id.clone()) {
+                        tracing::warn!(
+                            alias = %alias,
+                            new_target = %device_id,
+                            previous_target = %prev,
+                            "case-insensitive alias collision, overwriting"
+                        );
+                    }
                 }
                 None => {
                     tracing::warn!(
@@ -1112,11 +1130,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_name_collision_last_wins() {
-        // Two devices with the same name (case-insensitive). The last one
-        // inserted into the HashMap wins. Since HashMap iteration order is
-        // non-deterministic, we verify that resolve succeeds and returns
-        // one of the two valid device IDs.
+    async fn resolve_name_collision_last_by_id_wins() {
+        // Two devices with the same name (case-insensitive). Devices are
+        // sorted by DeviceId before populating name_map, so the
+        // lexicographically last ID wins deterministically.
         let cloud = Arc::new(
             MockBackend::new()
                 .with_devices(vec![
@@ -1140,10 +1157,36 @@ mod tests {
             .await
             .unwrap();
 
-        // Resolve succeeds — one of the two devices wins.
+        // Last by DeviceId sort order wins.
         let id = registry.resolve("Living Room").unwrap();
-        let valid_id_1 = DeviceId::new("AA:BB:CC:DD:EE:01").unwrap();
-        let valid_id_2 = DeviceId::new("AA:BB:CC:DD:EE:02").unwrap();
-        assert!(id == valid_id_1 || id == valid_id_2);
+        assert_eq!(id, DeviceId::new("AA:BB:CC:DD:EE:02").unwrap());
+    }
+
+    #[tokio::test]
+    async fn resolve_alias_case_insensitive() {
+        let mut aliases = HashMap::new();
+        aliases.insert("kitchen".to_string(), "Kitchen Light".to_string());
+
+        let config =
+            Config::new(None, BackendPreference::Auto, 60, aliases, HashMap::new()).unwrap();
+
+        let cloud = Arc::new(
+            MockBackend::new()
+                .with_devices(vec![make_device(
+                    "AA:BB:CC:DD:EE:01",
+                    "H6076",
+                    "Kitchen Light",
+                    BackendType::Cloud,
+                )])
+                .with_backend_type(BackendType::Cloud),
+        ) as Arc<dyn GoveeBackend>;
+
+        let registry = DeviceRegistry::start_with_backends(config, Some(cloud), None)
+            .await
+            .unwrap();
+
+        let expected = DeviceId::new("AA:BB:CC:DD:EE:01").unwrap();
+        assert_eq!(registry.resolve("KITCHEN").unwrap(), expected);
+        assert_eq!(registry.resolve("Kitchen").unwrap(), expected);
     }
 }
