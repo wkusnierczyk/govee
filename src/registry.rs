@@ -609,7 +609,7 @@ fn collect_group_results(ids: &[DeviceId], results: Vec<Result<()>>) -> Result<(
     for (id, result) in ids.iter().zip(results) {
         match result {
             Ok(()) => succeeded.push(id.clone()),
-            Err(e) => failed.push((id.clone(), e.to_string())),
+            Err(e) => failed.push((id.clone(), Box::new(e))),
         }
     }
 

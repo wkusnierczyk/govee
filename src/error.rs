@@ -44,7 +44,7 @@ pub enum GoveeError {
     #[error("partial failure: {succeeded_count} succeeded, {failed_count} failed")]
     PartialFailure {
         succeeded: Vec<crate::types::DeviceId>,
-        failed: Vec<(crate::types::DeviceId, String)>,
+        failed: Vec<(crate::types::DeviceId, Box<GoveeError>)>,
         succeeded_count: usize,
         failed_count: usize,
     },
