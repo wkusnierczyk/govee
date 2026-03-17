@@ -381,12 +381,19 @@ impl DeviceRegistry {
     }
 
     /// Update the state cache for a device.
+    ///
+    /// Only updates if the device exists in the registry. Silently ignores
+    /// unknown device IDs to prevent orphan cache entries.
+    #[allow(dead_code)]
     pub(crate) async fn update_cache(
         &self,
         id: &DeviceId,
         state: DeviceState,
         source: CacheSource,
     ) {
+        if !self.devices.contains_key(id) {
+            return;
+        }
         let mut cache = self.state_cache.write().await;
         cache.insert(
             id.clone(),
@@ -462,26 +469,49 @@ async fn reconciliation_loop(
                 }
             };
 
-            // Compare to cached state and update.
-            let source = {
-                let cache = registry.state_cache.read().await;
-                match cache.get(id) {
-                    Some(entry) => {
-                        if entry.state.on == live_state.on
-                            && entry.state.brightness == live_state.brightness
-                            && entry.state.color == live_state.color
-                            && entry.state.color_temp_kelvin == live_state.color_temp_kelvin
-                        {
-                            CacheSource::Confirmed
-                        } else {
-                            CacheSource::Stale
-                        }
-                    }
-                    None => CacheSource::Confirmed,
-                }
-            };
+            // Compare to cached state and update under write lock.
+            // Re-check the entry to avoid overwriting a newer optimistic
+            // update that landed between our read and this write (TOCTOU).
+            {
+                let mut cache = registry.state_cache.write().await;
 
-            registry.update_cache(id, live_state, source).await;
+                // Skip if a fresh optimistic update arrived while we were querying.
+                if let Some(entry) = cache.get(id)
+                    && entry.source == CacheSource::Optimistic
+                    && entry.updated_at.elapsed() < interval
+                {
+                    continue;
+                }
+
+                let diverged = cache.get(id).is_some_and(|entry| {
+                    entry.state.on != live_state.on
+                        || entry.state.brightness != live_state.brightness
+                        || entry.state.color != live_state.color
+                        || entry.state.color_temp_kelvin != live_state.color_temp_kelvin
+                });
+
+                if diverged {
+                    tracing::info!(
+                        device = %id,
+                        "reconciliation: cached state diverged from device"
+                    );
+                }
+
+                // Always store the live state as Confirmed (it's the truth).
+                // Set DeviceState.stale if the previous cached value diverged,
+                // so consumers know their optimistic assumption was wrong.
+                let mut confirmed_state = live_state;
+                confirmed_state.stale = diverged;
+
+                cache.insert(
+                    id.clone(),
+                    CacheEntry {
+                        state: confirmed_state,
+                        source: CacheSource::Confirmed,
+                        updated_at: Instant::now(),
+                    },
+                );
+            }
         }
     }
 }
@@ -1440,6 +1470,156 @@ mod tests {
             .expect("reconciliation task should not panic");
 
         cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn reconciliation_confirms_matching_state() {
+        // Backend returns state matching the optimistic cache → Confirmed.
+        let state = make_state(true, 75, 255, 0, 0);
+        let (cloud, id) = mock_with_device_and_state("AA:BB:CC:DD:EE:06", state.clone());
+
+        let config = Config::new(
+            None,
+            BackendPreference::Auto,
+            5,
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .unwrap();
+
+        let registry = DeviceRegistry::start_with_backends(config, Some(cloud), None)
+            .await
+            .unwrap();
+
+        // Seed cache with an optimistic entry matching what backend returns.
+        // Use Instant::now() minus a large offset so it's not "recent".
+        let matching = make_state(true, 75, 255, 0, 0);
+        registry
+            .update_cache(&id, matching, CacheSource::Optimistic)
+            .await;
+
+        // Manually make the entry old enough to not be skipped.
+        {
+            let mut cache = registry.state_cache.write().await;
+            if let Some(entry) = cache.get_mut(&id) {
+                entry.updated_at = Instant::now() - Duration::from_secs(60);
+            }
+        }
+
+        // Run one reconciliation iteration.
+        let weak = Arc::downgrade(&registry);
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        let handle = tokio::spawn(async move {
+            reconciliation_loop(weak, cancel_clone, Duration::from_millis(1)).await;
+        });
+
+        // Give reconciliation time to run one iteration.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+
+        // Check: entry should be Confirmed, stale=false.
+        let cache = registry.state_cache.read().await;
+        let entry = cache.get(&id).unwrap();
+        assert_eq!(entry.source, CacheSource::Confirmed);
+        assert!(!entry.state.stale);
+    }
+
+    #[tokio::test]
+    async fn reconciliation_detects_divergence() {
+        // Backend returns different state from cache → diverged, stale=true.
+        let backend_state = make_state(true, 80, 0, 255, 0);
+        let (cloud, id) = mock_with_device_and_state("AA:BB:CC:DD:EE:07", backend_state);
+
+        let config = Config::new(
+            None,
+            BackendPreference::Auto,
+            5,
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .unwrap();
+
+        let registry = DeviceRegistry::start_with_backends(config, Some(cloud), None)
+            .await
+            .unwrap();
+
+        // Seed cache with a different optimistic state.
+        let optimistic = make_state(false, 20, 255, 0, 0);
+        registry
+            .update_cache(&id, optimistic, CacheSource::Optimistic)
+            .await;
+
+        // Verify the entry was cached.
+        {
+            let cache = registry.state_cache.read().await;
+            let entry = cache.get(&id).unwrap();
+            assert_eq!(entry.source, CacheSource::Optimistic);
+            assert!(!entry.state.on);
+            assert_eq!(entry.state.brightness, 20);
+        }
+
+        // Make entry old enough to be reconciled.
+        {
+            let mut cache = registry.state_cache.write().await;
+            if let Some(entry) = cache.get_mut(&id) {
+                entry.updated_at = Instant::now() - Duration::from_secs(60);
+            }
+        }
+
+        // Run reconciliation: use a 1ms interval so the first tick fires
+        // quickly, but cancel right after to prevent a second iteration
+        // from overwriting the divergence signal.
+        let weak = Arc::downgrade(&registry);
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        let handle = tokio::spawn(async move {
+            reconciliation_loop(weak, cancel_clone, Duration::from_millis(500)).await;
+        });
+
+        // 500ms interval: loop sleeps 500ms, then runs one iteration.
+        // Wait 600ms to ensure the first iteration completes, then cancel
+        // before the second tick.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+
+        // Check: entry should have live state (backend truth), Confirmed,
+        // but stale=true because it diverged from the optimistic value.
+        let cache = registry.state_cache.read().await;
+        let entry = cache.get(&id).unwrap();
+        assert_eq!(entry.source, CacheSource::Confirmed);
+        assert!(
+            entry.state.stale,
+            "expected stale=true after divergence; cached: on={}, brightness={}, color=({},{},{}); live: on=true, brightness=80, color=(0,255,0)",
+            entry.state.on,
+            entry.state.brightness,
+            entry.state.color.r,
+            entry.state.color.g,
+            entry.state.color.b
+        );
+        // The cached state should be the live state from backend.
+        assert!(entry.state.on);
+        assert_eq!(entry.state.brightness, 80);
+        assert_eq!(entry.state.color.g, 255);
+    }
+
+    #[tokio::test]
+    async fn update_cache_ignores_unknown_device() {
+        let registry = DeviceRegistry::start_with_backends(default_config(), None, None)
+            .await
+            .unwrap();
+
+        let unknown = DeviceId::new("FF:FF:FF:FF:FF:FF").unwrap();
+        let state = make_state(true, 50, 0, 0, 0);
+        registry
+            .update_cache(&unknown, state, CacheSource::Optimistic)
+            .await;
+
+        // Cache should remain empty — unknown device ignored.
+        let cache = registry.state_cache.read().await;
+        assert!(cache.is_empty());
     }
 
     #[tokio::test]
