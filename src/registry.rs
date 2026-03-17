@@ -196,7 +196,7 @@ impl DeviceRegistry {
                 if removed > 0 {
                     tracing::info!(
                         removed,
-                        "LocalOnly mode: removed {removed} cloud-only device(s) from registry"
+                        "LocalOnly mode: removed cloud-only device(s) from registry"
                     );
                 }
                 tracing::debug!(
