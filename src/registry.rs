@@ -11,7 +11,7 @@ use crate::backend::cloud::CloudBackend;
 use crate::backend::local::LocalBackend;
 use crate::config::{BackendPreference, Config};
 use crate::error::{GoveeError, Result};
-use crate::types::{BackendType, Device, DeviceId, DeviceState};
+use crate::types::{BackendType, Color, Device, DeviceId, DeviceState};
 
 /// Default discovery timeout for initial device scan during construction.
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(2);
@@ -384,7 +384,6 @@ impl DeviceRegistry {
     ///
     /// Only updates if the device exists in the registry. Silently ignores
     /// unknown device IDs to prevent orphan cache entries.
-    #[allow(dead_code)]
     pub(crate) async fn update_cache(
         &self,
         id: &DeviceId,
@@ -403,6 +402,78 @@ impl DeviceRegistry {
                 updated_at: Instant::now(),
             },
         );
+    }
+
+    /// Turn a device on or off.
+    ///
+    /// Delegates to the device's backend and updates the state cache
+    /// optimistically on success.
+    pub async fn set_power(self: &Arc<Self>, id: &DeviceId, on: bool) -> Result<()> {
+        let backend = self.backend_for(id)?;
+        backend.set_power(id, on).await?;
+
+        if let Ok(mut state) = self.get_state(id).await {
+            state.on = on;
+            state.stale = false;
+            self.update_cache(id, state, CacheSource::Optimistic).await;
+        }
+
+        Ok(())
+    }
+
+    /// Set device brightness (0–100).
+    ///
+    /// Delegates to the device's backend and updates the state cache
+    /// optimistically on success.
+    pub async fn set_brightness(self: &Arc<Self>, id: &DeviceId, value: u8) -> Result<()> {
+        let backend = self.backend_for(id)?;
+        backend.set_brightness(id, value).await?;
+
+        if let Ok(mut state) = self.get_state(id).await {
+            state.brightness = value;
+            state.stale = false;
+            self.update_cache(id, state, CacheSource::Optimistic).await;
+        }
+
+        Ok(())
+    }
+
+    /// Set the device color.
+    ///
+    /// Delegates to the device's backend and updates the state cache
+    /// optimistically on success. Clears `color_temp_kelvin` since
+    /// color and color temperature are mutually exclusive.
+    pub async fn set_color(self: &Arc<Self>, id: &DeviceId, color: Color) -> Result<()> {
+        let backend = self.backend_for(id)?;
+        backend.set_color(id, color).await?;
+
+        if let Ok(mut state) = self.get_state(id).await {
+            state.color = color;
+            state.color_temp_kelvin = None;
+            state.stale = false;
+            self.update_cache(id, state, CacheSource::Optimistic).await;
+        }
+
+        Ok(())
+    }
+
+    /// Set color temperature in Kelvin.
+    ///
+    /// Delegates to the device's backend and updates the state cache
+    /// optimistically on success. Resets `color` to black since color
+    /// temperature and RGB color are mutually exclusive.
+    pub async fn set_color_temp(self: &Arc<Self>, id: &DeviceId, kelvin: u32) -> Result<()> {
+        let backend = self.backend_for(id)?;
+        backend.set_color_temp(id, kelvin).await?;
+
+        if let Ok(mut state) = self.get_state(id).await {
+            state.color_temp_kelvin = Some(kelvin);
+            state.color = Color::new(0, 0, 0);
+            state.stale = false;
+            self.update_cache(id, state, CacheSource::Optimistic).await;
+        }
+
+        Ok(())
     }
 
     /// Test-only constructor that accepts pre-built backends.
@@ -1648,5 +1719,137 @@ mod tests {
         let expected = DeviceId::new("AA:BB:CC:DD:EE:01").unwrap();
         assert_eq!(registry.resolve("KITCHEN").unwrap(), expected);
         assert_eq!(registry.resolve("Kitchen").unwrap(), expected);
+    }
+
+    // -- Command delegation tests (#27) --
+
+    #[tokio::test]
+    async fn set_power_updates_cache_optimistically() {
+        let state = make_state(true, 50, 255, 0, 0);
+        let (cloud, id) = mock_with_device_and_state("AA:BB:CC:DD:EE:01", state);
+
+        let registry = DeviceRegistry::start_with_backends(default_config(), Some(cloud), None)
+            .await
+            .unwrap();
+
+        registry.set_power(&id, false).await.unwrap();
+
+        let cached = registry.get_state(&id).await.unwrap();
+        assert!(!cached.on);
+        // Other fields preserved.
+        assert_eq!(cached.brightness, 50);
+        assert_eq!(cached.color.r, 255);
+    }
+
+    #[tokio::test]
+    async fn set_brightness_updates_cache_optimistically() {
+        let state = make_state(true, 50, 0, 255, 0);
+        let (cloud, id) = mock_with_device_and_state("AA:BB:CC:DD:EE:02", state);
+
+        let registry = DeviceRegistry::start_with_backends(default_config(), Some(cloud), None)
+            .await
+            .unwrap();
+
+        registry.set_brightness(&id, 80).await.unwrap();
+
+        let cached = registry.get_state(&id).await.unwrap();
+        assert_eq!(cached.brightness, 80);
+        // Other fields preserved.
+        assert!(cached.on);
+        assert_eq!(cached.color.g, 255);
+    }
+
+    #[tokio::test]
+    async fn set_color_updates_color_and_clears_temp() {
+        use crate::types::Color;
+
+        let state = DeviceState::new(true, 50, Color::new(0, 0, 0), Some(4000), false).unwrap();
+        let (cloud, id) = mock_with_device_and_state("AA:BB:CC:DD:EE:03", state);
+
+        let registry = DeviceRegistry::start_with_backends(default_config(), Some(cloud), None)
+            .await
+            .unwrap();
+
+        registry
+            .set_color(&id, Color::new(255, 128, 0))
+            .await
+            .unwrap();
+
+        let cached = registry.get_state(&id).await.unwrap();
+        assert_eq!(cached.color, Color::new(255, 128, 0));
+        assert_eq!(cached.color_temp_kelvin, None);
+        // Other fields preserved.
+        assert!(cached.on);
+        assert_eq!(cached.brightness, 50);
+    }
+
+    #[tokio::test]
+    async fn set_color_temp_updates_temp_and_resets_color() {
+        use crate::types::Color;
+
+        let state = make_state(true, 50, 255, 128, 0);
+        let (cloud, id) = mock_with_device_and_state("AA:BB:CC:DD:EE:04", state);
+
+        let registry = DeviceRegistry::start_with_backends(default_config(), Some(cloud), None)
+            .await
+            .unwrap();
+
+        registry.set_color_temp(&id, 5000).await.unwrap();
+
+        let cached = registry.get_state(&id).await.unwrap();
+        assert_eq!(cached.color_temp_kelvin, Some(5000));
+        assert_eq!(cached.color, Color::new(0, 0, 0));
+        // Other fields preserved.
+        assert!(cached.on);
+        assert_eq!(cached.brightness, 50);
+    }
+
+    #[tokio::test]
+    async fn set_power_unknown_device_returns_error() {
+        let registry = DeviceRegistry::start_with_backends(default_config(), None, None)
+            .await
+            .unwrap();
+
+        let unknown = DeviceId::new("FF:FF:FF:FF:FF:FF").unwrap();
+        let err = registry.set_power(&unknown, true).await.unwrap_err();
+        assert!(matches!(err, GoveeError::DeviceNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn set_brightness_unknown_device_returns_error() {
+        let registry = DeviceRegistry::start_with_backends(default_config(), None, None)
+            .await
+            .unwrap();
+
+        let unknown = DeviceId::new("FF:FF:FF:FF:FF:FF").unwrap();
+        let err = registry.set_brightness(&unknown, 50).await.unwrap_err();
+        assert!(matches!(err, GoveeError::DeviceNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn set_color_unknown_device_returns_error() {
+        use crate::types::Color;
+
+        let registry = DeviceRegistry::start_with_backends(default_config(), None, None)
+            .await
+            .unwrap();
+
+        let unknown = DeviceId::new("FF:FF:FF:FF:FF:FF").unwrap();
+        let err = registry
+            .set_color(&unknown, Color::new(255, 0, 0))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, GoveeError::DeviceNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn set_color_temp_unknown_device_returns_error() {
+        let registry = DeviceRegistry::start_with_backends(default_config(), None, None)
+            .await
+            .unwrap();
+
+        let unknown = DeviceId::new("FF:FF:FF:FF:FF:FF").unwrap();
+        let err = registry.set_color_temp(&unknown, 4000).await.unwrap_err();
+        assert!(matches!(err, GoveeError::DeviceNotFound(_)));
     }
 }
