@@ -28,13 +28,30 @@ pub const MIN_DISCOVERY_INTERVAL_SECS: u64 = 5;
 ///
 /// All construction paths (`new`, `load`, `Deserialize`) validate that
 /// `discovery_interval_secs >= 5`.
-#[derive(Clone, Serialize)]
+#[derive(Clone)]
 pub struct Config {
     api_key: Option<String>,
     backend: BackendPreference,
     discovery_interval_secs: u64,
     aliases: HashMap<String, String>,
     groups: HashMap<String, Vec<String>>,
+}
+
+impl Serialize for Config {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("Config", 5)?;
+        // RT-01: never serialize the API key — redact as null.
+        state.serialize_field("api_key", &None::<String>)?;
+        state.serialize_field("backend", &self.backend)?;
+        state.serialize_field("discovery_interval_secs", &self.discovery_interval_secs)?;
+        state.serialize_field("aliases", &self.aliases)?;
+        state.serialize_field("groups", &self.groups)?;
+        state.end()
+    }
 }
 
 fn default_discovery_interval() -> u64 {
@@ -90,6 +107,22 @@ impl Config {
     /// `GoveeError::Config` for TOML syntax errors, or
     /// `GoveeError::InvalidConfig` for out-of-range values.
     pub fn load(path: &Path) -> Result<Self> {
+        // RT-04: warn if config file has loose permissions (Unix only).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = std::fs::metadata(path) {
+                let mode = meta.permissions().mode();
+                if mode & 0o077 != 0 {
+                    tracing::warn!(
+                        path = %path.display(),
+                        mode = format_args!("{:04o}", mode & 0o777),
+                        "config file has loose permissions, recommend 0600"
+                    );
+                }
+            }
+        }
+
         let content = std::fs::read_to_string(path)?;
         // Parse TOML (syntax errors → GoveeError::Config)
         let config: Config = toml::from_str(&content)?;
