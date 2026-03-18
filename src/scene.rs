@@ -4,9 +4,11 @@ use crate::error::{GoveeError, Result};
 use crate::types::Color;
 
 /// The color component of a scene: either an RGB value or a color temperature.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SceneColor {
+    /// An RGB color value.
     Rgb(Color),
+    /// A color temperature in Kelvin (1–10000).
     Temp(u32),
 }
 
@@ -23,7 +25,7 @@ impl Scene {
     ///
     /// - `brightness` must be 0–100.
     /// - `SceneColor::Temp` value must be 1–10000.
-    /// - `name` must contain only alphanumeric characters, `-`, or `_`.
+    /// - `name` must be non-empty and contain only alphanumeric characters, `-`, or `_`.
     pub fn new(name: &str, brightness: u8, color: SceneColor) -> Result<Self> {
         if brightness > 100 {
             return Err(GoveeError::InvalidBrightness(brightness));
@@ -37,9 +39,10 @@ impl Scene {
             ));
         }
 
-        if !name
-            .chars()
-            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
         {
             return Err(GoveeError::InvalidConfig(
                 "scene name must contain only alphanumeric, '-', '_' characters".to_string(),
@@ -101,9 +104,11 @@ impl SceneRegistry {
             .ok_or_else(|| GoveeError::DeviceNotFound(format!("scene: {name}")))
     }
 
-    /// Return all registered scenes.
+    /// Return all registered scenes, sorted by name.
     pub fn list(&self) -> Vec<&Scene> {
-        self.scenes.values().collect()
+        let mut scenes: Vec<_> = self.scenes.values().collect();
+        scenes.sort_by_key(|s| s.name());
+        scenes
     }
 }
 
@@ -118,16 +123,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn builtins_all_present() {
+    fn builtins_all_present_with_values() {
         let registry = SceneRegistry::new();
         let scenes = registry.list();
         assert_eq!(scenes.len(), 5);
-        let names: Vec<&str> = scenes.iter().map(|s| s.name()).collect();
-        assert!(names.contains(&"warm"));
-        assert!(names.contains(&"focus"));
-        assert!(names.contains(&"night"));
-        assert!(names.contains(&"movie"));
-        assert!(names.contains(&"bright"));
+
+        // list() is sorted by name.
+        assert_eq!(scenes[0].name(), "bright");
+        assert_eq!(scenes[0].brightness(), 100);
+        assert_eq!(*scenes[0].color(), SceneColor::Temp(6500));
+
+        assert_eq!(scenes[1].name(), "focus");
+        assert_eq!(scenes[1].brightness(), 80);
+        assert_eq!(*scenes[1].color(), SceneColor::Temp(5500));
+
+        assert_eq!(scenes[2].name(), "movie");
+        assert_eq!(scenes[2].brightness(), 20);
+        assert_eq!(*scenes[2].color(), SceneColor::Temp(2200));
+
+        assert_eq!(scenes[3].name(), "night");
+        assert_eq!(scenes[3].brightness(), 10);
+        assert_eq!(*scenes[3].color(), SceneColor::Rgb(Color::new(255, 0, 0)));
+
+        assert_eq!(scenes[4].name(), "warm");
+        assert_eq!(scenes[4].brightness(), 40);
+        assert_eq!(*scenes[4].color(), SceneColor::Temp(2700));
     }
 
     #[test]
@@ -136,6 +156,7 @@ mod tests {
         let scene = registry.get("warm").unwrap();
         assert_eq!(scene.name(), "warm");
         assert_eq!(scene.brightness(), 40);
+        assert_eq!(*scene.color(), SceneColor::Temp(2700));
     }
 
     #[test]
@@ -181,6 +202,12 @@ mod tests {
     #[test]
     fn reject_name_with_space() {
         let result = Scene::new("bad name", 50, SceneColor::Temp(3000));
+        assert!(matches!(result, Err(GoveeError::InvalidConfig(_))));
+    }
+
+    #[test]
+    fn reject_empty_name() {
+        let result = Scene::new("", 50, SceneColor::Temp(3000));
         assert!(matches!(result, Err(GoveeError::InvalidConfig(_))));
     }
 
