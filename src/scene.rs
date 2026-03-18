@@ -80,13 +80,36 @@ pub struct SceneRegistry {
 
 impl SceneRegistry {
     /// Create a new registry populated with built-in scenes.
+    ///
+    /// Built-ins are constructed directly (no validation) since their
+    /// values are compile-time constants known to be valid.
     pub fn new() -> Self {
         let builtins = [
-            Scene::new("warm", 40, SceneColor::Temp(2700)).unwrap(),
-            Scene::new("focus", 80, SceneColor::Temp(5500)).unwrap(),
-            Scene::new("night", 10, SceneColor::Rgb(Color::new(255, 0, 0))).unwrap(),
-            Scene::new("movie", 20, SceneColor::Temp(2200)).unwrap(),
-            Scene::new("bright", 100, SceneColor::Temp(6500)).unwrap(),
+            Scene {
+                name: "warm".into(),
+                brightness: 40,
+                color: SceneColor::Temp(2700),
+            },
+            Scene {
+                name: "focus".into(),
+                brightness: 80,
+                color: SceneColor::Temp(5500),
+            },
+            Scene {
+                name: "night".into(),
+                brightness: 10,
+                color: SceneColor::Rgb(Color::new(255, 0, 0)),
+            },
+            Scene {
+                name: "movie".into(),
+                brightness: 20,
+                color: SceneColor::Temp(2200),
+            },
+            Scene {
+                name: "bright".into(),
+                brightness: 100,
+                color: SceneColor::Temp(6500),
+            },
         ];
 
         let mut scenes = HashMap::new();
