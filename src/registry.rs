@@ -527,17 +527,22 @@ impl DeviceRegistry {
 
     /// Apply a named scene to the specified target.
     ///
-    /// Sends 2 commands per device (color/temp then brightness), for a total
-    /// of 2 × N API calls where N is the number of targeted devices. Color or
-    /// color temperature is set first, then brightness, to produce a less
-    /// jarring visual transition.
+    /// Sends 2 commands per device (color/temp then brightness). Each
+    /// `set_*` call may also trigger an additional backend `get_state`
+    /// query on cache miss, so worst-case is up to 4 × N backend calls.
+    /// Color or color temperature is set first, then brightness, to
+    /// produce a less jarring visual transition.
     ///
-    /// `SceneTarget::All` targets every registered device — callers should
-    /// confirm scope before using this variant.
+    /// Executes commands concurrently via `join_all` (unbounded).
+    /// Designed for typical Govee setups with fewer than ~20 devices
+    /// per target. Larger targets may trigger cloud API rate limits.
     ///
-    /// On partial failure, some devices may be left in an intermediate state
-    /// (e.g., color changed but brightness not updated). No rollback is
-    /// attempted.
+    /// `SceneTarget::All` targets every registered device — callers
+    /// should confirm scope before using this variant.
+    ///
+    /// On partial failure, some devices may be left in an intermediate
+    /// state (e.g., color changed but brightness not updated). No
+    /// rollback is attempted.
     pub async fn apply_scene(
         self: &Arc<Self>,
         scene_name: &str,
@@ -547,11 +552,11 @@ impl DeviceRegistry {
         let brightness = scene.brightness();
         let color = *scene.color();
 
-        let ids = match target {
+        let ids: Vec<DeviceId> = match target {
             SceneTarget::Device(id) => vec![id],
             SceneTarget::DeviceName(name) => vec![self.resolve(&name)?],
             SceneTarget::Group(name) => self.resolve_group(&name)?,
-            SceneTarget::All => self.devices().iter().map(|d| d.id.clone()).collect(),
+            SceneTarget::All => self.devices.keys().cloned().collect(),
         };
 
         let results: Vec<_> = futures::future::join_all(ids.iter().map(|id| {
@@ -566,6 +571,12 @@ impl DeviceRegistry {
             }
         }))
         .await;
+
+        // Single-device targets return the underlying error directly
+        // instead of wrapping in PartialFailure.
+        if ids.len() == 1 {
+            return results.into_iter().next().unwrap();
+        }
 
         collect_group_results(&ids, results)
     }
@@ -2770,5 +2781,105 @@ mod tests {
         let cached = registry.get_state(&id).await.unwrap();
         assert_eq!(cached.brightness, 100);
         assert_eq!(cached.color_temp_kelvin, Some(6500));
+    }
+
+    #[tokio::test]
+    async fn apply_scene_partial_failure() {
+        use async_trait::async_trait;
+
+        struct FailingBackend;
+
+        #[async_trait]
+        impl GoveeBackend for FailingBackend {
+            async fn list_devices(&self) -> crate::error::Result<Vec<Device>> {
+                Ok(vec![Device {
+                    id: DeviceId::new("AA:BB:CC:DD:EE:02").unwrap(),
+                    model: "H6078".into(),
+                    name: "Failing Light".into(),
+                    alias: None,
+                    backend: BackendType::Local,
+                }])
+            }
+            async fn get_state(
+                &self,
+                _id: &DeviceId,
+            ) -> crate::error::Result<crate::types::DeviceState> {
+                Err(GoveeError::DiscoveryTimeout)
+            }
+            async fn set_power(&self, _id: &DeviceId, _on: bool) -> crate::error::Result<()> {
+                Err(GoveeError::DiscoveryTimeout)
+            }
+            async fn set_brightness(&self, _id: &DeviceId, _value: u8) -> crate::error::Result<()> {
+                Err(GoveeError::DiscoveryTimeout)
+            }
+            async fn set_color(
+                &self,
+                _id: &DeviceId,
+                _color: crate::types::Color,
+            ) -> crate::error::Result<()> {
+                Err(GoveeError::DiscoveryTimeout)
+            }
+            async fn set_color_temp(
+                &self,
+                _id: &DeviceId,
+                _kelvin: u32,
+            ) -> crate::error::Result<()> {
+                Err(GoveeError::DiscoveryTimeout)
+            }
+            fn backend_type(&self) -> BackendType {
+                BackendType::Local
+            }
+        }
+
+        let state = make_state(true, 50, 0, 255, 0);
+        let mut groups = HashMap::new();
+        groups.insert(
+            "all".to_string(),
+            vec!["Test Light".to_string(), "Failing Light".to_string()],
+        );
+
+        let config = Config::new(
+            None,
+            BackendPreference::Auto,
+            60,
+            HashMap::new(),
+            groups,
+            HashMap::new(),
+        )
+        .unwrap();
+
+        let cloud = Arc::new(
+            MockBackend::new()
+                .with_devices(vec![make_device(
+                    "AA:BB:CC:DD:EE:01",
+                    "H6076",
+                    "Test Light",
+                    BackendType::Cloud,
+                )])
+                .with_state(state)
+                .with_backend_type(BackendType::Cloud),
+        ) as Arc<dyn GoveeBackend>;
+        let local = Arc::new(FailingBackend) as Arc<dyn GoveeBackend>;
+
+        let registry = DeviceRegistry::start_with_backends(config, Some(cloud), Some(local))
+            .await
+            .unwrap();
+
+        let result = registry
+            .apply_scene("warm", SceneTarget::Group("all".into()))
+            .await;
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            GoveeError::PartialFailure {
+                succeeded, failed, ..
+            } => {
+                assert_eq!(succeeded.len(), 1);
+                assert_eq!(failed.len(), 1);
+                assert_eq!(succeeded[0], DeviceId::new("AA:BB:CC:DD:EE:01").unwrap());
+                assert_eq!(failed[0].0, DeviceId::new("AA:BB:CC:DD:EE:02").unwrap());
+            }
+            other => panic!("expected PartialFailure, got {:?}", other),
+        }
     }
 }
