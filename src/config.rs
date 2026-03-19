@@ -117,42 +117,38 @@ impl Config {
         }
 
         for (name, sc) in &self.scenes {
-            // Validate scene name: non-empty, alphanumeric/'-'/'_' only.
             if name.is_empty()
                 || !name
                     .chars()
                     .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
             {
-                return Err(GoveeError::InvalidConfig(
-                    "scene name must contain only alphanumeric, '-', '_' characters".to_string(),
-                ));
+                return Err(GoveeError::InvalidConfig(format!(
+                    "scene \"{name}\": name must be non-empty and contain only alphanumeric, '-', '_' characters"
+                )));
             }
 
             if sc.brightness > 100 {
-                tracing::error!(scene = %name, "brightness must be 0\u{2013}100");
-                return Err(GoveeError::InvalidConfig(
-                    "scene brightness must be 0\u{2013}100".to_string(),
-                ));
+                return Err(GoveeError::InvalidConfig(format!(
+                    "scene \"{name}\": brightness must be 0\u{2013}100, got {}",
+                    sc.brightness
+                )));
             }
 
             match (&sc.color, sc.color_temp) {
                 (Some(_), Some(_)) => {
-                    tracing::error!(scene = %name, "both color and color_temp set");
-                    return Err(GoveeError::InvalidConfig(
-                        "scene must set exactly one of color or color_temp".to_string(),
-                    ));
+                    return Err(GoveeError::InvalidConfig(format!(
+                        "scene \"{name}\": must set exactly one of color or color_temp, not both"
+                    )));
                 }
                 (None, None) => {
-                    tracing::error!(scene = %name, "neither color nor color_temp set");
-                    return Err(GoveeError::InvalidConfig(
-                        "scene must set exactly one of color or color_temp".to_string(),
-                    ));
+                    return Err(GoveeError::InvalidConfig(format!(
+                        "scene \"{name}\": must set exactly one of color or color_temp"
+                    )));
                 }
                 (None, Some(temp)) if temp == 0 || temp > 10000 => {
-                    tracing::error!(scene = %name, "color_temp must be 1\u{2013}10000");
-                    return Err(GoveeError::InvalidConfig(
-                        "scene color_temp must be 1\u{2013}10000".to_string(),
-                    ));
+                    return Err(GoveeError::InvalidConfig(format!(
+                        "scene \"{name}\": color_temp must be 1\u{2013}10000, got {temp}"
+                    )));
                 }
                 _ => {}
             }
@@ -465,6 +461,25 @@ mod tests {
             [scenes.bad]
             brightness = 101
             color_temp = 3000
+        "#;
+        let result: std::result::Result<Config, _> = toml::from_str(toml);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn config_scene_color_temp_out_of_range_rejected() {
+        let toml = r#"
+            [scenes.bad]
+            brightness = 50
+            color_temp = 0
+        "#;
+        let result: std::result::Result<Config, _> = toml::from_str(toml);
+        assert!(result.is_err());
+
+        let toml = r#"
+            [scenes.bad]
+            brightness = 50
+            color_temp = 10001
         "#;
         let result: std::result::Result<Config, _> = toml::from_str(toml);
         assert!(result.is_err());

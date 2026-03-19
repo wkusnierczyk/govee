@@ -142,27 +142,32 @@ impl SceneRegistry {
     /// - On name collision with a built-in, the user scene wins (logged at debug).
     /// - On case-insensitive collision between user scenes, last-wins (logged at warn).
     pub fn with_user_scenes(mut self, user: &HashMap<String, SceneConfig>) -> Result<Self> {
-        for (name, sc) in user {
+        // Track built-in keys to distinguish overrides from user/user collisions.
+        let builtin_keys: std::collections::HashSet<String> = self.scenes.keys().cloned().collect();
+
+        // Sort user scene names for deterministic iteration order.
+        let mut sorted_names: Vec<&String> = user.keys().collect();
+        sorted_names.sort();
+
+        for name in sorted_names {
+            let sc = &user[name];
             let color = match (&sc.color, sc.color_temp) {
                 (Some(c), None) => SceneColor::Rgb(*c),
                 (None, Some(temp)) => SceneColor::Temp(temp),
                 _ => {
-                    // Should not reach here if Config::validate() ran, but handle defensively.
-                    return Err(GoveeError::InvalidConfig(
-                        "scene must set exactly one of color or color_temp".to_string(),
-                    ));
+                    return Err(GoveeError::InvalidConfig(format!(
+                        "scene \"{name}\": must set exactly one of color or color_temp"
+                    )));
                 }
             };
 
             let scene = Scene::new(name, sc.brightness, color)?;
             let key = name.to_lowercase();
 
-            if let Some(existing) = self.scenes.get(&key) {
-                if existing.name() == key {
-                    // Overriding a built-in scene.
+            if let Some(_existing) = self.scenes.get(&key) {
+                if builtin_keys.contains(&key) {
                     tracing::debug!(scene = %name, "user scene overrides built-in");
                 } else {
-                    // Case-insensitive collision between user scenes.
                     tracing::warn!(scene = %name, "case-insensitive collision with existing user scene");
                 }
             }
@@ -333,5 +338,34 @@ mod tests {
         let scene = registry.get("daylight").unwrap();
         assert_eq!(scene.brightness(), 100);
         assert_eq!(*scene.color(), SceneColor::Temp(6500));
+    }
+
+    #[test]
+    fn user_scene_case_insensitive_collision_last_wins() {
+        // Two user scenes differing only by case. Sorted iteration
+        // means "Cozy" comes before "cozy" — "cozy" wins.
+        let mut user = HashMap::new();
+        user.insert(
+            "Cozy".to_string(),
+            SceneConfig {
+                brightness: 30,
+                color: None,
+                color_temp: Some(2700),
+            },
+        );
+        user.insert(
+            "cozy".to_string(),
+            SceneConfig {
+                brightness: 50,
+                color: None,
+                color_temp: Some(3000),
+            },
+        );
+
+        let registry = SceneRegistry::new().with_user_scenes(&user).unwrap();
+        let scene = registry.get("cozy").unwrap();
+        // "cozy" (lowercase) sorts after "Cozy" (uppercase), so it wins.
+        assert_eq!(scene.brightness(), 50);
+        assert_eq!(*scene.color(), SceneColor::Temp(3000));
     }
 }
