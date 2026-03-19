@@ -1115,6 +1115,7 @@ mod tests {
             60,
             HashMap::new(),
             HashMap::new(),
+            HashMap::new(),
         )
         .unwrap();
 
@@ -1202,6 +1203,7 @@ mod tests {
             60,
             HashMap::new(),
             HashMap::new(),
+            HashMap::new(),
         )
         .unwrap();
 
@@ -1246,6 +1248,7 @@ mod tests {
             None,
             BackendPreference::LocalOnly,
             60,
+            HashMap::new(),
             HashMap::new(),
             HashMap::new(),
         )
@@ -1405,8 +1408,15 @@ mod tests {
         let mut aliases = HashMap::new();
         aliases.insert("kitchen".to_string(), "Kitchen Light".to_string());
 
-        let config =
-            Config::new(None, BackendPreference::Auto, 60, aliases, HashMap::new()).unwrap();
+        let config = Config::new(
+            None,
+            BackendPreference::Auto,
+            60,
+            aliases,
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .unwrap();
 
         let cloud = Arc::new(
             MockBackend::new()
@@ -1454,8 +1464,15 @@ mod tests {
         aliases.insert("kitchen".to_string(), "Kitchen Light".to_string());
         aliases.insert("k".to_string(), "Kitchen Light".to_string());
 
-        let config =
-            Config::new(None, BackendPreference::Auto, 60, aliases, HashMap::new()).unwrap();
+        let config = Config::new(
+            None,
+            BackendPreference::Auto,
+            60,
+            aliases,
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .unwrap();
 
         let cloud = Arc::new(
             MockBackend::new()
@@ -1482,8 +1499,15 @@ mod tests {
         let mut aliases = HashMap::new();
         aliases.insert("ghost".to_string(), "Does Not Exist".to_string());
 
-        let config =
-            Config::new(None, BackendPreference::Auto, 60, aliases, HashMap::new()).unwrap();
+        let config = Config::new(
+            None,
+            BackendPreference::Auto,
+            60,
+            aliases,
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .unwrap();
 
         let cloud = Arc::new(
             MockBackend::new()
@@ -1693,6 +1717,7 @@ mod tests {
             5,
             HashMap::new(),
             HashMap::new(),
+            HashMap::new(),
         )
         .unwrap();
 
@@ -1745,6 +1770,7 @@ mod tests {
             None,
             BackendPreference::Auto,
             5,
+            HashMap::new(),
             HashMap::new(),
             HashMap::new(),
         )
@@ -1836,8 +1862,15 @@ mod tests {
         let mut aliases = HashMap::new();
         aliases.insert("kitchen".to_string(), "Kitchen Light".to_string());
 
-        let config =
-            Config::new(None, BackendPreference::Auto, 60, aliases, HashMap::new()).unwrap();
+        let config = Config::new(
+            None,
+            BackendPreference::Auto,
+            60,
+            aliases,
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .unwrap();
 
         let cloud = Arc::new(
             MockBackend::new()
@@ -1994,7 +2027,15 @@ mod tests {
     // -- group resolution and group commands (#28) --
 
     fn config_with_groups(groups: HashMap<String, Vec<String>>) -> Config {
-        Config::new(None, BackendPreference::Auto, 60, HashMap::new(), groups).unwrap()
+        Config::new(
+            None,
+            BackendPreference::Auto,
+            60,
+            HashMap::new(),
+            groups,
+            HashMap::new(),
+        )
+        .unwrap()
     }
 
     #[tokio::test]
@@ -2262,7 +2303,15 @@ mod tests {
         let mut groups = HashMap::new();
         groups.insert("upstairs".to_string(), vec!["bed".to_string()]);
 
-        let config = Config::new(None, BackendPreference::Auto, 60, aliases, groups).unwrap();
+        let config = Config::new(
+            None,
+            BackendPreference::Auto,
+            60,
+            aliases,
+            groups,
+            HashMap::new(),
+        )
+        .unwrap();
 
         let cloud = Arc::new(
             MockBackend::new()
@@ -2296,7 +2345,15 @@ mod tests {
             vec!["Bedroom Light".to_string(), "bed".to_string()],
         );
 
-        let config = Config::new(None, BackendPreference::Auto, 60, aliases, groups).unwrap();
+        let config = Config::new(
+            None,
+            BackendPreference::Auto,
+            60,
+            aliases,
+            groups,
+            HashMap::new(),
+        )
+        .unwrap();
 
         let cloud = Arc::new(
             MockBackend::new()
@@ -2377,8 +2434,15 @@ mod tests {
             vec!["Test Light".to_string(), "Failing Light".to_string()],
         );
 
-        let config =
-            Config::new(None, BackendPreference::Auto, 60, HashMap::new(), groups).unwrap();
+        let config = Config::new(
+            None,
+            BackendPreference::Auto,
+            60,
+            HashMap::new(),
+            groups,
+            HashMap::new(),
+        )
+        .unwrap();
 
         let cloud = Arc::new(
             MockBackend::new()
