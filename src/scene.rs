@@ -144,6 +144,8 @@ impl SceneRegistry {
     pub fn with_user_scenes(mut self, user: &HashMap<String, SceneConfig>) -> Result<Self> {
         // Track built-in keys to distinguish overrides from user/user collisions.
         let builtin_keys: std::collections::HashSet<String> = self.scenes.keys().cloned().collect();
+        // Track keys inserted from user scenes in this merge.
+        let mut user_keys = std::collections::HashSet::new();
 
         // Sort user scene names for deterministic iteration order.
         let mut sorted_names: Vec<&String> = user.keys().collect();
@@ -161,17 +163,21 @@ impl SceneRegistry {
                 }
             };
 
-            let scene = Scene::new(name, sc.brightness, color)?;
+            let scene = Scene::new(name, sc.brightness, color)
+                .map_err(|e| GoveeError::InvalidConfig(format!("scene \"{name}\": {e}")))?;
             let key = name.to_lowercase();
 
-            if let Some(_existing) = self.scenes.get(&key) {
-                if builtin_keys.contains(&key) {
-                    tracing::debug!(scene = %name, "user scene overrides built-in");
-                } else {
+            if self.scenes.contains_key(&key) {
+                if user_keys.contains(&key) {
+                    // Collision between two user scenes (case-insensitive).
                     tracing::warn!(scene = %name, "case-insensitive collision with existing user scene");
+                } else if builtin_keys.contains(&key) {
+                    // User scene overriding a built-in.
+                    tracing::debug!(scene = %name, "user scene overrides built-in");
                 }
             }
 
+            user_keys.insert(key.clone());
             self.scenes.insert(key, scene);
         }
 

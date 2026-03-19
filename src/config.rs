@@ -116,7 +116,10 @@ impl Config {
             )));
         }
 
-        for (name, sc) in &self.scenes {
+        let mut scene_names: Vec<&String> = self.scenes.keys().collect();
+        scene_names.sort();
+        for name in scene_names {
+            let sc = &self.scenes[name];
             if name.is_empty()
                 || !name
                     .chars()
@@ -460,6 +463,17 @@ mod tests {
         let toml = r#"
             [scenes.bad]
             brightness = 101
+            color_temp = 3000
+        "#;
+        let result: std::result::Result<Config, _> = toml::from_str(toml);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn config_scene_invalid_name_rejected() {
+        let toml = r#"
+            [scenes."bad name"]
+            brightness = 50
             color_temp = 3000
         "#;
         let result: std::result::Result<Config, _> = toml::from_str(toml);
