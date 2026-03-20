@@ -167,7 +167,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Requires the device to be on the same LAN segment. Port 4002 must be available (not used by Home Assistant, govee2mqtt, etc.).
+No API key required. Requires the device to be on the same LAN segment. Port 4002 must be available (not used by Home Assistant, govee2mqtt, etc.).
 
 ### Configuration
 
