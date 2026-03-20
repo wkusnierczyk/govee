@@ -139,7 +139,9 @@ use govee::backend::GoveeBackend;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let backend = CloudBackend::new("your-api-key".into(), None)?;
+    let api_key = std::env::var("GOVEE_API_KEY")
+        .expect("set GOVEE_API_KEY env var");
+    let backend = CloudBackend::new(api_key, None)?;
     let devices = backend.list_devices().await?;
     let state = backend.get_state(&devices[0].id).await?;
     backend.set_brightness(&devices[0].id, 75).await?;
@@ -147,7 +149,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-The API key is obtained from the Govee Home mobile app. HTTPS is enforced for all remote URLs.
+The API key is obtained from the Govee Home mobile app. Store it in an environment variable or the config file (`api_key` field) — never hardcode it in source. HTTPS is enforced for all remote URLs.
 
 ### Local LAN backend
 
