@@ -59,6 +59,13 @@ fn build_client() -> std::result::Result<Client, reqwest::Error> {
 /// Authenticates via `Govee-API-Key` header. Base URL defaults to
 /// `https://developer-api.govee.com` but can be overridden for testing.
 ///
+/// # Security
+///
+/// - **MITM risk:** Uses the system CA bundle for TLS verification
+///   (no certificate pinning). A corporate MITM proxy or CA-installing
+///   malware can intercept all traffic, capturing the API key. The
+///   Govee API does not provide key rotation or revocation. (RT-08)
+///
 /// **Note:** `std::sync::RwLock` is used for the device cache because the
 /// lock is held only for brief HashMap lookups/swaps and never across
 /// `.await` points. This avoids the overhead of `tokio::sync::RwLock`.
@@ -77,6 +84,13 @@ impl CloudBackend {
     /// Returns `GoveeError::InvalidConfig` if `base_url` is not a valid URL
     /// or does not use HTTPS (unless the host is a loopback address, which
     /// allows HTTP for local testing with wiremock).
+    ///
+    /// # Security
+    ///
+    /// `base_url` is a privileged parameter. If an attacker controls it,
+    /// all API calls (including the API key) are sent to the attacker's
+    /// endpoint. Callers must never derive `base_url` from untrusted
+    /// input. (RT-09)
     pub fn new(api_key: String, base_url: Option<String>) -> Result<Self> {
         let raw = base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
         let parsed = reqwest::Url::parse(&raw)
