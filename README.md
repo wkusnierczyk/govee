@@ -61,7 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-For detailed API usage, see the sections below.
+For detailed API configuration and usage, see the sections below.
 
 ## Usage
 
