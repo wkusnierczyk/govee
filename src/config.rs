@@ -132,7 +132,7 @@ impl Config {
 
             if sc.brightness > 100 {
                 return Err(GoveeError::InvalidConfig(format!(
-                    "scene \"{name}\": brightness must be 0\u{2013}100, got {}",
+                    "scene \"{name}\": brightness must be 0-100, got {}",
                     sc.brightness
                 )));
             }
@@ -150,7 +150,7 @@ impl Config {
                 }
                 (None, Some(temp)) if temp == 0 || temp > 10000 => {
                     return Err(GoveeError::InvalidConfig(format!(
-                        "scene \"{name}\": color_temp must be 1\u{2013}10000, got {temp}"
+                        "scene \"{name}\": color_temp must be 1-10000, got {temp}"
                     )));
                 }
                 _ => {}
@@ -161,6 +161,10 @@ impl Config {
     }
 
     /// Load configuration from a TOML file.
+    ///
+    /// The caller is responsible for expanding `~` (tilde) in the path
+    /// before calling this method. The library does not perform tilde
+    /// expansion.
     ///
     /// Returns `GoveeError::Io` if the file cannot be read,
     /// `GoveeError::Config` for TOML syntax errors, or

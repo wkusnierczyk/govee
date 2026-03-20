@@ -11,7 +11,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 ///
 /// `CloudBackend::new` allows HTTP for loopback addresses (wiremock binds to 127.0.0.1).
 fn backend_for(server: &MockServer, api_key: &str) -> CloudBackend {
-    CloudBackend::new(api_key.to_string(), Some(server.uri())).unwrap()
+    CloudBackend::new(api_key.to_string(), Some(server.uri()), None).unwrap()
 }
 
 const HAPPY_RESPONSE: &str = r#"{
