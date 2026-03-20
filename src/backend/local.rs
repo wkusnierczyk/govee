@@ -380,6 +380,16 @@ fn parse_dev_status(data: &serde_json::Value) -> Result<DeviceState> {
     DeviceState::new(on, brightness, color, color_temp, false)
 }
 
+/// Validate color temperature range (1-10000K).
+fn validate_kelvin(kelvin: u32) -> Result<()> {
+    if kelvin == 0 || kelvin > 10000 {
+        return Err(GoveeError::InvalidConfig(
+            "color temperature must be 1-10000K".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl GoveeBackend for LocalBackend {
     async fn list_devices(&self) -> Result<Vec<Device>> {
@@ -518,11 +528,7 @@ impl GoveeBackend for LocalBackend {
     /// single `colorwc` command. Setting the color temperature resets the
     /// RGB color to (0, 0, 0) (disabled).
     async fn set_color_temp(&self, id: &DeviceId, kelvin: u32) -> Result<()> {
-        if kelvin == 0 || kelvin > 10000 {
-            return Err(GoveeError::InvalidConfig(
-                "color temperature must be 1-10000K".into(),
-            ));
-        }
+        validate_kelvin(kelvin)?;
         let payload = serde_json::json!({
             "msg": {
                 "cmd": "colorwc",
@@ -571,11 +577,6 @@ fn _assert_boxed_backend_send_sync() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::LazyLock;
-    use tokio::sync::Mutex as TokioMutex;
-
-    /// Serialize tests that bind port 4002.
-    static PORT_LOCK: LazyLock<TokioMutex<()>> = LazyLock::new(|| TokioMutex::new(()));
 
     #[test]
     fn parse_scan_response_json() {
@@ -806,26 +807,16 @@ mod tests {
         assert_eq!(msg["data"]["colorTemInKelvin"], 4500);
     }
 
-    #[tokio::test]
-    async fn set_color_temp_kelvin_zero_rejected() {
-        let _lock = PORT_LOCK.lock().await;
-        let backend = LocalBackend::new(Duration::from_millis(100), 60)
-            .await
-            .unwrap();
-        let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
-        let result = backend.set_color_temp(&id, 0).await;
+    #[test]
+    fn set_color_temp_kelvin_zero_rejected() {
+        let result = validate_kelvin(0);
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), GoveeError::InvalidConfig(_)));
     }
 
-    #[tokio::test]
-    async fn set_color_temp_kelvin_above_10000_rejected() {
-        let _lock = PORT_LOCK.lock().await;
-        let backend = LocalBackend::new(Duration::from_millis(100), 60)
-            .await
-            .unwrap();
-        let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
-        let result = backend.set_color_temp(&id, 10001).await;
+    #[test]
+    fn set_color_temp_kelvin_above_10000_rejected() {
+        let result = validate_kelvin(10001);
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), GoveeError::InvalidConfig(_)));
     }
