@@ -137,7 +137,7 @@ impl LocalBackend {
             if let Err(e) = socket.bind(&bind_addr.into()) {
                 if e.kind() == std::io::ErrorKind::AddrInUse {
                     return Err(GoveeError::BackendUnavailable(
-                        "port 4002 already in use — another process \
+                        "port 4002 already in use -- another process \
                          (Home Assistant, govee2mqtt, etc.) may be using the Govee LAN API"
                             .into(),
                     ));
@@ -284,7 +284,7 @@ async fn handle_packet(
             handle_dev_status(data_obj, source_ip, pending_state).await?;
         }
         _ => {
-            return Err(protocol_error(&format!("unexpected cmd: {cmd}")));
+            tracing::warn!(cmd, "ignoring unknown LAN command");
         }
     }
 
@@ -571,6 +571,11 @@ fn _assert_boxed_backend_send_sync() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::LazyLock;
+    use tokio::sync::Mutex as TokioMutex;
+
+    /// Serialize tests that bind port 4002.
+    static PORT_LOCK: LazyLock<TokioMutex<()>> = LazyLock::new(|| TokioMutex::new(()));
 
     #[test]
     fn parse_scan_response_json() {
@@ -801,18 +806,28 @@ mod tests {
         assert_eq!(msg["data"]["colorTemInKelvin"], 4500);
     }
 
-    #[test]
-    fn set_color_temp_kelvin_zero_rejected() {
-        // Verify that the validation message is correct for kelvin=0
-        let err = GoveeError::InvalidConfig("color temperature must be 1-10000K".into());
-        assert!(matches!(err, GoveeError::InvalidConfig(_)));
+    #[tokio::test]
+    async fn set_color_temp_kelvin_zero_rejected() {
+        let _lock = PORT_LOCK.lock().await;
+        let backend = LocalBackend::new(Duration::from_millis(100), 60)
+            .await
+            .unwrap();
+        let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+        let result = backend.set_color_temp(&id, 0).await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), GoveeError::InvalidConfig(_)));
     }
 
-    #[test]
-    fn set_color_temp_kelvin_above_10000_rejected() {
-        // Verify that the validation message is correct for kelvin=10001
-        let err = GoveeError::InvalidConfig("color temperature must be 1-10000K".into());
-        assert!(matches!(err, GoveeError::InvalidConfig(_)));
+    #[tokio::test]
+    async fn set_color_temp_kelvin_above_10000_rejected() {
+        let _lock = PORT_LOCK.lock().await;
+        let backend = LocalBackend::new(Duration::from_millis(100), 60)
+            .await
+            .unwrap();
+        let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+        let result = backend.set_color_temp(&id, 10001).await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), GoveeError::InvalidConfig(_)));
     }
 
     #[test]

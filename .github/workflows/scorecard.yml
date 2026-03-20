@@ -5,6 +5,7 @@ on:
   schedule:
     - cron: '0 6 * * 1'
 permissions:
+  contents: read
   security-events: write
   id-token: write
   actions: read
@@ -12,14 +13,14 @@ jobs:
   scorecard:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
           persist-credentials: false
-      - uses: ossf/scorecard-action@v2
+      - uses: ossf/scorecard-action@80aea4a47cea314c6b4b2cf9f2c4a6bbe4fd824a # v2
         with:
           results_file: results.sarif
           results_format: sarif
           publish_results: true
-      - uses: github/codeql-action/upload-sarif@v3
+      - uses: github/codeql-action/upload-sarif@5cf07d8b700b67e235fbb65cbc84f69c0cf10464 # v3
         with:
           sarif_file: results.sarif

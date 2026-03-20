@@ -97,9 +97,9 @@ impl CloudBackend {
         base_url: Option<String>,
         user_agent: Option<String>,
     ) -> Result<Self> {
-        // Validate user_agent: reject control characters (CR, LF, bytes < 0x20).
+        // Validate user_agent: reject control characters (bytes < 0x20 or DEL 0x7F).
         if let Some(ref ua) = user_agent
-            && ua.bytes().any(|b| b < 0x20)
+            && ua.bytes().any(|b| b < 0x20 || b == 0x7f)
         {
             return Err(GoveeError::InvalidConfig(
                 "user_agent contains invalid characters".into(),
@@ -647,19 +647,22 @@ mod tests {
         assert!(matches!(result.unwrap_err(), GoveeError::InvalidConfig(_)));
     }
 
-    #[test]
-    fn set_color_temp_kelvin_zero_rejected() {
-        let _backend = CloudBackend::new("key".into(), None, None).unwrap();
-        // Can't actually call set_color_temp without populating the cache,
-        // but we can verify the validation logic inline.
-        let kelvin: u32 = 0;
-        assert!(kelvin == 0 || kelvin > 10000);
+    #[tokio::test]
+    async fn set_color_temp_kelvin_zero_rejected() {
+        let backend = CloudBackend::new("key".into(), None, None).unwrap();
+        let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+        // Validation runs before cache lookup, so no need to populate cache.
+        let result = backend.set_color_temp(&id, 0).await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), GoveeError::InvalidConfig(_)));
     }
 
-    #[test]
-    fn set_color_temp_kelvin_above_10000_rejected() {
-        let _backend = CloudBackend::new("key".into(), None, None).unwrap();
-        let kelvin: u32 = 10001;
-        assert!(kelvin == 0 || kelvin > 10000);
+    #[tokio::test]
+    async fn set_color_temp_kelvin_above_10000_rejected() {
+        let backend = CloudBackend::new("key".into(), None, None).unwrap();
+        let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+        let result = backend.set_color_temp(&id, 10001).await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), GoveeError::InvalidConfig(_)));
     }
 }
