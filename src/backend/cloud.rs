@@ -46,11 +46,12 @@ fn is_loopback(url: &reqwest::Url) -> bool {
 }
 
 /// Build a configured `reqwest::Client` with timeouts and User-Agent.
-fn build_client() -> std::result::Result<Client, reqwest::Error> {
+fn build_client(custom_ua: Option<&str>) -> std::result::Result<Client, reqwest::Error> {
+    let ua = custom_ua.map(|s| s.to_string()).unwrap_or_else(user_agent);
     Client::builder()
         .timeout(DEFAULT_TIMEOUT)
         .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
-        .user_agent(user_agent())
+        .user_agent(ua)
         .build()
 }
 
@@ -91,7 +92,20 @@ impl CloudBackend {
     /// all API calls (including the API key) are sent to the attacker's
     /// endpoint. Callers must never derive `base_url` from untrusted
     /// input. (RT-09)
-    pub fn new(api_key: String, base_url: Option<String>) -> Result<Self> {
+    pub fn new(
+        api_key: String,
+        base_url: Option<String>,
+        user_agent: Option<String>,
+    ) -> Result<Self> {
+        // Validate user_agent: reject control characters (bytes < 0x20 or DEL 0x7F).
+        if let Some(ref ua) = user_agent
+            && ua.bytes().any(|b| b < 0x20 || b == 0x7f)
+        {
+            return Err(GoveeError::InvalidConfig(
+                "user_agent contains invalid characters".into(),
+            ));
+        }
+
         let raw = base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
         let parsed = reqwest::Url::parse(&raw)
             .map_err(|e| GoveeError::InvalidConfig(format!("invalid base URL \"{raw}\": {e}")))?;
@@ -100,7 +114,7 @@ impl CloudBackend {
                 "base URL must use HTTPS (HTTP is only allowed for loopback addresses), got: {raw}"
             )));
         }
-        let client = build_client()
+        let client = build_client(user_agent.as_deref())
             .map_err(|e| GoveeError::InvalidConfig(format!("failed to build HTTP client: {e}")))?;
         Ok(Self {
             client,
@@ -426,14 +440,11 @@ impl GoveeBackend for CloudBackend {
         .await
     }
 
-    /// Set color temperature in Kelvin.
-    ///
-    /// No device-specific range validation — the Govee API rejects
-    /// unsupported values. We only reject `0` as physically meaningless.
+    /// Set color temperature in Kelvin (1-10000).
     async fn set_color_temp(&self, id: &DeviceId, kelvin: u32) -> Result<()> {
-        if kelvin == 0 {
+        if kelvin == 0 || kelvin > 10000 {
             return Err(GoveeError::InvalidConfig(
-                "color temperature must be > 0K".into(),
+                "color temperature must be 1-10000K".into(),
             ));
         }
         self.send_control(id, "colorTem", serde_json::json!(kelvin))
@@ -462,7 +473,7 @@ mod tests {
 
     #[test]
     fn rejects_http_non_loopback() {
-        let result = CloudBackend::new("key".into(), Some("http://example.com".into()));
+        let result = CloudBackend::new("key".into(), Some("http://example.com".into()), None);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, GoveeError::InvalidConfig(_)));
@@ -471,40 +482,45 @@ mod tests {
 
     #[test]
     fn allows_http_loopback() {
-        assert!(CloudBackend::new("key".into(), Some("http://127.0.0.1:8080".into())).is_ok());
-        assert!(CloudBackend::new("key".into(), Some("http://localhost:8080".into())).is_ok());
-        assert!(CloudBackend::new("key".into(), Some("http://[::1]:8080".into())).is_ok());
+        assert!(
+            CloudBackend::new("key".into(), Some("http://127.0.0.1:8080".into()), None).is_ok()
+        );
+        assert!(
+            CloudBackend::new("key".into(), Some("http://localhost:8080".into()), None).is_ok()
+        );
+        assert!(CloudBackend::new("key".into(), Some("http://[::1]:8080".into()), None).is_ok());
     }
 
     #[test]
     fn rejects_invalid_url() {
-        let result = CloudBackend::new("key".into(), Some("not a url".into()));
+        let result = CloudBackend::new("key".into(), Some("not a url".into()), None);
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), GoveeError::InvalidConfig(_)));
     }
 
     #[test]
     fn accepts_https_base_url() {
-        let result = CloudBackend::new("key".into(), Some("https://example.com".into()));
+        let result = CloudBackend::new("key".into(), Some("https://example.com".into()), None);
         assert!(result.is_ok());
     }
 
     #[test]
     fn default_base_url_is_https() {
-        let backend = CloudBackend::new("key".into(), None).unwrap();
+        let backend = CloudBackend::new("key".into(), None, None).unwrap();
         assert_eq!(backend.base_url.scheme(), "https");
     }
 
     #[test]
     fn trailing_slash_normalized() {
-        let backend = CloudBackend::new("key".into(), Some("https://example.com/".into())).unwrap();
+        let backend =
+            CloudBackend::new("key".into(), Some("https://example.com/".into()), None).unwrap();
         let url = backend.base_url.join("v1/devices").unwrap();
         assert_eq!(url.path(), "/v1/devices");
     }
 
     #[test]
     fn debug_redacts_api_key() {
-        let backend = CloudBackend::new("super-secret-key".into(), None).unwrap();
+        let backend = CloudBackend::new("super-secret-key".into(), None, None).unwrap();
         let debug = format!("{:?}", backend);
         assert!(!debug.contains("super-secret-key"));
         assert!(debug.contains("[REDACTED]"));
@@ -604,5 +620,49 @@ mod tests {
         let ua = user_agent();
         assert!(ua.starts_with("govee/"));
         assert!(ua.contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn custom_user_agent_accepted() {
+        let result = CloudBackend::new("key".into(), None, Some("my-app/1.0".into()));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn user_agent_crlf_rejected() {
+        let result = CloudBackend::new("key".into(), None, Some("foo\r\nbar".into()));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, GoveeError::InvalidConfig(_)));
+        assert!(
+            err.to_string()
+                .contains("user_agent contains invalid characters")
+        );
+    }
+
+    #[test]
+    fn user_agent_null_byte_rejected() {
+        let result = CloudBackend::new("key".into(), None, Some("foo\0bar".into()));
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), GoveeError::InvalidConfig(_)));
+    }
+
+    #[tokio::test]
+    async fn set_color_temp_kelvin_zero_rejected() {
+        let backend = CloudBackend::new("key".into(), None, None).unwrap();
+        let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+        // Validation runs before cache lookup, so no need to populate cache.
+        let result = backend.set_color_temp(&id, 0).await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), GoveeError::InvalidConfig(_)));
+    }
+
+    #[tokio::test]
+    async fn set_color_temp_kelvin_above_10000_rejected() {
+        let backend = CloudBackend::new("key".into(), None, None).unwrap();
+        let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+        let result = backend.set_color_temp(&id, 10001).await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), GoveeError::InvalidConfig(_)));
     }
 }

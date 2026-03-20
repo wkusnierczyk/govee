@@ -141,7 +141,7 @@ use govee::backend::GoveeBackend;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let api_key = std::env::var("GOVEE_API_KEY")
         .expect("set GOVEE_API_KEY env var");
-    let backend = CloudBackend::new(api_key, None)?;
+    let backend = CloudBackend::new(api_key, None, None)?;
     let devices = backend.list_devices().await?;
     let state = backend.get_state(&devices[0].id).await?;
     backend.set_brightness(&devices[0].id, 75).await?;

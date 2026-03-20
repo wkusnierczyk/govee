@@ -10,15 +10,13 @@ use tokio::sync::{Mutex, RwLock, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use serde::de::Error as _;
-
 use crate::backend::GoveeBackend;
 use crate::error::{GoveeError, Result};
 use crate::types::{BackendType, Color, Device, DeviceId, DeviceState};
 
-/// Helper to create a `GoveeError::Json` with a custom message.
-fn json_error(msg: &str) -> GoveeError {
-    GoveeError::Json(serde_json::Error::custom(msg))
+/// Helper to create a `GoveeError::Protocol` with a custom message.
+fn protocol_error(msg: &str) -> GoveeError {
+    GoveeError::Protocol(msg.to_string())
 }
 
 /// Validate that an IP address is local (private, link-local, or loopback).
@@ -139,7 +137,7 @@ impl LocalBackend {
             if let Err(e) = socket.bind(&bind_addr.into()) {
                 if e.kind() == std::io::ErrorKind::AddrInUse {
                     return Err(GoveeError::BackendUnavailable(
-                        "port 4002 already in use — another process \
+                        "port 4002 already in use -- another process \
                          (Home Assistant, govee2mqtt, etc.) may be using the Govee LAN API"
                             .into(),
                     ));
@@ -266,27 +264,27 @@ async fn handle_packet(
     let envelope: serde_json::Value = serde_json::from_slice(data)?;
     let msg = envelope
         .get("msg")
-        .ok_or_else(|| json_error("missing 'msg' field"))?;
+        .ok_or_else(|| protocol_error("missing 'msg' field"))?;
     let cmd = msg
         .get("cmd")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| json_error("missing 'cmd' field"))?;
+        .ok_or_else(|| protocol_error("missing 'cmd' field"))?;
 
     match cmd {
         "scan" => {
             let data_obj = msg
                 .get("data")
-                .ok_or_else(|| json_error("missing 'data' in scan"))?;
+                .ok_or_else(|| protocol_error("missing 'data' in scan"))?;
             handle_scan_response(data_obj, source_ip, devices).await?;
         }
         "devStatus" => {
             let data_obj = msg
                 .get("data")
-                .ok_or_else(|| json_error("missing 'data' in devStatus"))?;
+                .ok_or_else(|| protocol_error("missing 'data' in devStatus"))?;
             handle_dev_status(data_obj, source_ip, pending_state).await?;
         }
         _ => {
-            tracing::warn!("unknown LAN command: {}", cmd);
+            tracing::warn!(cmd, "ignoring unknown LAN command");
         }
     }
 
@@ -302,11 +300,11 @@ async fn handle_scan_response(
     let device_mac = data
         .get("device")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| json_error("missing 'device' in scan"))?;
+        .ok_or_else(|| protocol_error("missing 'device' in scan"))?;
     let sku = data
         .get("sku")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| json_error("missing 'sku' in scan"))?;
+        .ok_or_else(|| protocol_error("missing 'sku' in scan"))?;
 
     // Always use the UDP source IP as the device address to prevent a
     // spoofed JSON `ip` field from injecting a wrong address. Log the
@@ -380,6 +378,16 @@ fn parse_dev_status(data: &serde_json::Value) -> Result<DeviceState> {
         .filter(|&v| v > 0);
 
     DeviceState::new(on, brightness, color, color_temp, false)
+}
+
+/// Validate color temperature range (1-10000K).
+fn validate_kelvin(kelvin: u32) -> Result<()> {
+    if kelvin == 0 || kelvin > 10000 {
+        return Err(GoveeError::InvalidConfig(
+            "color temperature must be 1-10000K".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -520,11 +528,7 @@ impl GoveeBackend for LocalBackend {
     /// single `colorwc` command. Setting the color temperature resets the
     /// RGB color to (0, 0, 0) (disabled).
     async fn set_color_temp(&self, id: &DeviceId, kelvin: u32) -> Result<()> {
-        if kelvin == 0 {
-            return Err(GoveeError::InvalidConfig(
-                "color temperature must be > 0K".into(),
-            ));
-        }
+        validate_kelvin(kelvin)?;
         let payload = serde_json::json!({
             "msg": {
                 "cmd": "colorwc",
@@ -801,6 +805,20 @@ mod tests {
         assert_eq!(msg["data"]["color"]["g"], 0);
         assert_eq!(msg["data"]["color"]["b"], 0);
         assert_eq!(msg["data"]["colorTemInKelvin"], 4500);
+    }
+
+    #[test]
+    fn set_color_temp_kelvin_zero_rejected() {
+        let result = validate_kelvin(0);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), GoveeError::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn set_color_temp_kelvin_above_10000_rejected() {
+        let result = validate_kelvin(10001);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), GoveeError::InvalidConfig(_)));
     }
 
     #[test]

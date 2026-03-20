@@ -81,7 +81,7 @@ impl DeviceRegistry {
         let cloud: Option<Arc<dyn GoveeBackend>> =
             if config.backend() != BackendPreference::LocalOnly {
                 if let Some(key) = config.api_key() {
-                    Some(Arc::new(CloudBackend::new(key.to_string(), None)?))
+                    Some(Arc::new(CloudBackend::new(key.to_string(), None, None)?))
                 } else {
                     None
                 }

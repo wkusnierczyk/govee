@@ -11,7 +11,7 @@ pub enum GoveeError {
     #[error("API error {code}: {message}")]
     Api { code: u16, message: String },
 
-    #[error("rate limited — retry after {retry_after_secs}s")]
+    #[error("rate limited -- retry after {retry_after_secs}s")]
     RateLimited { retry_after_secs: u64 },
 
     #[error("device not found: {0}")]
@@ -29,13 +29,16 @@ pub enum GoveeError {
     #[error("config error: {0}")]
     Config(#[from] toml::de::Error),
 
+    #[error("protocol error: {0}")]
+    Protocol(String),
+
     #[error("not implemented: {0}")]
     NotImplemented(String),
 
     #[error("invalid device ID: {0}")]
     InvalidDeviceId(String),
 
-    #[error("brightness must be 0–100, got {0}")]
+    #[error("brightness must be 0-100, got {0}")]
     InvalidBrightness(u8),
 
     #[error("invalid config: {0}")]
@@ -71,7 +74,7 @@ mod tests {
         let err = GoveeError::RateLimited {
             retry_after_secs: 60,
         };
-        assert_eq!(err.to_string(), "rate limited — retry after 60s");
+        assert_eq!(err.to_string(), "rate limited -- retry after 60s");
     }
 
     #[test]
