@@ -70,9 +70,9 @@ struct DiscoveredDevice {
 ///
 /// - Send arbitrary control commands directly to port 4003, bypassing
 ///   this library entirely. (RT-03)
-/// - Sniff multicast traffic on `239.255.255.250:4001` to enumerate
-///   all Govee devices, their firmware versions, and MAC addresses.
-///   (RT-11)
+/// - Send a multicast scan request to `239.255.255.250:4001` and
+///   receive discovery responses on port 4002 to enumerate all Govee
+///   devices, their firmware versions, and MAC addresses. (RT-11)
 /// - Inject spoofed scan responses to register fake devices in the
 ///   discovery cache. The library uses the UDP source IP (not the
 ///   JSON payload IP) to mitigate IP spoofing, but the `device` (MAC)
