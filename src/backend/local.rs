@@ -62,6 +62,32 @@ struct DiscoveredDevice {
 ///
 /// Communicates with Govee devices on the local network via the
 /// Govee LAN API (UDP multicast). Requires port 4002 to be available.
+///
+/// # Security
+///
+/// The Govee LAN protocol is **unauthenticated plaintext UDP**. Any
+/// process on the local network can:
+///
+/// - Send arbitrary control commands directly to port 4003, bypassing
+///   this library entirely. (RT-03)
+/// - Send a multicast scan request to `239.255.255.250:4001` and
+///   receive discovery responses on port 4002 to enumerate all Govee
+///   devices, their firmware versions, and MAC addresses. (RT-11)
+/// - Inject spoofed scan responses to register fake devices in the
+///   discovery cache. The library uses the UDP source IP (not the
+///   JSON payload IP) to mitigate IP spoofing, but the `device` (MAC)
+///   and `sku` fields are taken from the untrusted payload. (RT-02)
+/// - Send forged `devStatus` responses to poison the state cache.
+///
+/// These are fundamental properties of the Govee LAN protocol, which
+/// has no authentication mechanism. The library cannot fully prevent
+/// them.
+///
+/// # Limitations
+///
+/// - **Receive buffer:** 4096 bytes. UDP packets larger than this are
+///   silently truncated before JSON parsing. All current Govee protocol
+///   messages fit well within this limit. (RT-10)
 pub struct LocalBackend {
     send_socket: UdpSocket,
     devices: Arc<RwLock<HashMap<DeviceId, DiscoveredDevice>>>,
