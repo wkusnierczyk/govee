@@ -277,6 +277,18 @@ async fn get_state_device_not_found_without_cache() {
     let server = MockServer::start().await;
     let backend = backend_for(&server, "test-key");
 
+    // Auto-refresh will call list_devices — mock an empty device list.
+    Mock::given(method("GET"))
+        .and(path("/v1/devices"))
+        .and(header("Govee-API-Key", "test-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": { "devices": [] },
+            "message": "Success",
+            "code": 200
+        })))
+        .mount(&server)
+        .await;
+
     let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
     let result = backend.get_state(&id).await;
 
@@ -498,9 +510,10 @@ async fn control_command_rate_limited() {
 
     Mock::given(method("PUT"))
         .and(path("/v1/devices/control"))
+        .and(header("Govee-API-Key", "test-key"))
         .respond_with(
             ResponseTemplate::new(429)
-                .insert_header("Retry-After", "45")
+                .insert_header("Retry-After", "1")
                 .set_body_string("Too Many Requests"),
         )
         .mount(&server)
@@ -509,7 +522,7 @@ async fn control_command_rate_limited() {
     let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
     let result = backend.set_power(&id, true).await;
     match result.unwrap_err() {
-        GoveeError::RateLimited { retry_after_secs } => assert_eq!(retry_after_secs, 45),
+        GoveeError::RateLimited { retry_after_secs } => assert_eq!(retry_after_secs, 1),
         other => panic!("expected RateLimited, got: {other:?}"),
     }
 }

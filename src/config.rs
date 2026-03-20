@@ -116,6 +116,19 @@ impl Config {
             )));
         }
 
+        // Validate group names: non-empty, alphanumeric/'-'/'_' only (RT-M07-05).
+        for name in self.groups.keys() {
+            if name.is_empty()
+                || !name
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+            {
+                return Err(GoveeError::InvalidConfig(format!(
+                    "group \"{name}\": name must be non-empty and contain only alphanumeric, '-', '_' characters"
+                )));
+            }
+        }
+
         let mut scene_names: Vec<&String> = self.scenes.keys().collect();
         scene_names.sort();
         for name in scene_names {
@@ -457,6 +470,16 @@ mod tests {
         let toml = r#"
             [scenes.bad]
             brightness = 50
+        "#;
+        let result: std::result::Result<Config, _> = toml::from_str(toml);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn config_group_name_invalid_rejected() {
+        let toml = r#"
+            [groups]
+            "bad name" = ["device"]
         "#;
         let result: std::result::Result<Config, _> = toml::from_str(toml);
         assert!(result.is_err());

@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use reqwest::Client;
-use tracing::{debug, warn};
+use tracing::{debug, instrument, warn};
 
 use super::GoveeBackend;
 use crate::error::{GoveeError, Result};
@@ -18,6 +18,13 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Default connection timeout (TCP + TLS handshake).
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Maximum retry-after delay honored from a 429 response (RT-M07-02).
+/// Prevents a server from blocking the client indefinitely.
+const MAX_RETRY_AFTER_SECS: u64 = 300;
+
+/// Maximum number of retries for transient errors and rate limiting.
+const MAX_RETRIES: u32 = 3;
 
 /// User-Agent header identifying the library and version.
 fn user_agent() -> String {
@@ -67,9 +74,14 @@ fn build_client(custom_ua: Option<&str>) -> std::result::Result<Client, reqwest:
 ///   malware can intercept all traffic, capturing the API key. The
 ///   Govee API does not provide key rotation or revocation. (RT-08)
 ///
-/// **Note:** `std::sync::RwLock` is used for the device cache because the
-/// lock is held only for brief HashMap lookups/swaps and never across
-/// `.await` points. This avoids the overhead of `tokio::sync::RwLock`.
+/// # Resource lifecycle
+///
+/// - **HTTP client:** A single `reqwest::Client` is created at construction
+///   time and shared across all requests. `reqwest` pools connections
+///   internally — no manual connection management needed.
+/// - **Device model cache:** `std::sync::RwLock<HashMap>` holding device→model
+///   mappings. Populated by `list_devices`, read by `get_state`/`send_control`.
+///   Lock is held only for brief lookups/swaps and never across `.await` points.
 pub struct CloudBackend {
     client: Client,
     base_url: reqwest::Url,
@@ -77,6 +89,8 @@ pub struct CloudBackend {
     /// Device ID → model mapping, populated by `list_devices`.
     /// Required because `GET /v1/devices/state` needs both `device` and `model`.
     device_models: RwLock<HashMap<DeviceId, String>>,
+    /// Single-flight guard for auto-refresh of device_models cache (RT-M07-04).
+    refresh_guard: tokio::sync::Mutex<()>,
 }
 
 impl CloudBackend {
@@ -121,6 +135,7 @@ impl CloudBackend {
             base_url: parsed,
             api_key,
             device_models: RwLock::new(HashMap::new()),
+            refresh_guard: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -166,27 +181,56 @@ impl CloudBackend {
             }
         });
 
-        let response = self
-            .client
-            .put(url)
-            .header("Govee-API-Key", &self.api_key)
-            .json(&payload)
-            .send()
-            .await?;
+        for attempt in 0..=MAX_RETRIES {
+            let result = self
+                .client
+                .put(url.clone())
+                .header("Govee-API-Key", &self.api_key)
+                .json(&payload)
+                .send()
+                .await;
 
-        let response = self.check_response(response).await?;
+            let response = match result {
+                Ok(r) => r,
+                Err(e) => {
+                    let err = GoveeError::Request(e);
+                    if let Some(delay) = Self::retry_delay(&err, attempt)
+                        && attempt < MAX_RETRIES
+                    {
+                        debug!(attempt, ?delay, "retrying after request error");
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    return Err(err);
+                }
+            };
 
-        // Check API-level error code in response body.
-        let body: V1ControlResponse = response.json().await?;
-        if body.code != 200 {
-            return Err(GoveeError::Api {
-                code: body.code,
-                message: body.message,
-            });
+            match self.check_response(response).await {
+                Ok(response) => {
+                    let body: V1ControlResponse = response.json().await?;
+                    if body.code != 200 {
+                        return Err(GoveeError::Api {
+                            code: body.code,
+                            message: body.message,
+                        });
+                    }
+                    debug!(device = %id, cmd = cmd_name, "sent control command");
+                    return Ok(());
+                }
+                Err(err) => {
+                    if let Some(delay) = Self::retry_delay(&err, attempt)
+                        && attempt < MAX_RETRIES
+                    {
+                        debug!(attempt, ?delay, "retrying after error");
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
         }
 
-        debug!(device = %id, cmd = cmd_name, "sent control command");
-        Ok(())
+        unreachable!("retry loop always returns on the final attempt")
     }
 
     /// Check an HTTP response for rate limiting and error status codes.
@@ -211,6 +255,24 @@ impl CloudBackend {
             });
         }
         Ok(response)
+    }
+
+    /// Compute retry delay for a failed request.
+    ///
+    /// Returns `Some(duration)` if the error is retryable, `None` otherwise.
+    fn retry_delay(err: &GoveeError, attempt: u32) -> Option<Duration> {
+        match err {
+            GoveeError::RateLimited { retry_after_secs } => {
+                let capped = (*retry_after_secs).min(MAX_RETRY_AFTER_SECS);
+                Some(Duration::from_secs(capped))
+            }
+            GoveeError::Request(_) | GoveeError::Api { code: 500.., .. } => {
+                // Exponential backoff: 1s, 2s, 4s (deterministic, no randomness)
+                let delay_ms = 1000u64 * 2u64.pow(attempt);
+                Some(Duration::from_millis(delay_ms))
+            }
+            _ => None,
+        }
     }
 }
 
@@ -335,6 +397,7 @@ fn parse_retry_after(response: &reqwest::Response) -> u64 {
 
 #[async_trait]
 impl GoveeBackend for CloudBackend {
+    #[instrument(skip(self), fields(backend = "cloud"))]
     async fn list_devices(&self) -> Result<Vec<Device>> {
         let url = self
             .base_url
@@ -383,10 +446,27 @@ impl GoveeBackend for CloudBackend {
 
     /// Query the current state of a device.
     ///
-    /// Requires a prior `list_devices` call to populate the device→model
-    /// cache. Returns `DeviceNotFound` if the device is not cached.
+    /// Uses an internal device→model cache and will automatically refresh
+    /// the cache with `list_devices` on a cache miss. Returns
+    /// `DeviceNotFound` if the device is still unknown after refreshing.
+    #[instrument(skip(self), fields(backend = "cloud", device = %id))]
     async fn get_state(&self, id: &DeviceId) -> Result<DeviceState> {
-        let model = self.get_model(id)?;
+        // Auto-refresh device cache on miss (single-flight guard).
+        let model = match self.get_model(id) {
+            Ok(m) => m,
+            Err(_) => {
+                let _guard = self.refresh_guard.lock().await;
+                // Re-check after acquiring lock (another task may have refreshed).
+                match self.get_model(id) {
+                    Ok(m) => m,
+                    Err(_) => {
+                        debug!(device = %id, "model cache miss, refreshing device list");
+                        self.list_devices().await?;
+                        self.get_model(id)?
+                    }
+                }
+            }
+        };
         let mut url = self
             .base_url
             .join("v1/devices/state")
@@ -417,12 +497,14 @@ impl GoveeBackend for CloudBackend {
         Ok(state)
     }
 
+    #[instrument(skip(self), fields(backend = "cloud", device = %id))]
     async fn set_power(&self, id: &DeviceId, on: bool) -> Result<()> {
         let value = if on { "on" } else { "off" };
         self.send_control(id, "turn", serde_json::json!(value))
             .await
     }
 
+    #[instrument(skip(self), fields(backend = "cloud", device = %id))]
     async fn set_brightness(&self, id: &DeviceId, value: u8) -> Result<()> {
         if value > 100 {
             return Err(GoveeError::InvalidBrightness(value));
@@ -431,6 +513,7 @@ impl GoveeBackend for CloudBackend {
             .await
     }
 
+    #[instrument(skip(self, color), fields(backend = "cloud", device = %id))]
     async fn set_color(&self, id: &DeviceId, color: Color) -> Result<()> {
         self.send_control(
             id,
@@ -441,6 +524,7 @@ impl GoveeBackend for CloudBackend {
     }
 
     /// Set color temperature in Kelvin (1-10000).
+    #[instrument(skip(self), fields(backend = "cloud", device = %id))]
     async fn set_color_temp(&self, id: &DeviceId, kelvin: u32) -> Result<()> {
         if kelvin == 0 || kelvin > 10000 {
             return Err(GoveeError::InvalidConfig(
