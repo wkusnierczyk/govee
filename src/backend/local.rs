@@ -11,6 +11,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use serde::de::Error as _;
+use tracing::instrument;
 
 use crate::backend::GoveeBackend;
 use crate::error::{GoveeError, Result};
@@ -82,6 +83,15 @@ struct DiscoveredDevice {
 /// These are fundamental properties of the Govee LAN protocol, which
 /// has no authentication mechanism. The library cannot fully prevent
 /// them.
+///
+/// # Resource lifecycle
+///
+/// - **UDP socket:** A single `UdpSocket` is created at construction and
+///   shared for both multicast discovery sends and unicast control commands.
+/// - **Receiver task:** A background tokio task owns the `recv_from` loop,
+///   routing `scan` responses to the device cache and `devStatus` responses
+///   to oneshot channels. Lifecycle is tied to a `CancellationToken`.
+/// - **Drop:** Cancels the `CancellationToken` and aborts the receiver task.
 ///
 /// # Limitations
 ///
@@ -186,13 +196,53 @@ impl LocalBackend {
     }
 
     /// Send a multicast scan request and wait for responses.
+    /// Send a multicast scan request and wait for responses.
+    ///
+    /// Returns early if no new devices arrive for 200ms after the last
+    /// response, rather than waiting the full discovery timeout. This
+    /// reduces startup latency on quiet networks.
+    ///
+    /// **Trade-off:** The 200ms idle timeout may miss devices on
+    /// congested or high-latency LAN segments (WiFi, bridges). In
+    /// `Auto` mode, missed LAN devices fall back to cloud. In
+    /// `LocalOnly` mode, they are absent.
     pub async fn discover(&self) -> Result<()> {
         let scan_msg = r#"{"msg":{"cmd":"scan","data":{"account_topic":"reserve"}}}"#;
         let target: SocketAddr = (MULTICAST_ADDR, MULTICAST_PORT).into();
         self.send_socket
             .send_to(scan_msg.as_bytes(), target)
             .await?;
-        tokio::time::sleep(self.discovery_timeout).await;
+
+        // Wait for responses with early return on idle.
+        let idle_timeout = Duration::from_millis(200);
+        let deadline = tokio::time::Instant::now() + self.discovery_timeout;
+        let mut last_count = {
+            let cache = self.devices.read().await;
+            cache.len()
+        };
+
+        loop {
+            let remaining = deadline - tokio::time::Instant::now();
+            let wait = remaining.min(idle_timeout);
+            tokio::time::sleep(wait).await;
+
+            let current_count = {
+                let cache = self.devices.read().await;
+                cache.len()
+            };
+
+            if current_count > last_count {
+                // New device(s) arrived — reset idle timer.
+                last_count = current_count;
+            } else if tokio::time::Instant::now() >= deadline {
+                // Full timeout reached.
+                break;
+            } else {
+                // No new devices in the last idle window — return early.
+                break;
+            }
+        }
+
         Ok(())
     }
 
@@ -384,6 +434,7 @@ fn parse_dev_status(data: &serde_json::Value) -> Result<DeviceState> {
 
 #[async_trait]
 impl GoveeBackend for LocalBackend {
+    #[instrument(skip(self), fields(backend = "local"))]
     async fn list_devices(&self) -> Result<Vec<Device>> {
         // Discover if cache is empty or all entries are expired.
         {
@@ -421,6 +472,7 @@ impl GoveeBackend for LocalBackend {
         Ok(result)
     }
 
+    #[instrument(skip(self), fields(backend = "local", device = %id))]
     async fn get_state(&self, id: &DeviceId) -> Result<DeviceState> {
         let ip = self.get_device_ip(id).await?;
         validate_local_ip(ip)?;
@@ -472,6 +524,7 @@ impl GoveeBackend for LocalBackend {
         }
     }
 
+    #[instrument(skip(self), fields(backend = "local", device = %id))]
     async fn set_power(&self, id: &DeviceId, on: bool) -> Result<()> {
         let value = if on { 1 } else { 0 };
         let payload = serde_json::json!({
@@ -483,6 +536,7 @@ impl GoveeBackend for LocalBackend {
         self.send_command(id, payload).await
     }
 
+    #[instrument(skip(self), fields(backend = "local", device = %id))]
     async fn set_brightness(&self, id: &DeviceId, value: u8) -> Result<()> {
         if value > 100 {
             return Err(GoveeError::InvalidBrightness(value));
@@ -501,6 +555,7 @@ impl GoveeBackend for LocalBackend {
     /// The Govee LAN protocol bundles color and color temperature into a
     /// single `colorwc` command. Setting the RGB color resets the color
     /// temperature to 0 (disabled).
+    #[instrument(skip(self, color), fields(backend = "local", device = %id))]
     async fn set_color(&self, id: &DeviceId, color: Color) -> Result<()> {
         let payload = serde_json::json!({
             "msg": {
@@ -519,6 +574,7 @@ impl GoveeBackend for LocalBackend {
     /// The Govee LAN protocol bundles color and color temperature into a
     /// single `colorwc` command. Setting the color temperature resets the
     /// RGB color to (0, 0, 0) (disabled).
+    #[instrument(skip(self), fields(backend = "local", device = %id))]
     async fn set_color_temp(&self, id: &DeviceId, kelvin: u32) -> Result<()> {
         if kelvin == 0 {
             return Err(GoveeError::InvalidConfig(

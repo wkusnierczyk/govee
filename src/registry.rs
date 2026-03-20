@@ -47,6 +47,16 @@ pub(crate) enum CacheSource {
 /// Created via [`DeviceRegistry::start`], which returns an `Arc<Self>`.
 /// The registry merges device lists from cloud and local backends
 /// and routes commands to the appropriate backend per device.
+///
+/// # Resource lifecycle
+///
+/// - **Backends:** Held as `Arc<dyn GoveeBackend>`. Dropped when the
+///   registry is dropped.
+/// - **Reconciliation task:** Spawned at construction, holds a
+///   `Weak<DeviceRegistry>`. Exits when the `Weak` can no longer
+///   upgrade (registry dropped) or when the `CancellationToken` fires.
+/// - **Drop:** Cancels the `CancellationToken`, signaling the
+///   reconciliation task to exit.
 pub struct DeviceRegistry {
     devices: HashMap<DeviceId, RegisteredDevice>,
     cloud: Option<Arc<dyn GoveeBackend>>,
