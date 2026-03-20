@@ -1,0 +1,32 @@
+# Code coverage workflow using cargo-llvm-cov.
+#
+# Coverage target: ≥90% line coverage (informational, not blocking).
+# Uses `--lib` to measure only library code, which automatically excludes
+# test utilities (tests/, src/backend/mock.rs behind cfg(test)), so no
+# --ignore-filename-regex is needed.
+
+name: Coverage
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - run: cargo llvm-cov --lib --lcov --output-path lcov.info
+      - name: Check coverage threshold
+        run: |
+          COVERAGE=$(cargo llvm-cov --lib --summary-only 2>&1 | grep -oP 'TOTAL.*?(\d+\.\d+)%' | grep -oP '\d+\.\d+' | tail -1)
+          echo "Coverage: ${COVERAGE}%"
+          # Target: 90% (informational, not blocking for now)
