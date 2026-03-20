@@ -280,6 +280,7 @@ async fn get_state_device_not_found_without_cache() {
     // Auto-refresh will call list_devices — mock an empty device list.
     Mock::given(method("GET"))
         .and(path("/v1/devices"))
+        .and(header("Govee-API-Key", "test-key"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "data": { "devices": [] },
             "message": "Success",
@@ -509,6 +510,7 @@ async fn control_command_rate_limited() {
 
     Mock::given(method("PUT"))
         .and(path("/v1/devices/control"))
+        .and(header("Govee-API-Key", "test-key"))
         .respond_with(
             ResponseTemplate::new(429)
                 .insert_header("Retry-After", "1")

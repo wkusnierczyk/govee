@@ -196,7 +196,6 @@ impl LocalBackend {
     }
 
     /// Send a multicast scan request and wait for responses.
-    /// Send a multicast scan request and wait for responses.
     ///
     /// Returns early if no new devices arrive for 200ms after the last
     /// response, rather than waiting the full discovery timeout. This
@@ -222,7 +221,11 @@ impl LocalBackend {
         };
 
         loop {
-            let remaining = deadline - tokio::time::Instant::now();
+            let now = tokio::time::Instant::now();
+            let remaining = match deadline.checked_duration_since(now) {
+                Some(dur) if !dur.is_zero() => dur,
+                _ => break,
+            };
             let wait = remaining.min(idle_timeout);
             tokio::time::sleep(wait).await;
 
@@ -576,9 +579,9 @@ impl GoveeBackend for LocalBackend {
     /// RGB color to (0, 0, 0) (disabled).
     #[instrument(skip(self), fields(backend = "local", device = %id))]
     async fn set_color_temp(&self, id: &DeviceId, kelvin: u32) -> Result<()> {
-        if kelvin == 0 {
+        if kelvin == 0 || kelvin > 10000 {
             return Err(GoveeError::InvalidConfig(
-                "color temperature must be > 0K".into(),
+                "color temperature must be 1-10000K".into(),
             ));
         }
         let payload = serde_json::json!({

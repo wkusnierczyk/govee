@@ -167,7 +167,6 @@ impl CloudBackend {
             }
         });
 
-        let mut last_err = None;
         for attempt in 0..=MAX_RETRIES {
             let result = self
                 .client
@@ -186,7 +185,6 @@ impl CloudBackend {
                     {
                         debug!(attempt, ?delay, "retrying after request error");
                         tokio::time::sleep(delay).await;
-                        last_err = Some(err);
                         continue;
                     }
                     return Err(err);
@@ -211,7 +209,6 @@ impl CloudBackend {
                     {
                         debug!(attempt, ?delay, "retrying after error");
                         tokio::time::sleep(delay).await;
-                        last_err = Some(err);
                         continue;
                     }
                     return Err(err);
@@ -219,7 +216,7 @@ impl CloudBackend {
             }
         }
 
-        Err(last_err.unwrap_or(GoveeError::DiscoveryTimeout))
+        unreachable!("retry loop always returns on the final attempt")
     }
 
     /// Check an HTTP response for rate limiting and error status codes.
@@ -255,13 +252,10 @@ impl CloudBackend {
                 let capped = (*retry_after_secs).min(MAX_RETRY_AFTER_SECS);
                 Some(Duration::from_secs(capped))
             }
-            GoveeError::Request(_) => {
-                // Exponential backoff with jitter: base 1s, 2s, 4s
-                let base_ms = 1000u64 * 2u64.pow(attempt.saturating_sub(1));
-                // Simple jitter: ±25%
-                let jitter = base_ms / 4;
-                let delay = base_ms + (base_ms % (jitter.max(1)));
-                Some(Duration::from_millis(delay))
+            GoveeError::Request(_) | GoveeError::Api { code: 500.., .. } => {
+                // Exponential backoff: 1s, 2s, 4s (deterministic, no randomness)
+                let delay_ms = 1000u64 * 2u64.pow(attempt);
+                Some(Duration::from_millis(delay_ms))
             }
             _ => None,
         }
@@ -438,8 +432,9 @@ impl GoveeBackend for CloudBackend {
 
     /// Query the current state of a device.
     ///
-    /// Requires a prior `list_devices` call to populate the device→model
-    /// cache. Returns `DeviceNotFound` if the device is not cached.
+    /// Uses an internal device→model cache and will automatically refresh
+    /// the cache with `list_devices` on a cache miss. Returns
+    /// `DeviceNotFound` if the device is still unknown after refreshing.
     #[instrument(skip(self), fields(backend = "cloud", device = %id))]
     async fn get_state(&self, id: &DeviceId) -> Result<DeviceState> {
         // Auto-refresh device cache on miss (single-flight guard).
@@ -514,15 +509,12 @@ impl GoveeBackend for CloudBackend {
         .await
     }
 
-    /// Set color temperature in Kelvin.
-    ///
-    /// No device-specific range validation — the Govee API rejects
-    /// unsupported values. We only reject `0` as physically meaningless.
+    /// Set color temperature in Kelvin (1-10000).
     #[instrument(skip(self), fields(backend = "cloud", device = %id))]
     async fn set_color_temp(&self, id: &DeviceId, kelvin: u32) -> Result<()> {
-        if kelvin == 0 {
+        if kelvin == 0 || kelvin > 10000 {
             return Err(GoveeError::InvalidConfig(
-                "color temperature must be > 0K".into(),
+                "color temperature must be 1-10000K".into(),
             ));
         }
         self.send_control(id, "colorTem", serde_json::json!(kelvin))
