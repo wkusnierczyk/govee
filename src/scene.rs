@@ -49,7 +49,7 @@ impl Scene {
             && (*temp == 0 || *temp > 10000)
         {
             return Err(GoveeError::InvalidConfig(
-                "color temp must be 1\u{2013}10000".to_string(),
+                "color temp must be 1-10000".to_string(),
             ));
         }
 
