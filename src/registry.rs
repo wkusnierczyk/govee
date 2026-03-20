@@ -11,6 +11,7 @@ use crate::backend::cloud::CloudBackend;
 use crate::backend::local::LocalBackend;
 use crate::config::{BackendPreference, Config};
 use crate::error::{GoveeError, Result};
+use crate::scene::{SceneColor, SceneRegistry, SceneTarget};
 use crate::types::{BackendType, Color, Device, DeviceId, DeviceState};
 
 /// Default discovery timeout for initial device scan during construction.
@@ -57,6 +58,7 @@ pub struct DeviceRegistry {
     #[allow(dead_code)]
     group_map: HashMap<String, Vec<DeviceId>>,
     state_cache: RwLock<HashMap<DeviceId, CacheEntry>>,
+    scene_registry: SceneRegistry,
     cancel: CancellationToken,
     #[allow(dead_code)]
     config: Config,
@@ -301,6 +303,8 @@ impl DeviceRegistry {
             }
         }
 
+        let scene_registry = SceneRegistry::new().with_user_scenes(config.scenes())?;
+
         let cancel = CancellationToken::new();
         let interval = Duration::from_secs(config.discovery_interval_secs());
         let cancel_for_task = cancel.clone();
@@ -313,6 +317,7 @@ impl DeviceRegistry {
             name_map,
             group_map,
             state_cache: RwLock::new(HashMap::new()),
+            scene_registry,
             cancel,
             config,
         });
@@ -513,6 +518,67 @@ impl DeviceRegistry {
         }
 
         Ok(())
+    }
+
+    /// Return a reference to the scene registry.
+    pub fn scenes(&self) -> &SceneRegistry {
+        &self.scene_registry
+    }
+
+    /// Apply a named scene to the specified target.
+    ///
+    /// Sends 2 commands per device (color/temp then brightness). Each
+    /// `set_*` call may also trigger an additional backend `get_state`
+    /// query on cache miss, so worst-case is up to 4 × N backend calls.
+    /// Color or color temperature is set first, then brightness, to
+    /// produce a less jarring visual transition.
+    ///
+    /// Executes commands concurrently via `join_all` (unbounded).
+    /// Designed for typical Govee setups with fewer than ~20 devices
+    /// per target. Larger targets may trigger cloud API rate limits.
+    ///
+    /// `SceneTarget::All` targets every registered device — callers
+    /// should confirm scope before using this variant.
+    ///
+    /// On partial failure, some devices may be left in an intermediate
+    /// state (e.g., color changed but brightness not updated). No
+    /// rollback is attempted.
+    pub async fn apply_scene(
+        self: &Arc<Self>,
+        scene_name: &str,
+        target: SceneTarget,
+    ) -> Result<()> {
+        let scene = self.scenes().get(scene_name)?;
+        let brightness = scene.brightness();
+        let color = *scene.color();
+
+        let ids: Vec<DeviceId> = match target {
+            SceneTarget::Device(id) => vec![id],
+            SceneTarget::DeviceName(name) => vec![self.resolve(&name)?],
+            SceneTarget::Group(name) => self.resolve_group(&name)?,
+            SceneTarget::All => self.devices.keys().cloned().collect(),
+        };
+
+        let results: Vec<_> = futures::future::join_all(ids.iter().map(|id| {
+            let registry = Arc::clone(self);
+            let id = id.clone();
+            async move {
+                match color {
+                    SceneColor::Rgb(c) => registry.set_color(&id, c).await?,
+                    SceneColor::Temp(k) => registry.set_color_temp(&id, k).await?,
+                }
+                registry.set_brightness(&id, brightness).await
+            }
+        }))
+        .await;
+
+        // Single-device targets return the underlying error directly
+        // instead of wrapping in PartialFailure.
+        if ids.len() == 1 {
+            return results.into_iter().next().unwrap();
+        }
+
+        collect_group_results(&ids, results)
     }
 
     /// Resolve a group name to its member device IDs.
@@ -2465,6 +2531,345 @@ mod tests {
         let result = registry.group_set_power("all", true).await;
         assert!(result.is_err());
 
+        match result.unwrap_err() {
+            GoveeError::PartialFailure {
+                succeeded, failed, ..
+            } => {
+                assert_eq!(succeeded.len(), 1);
+                assert_eq!(failed.len(), 1);
+                assert_eq!(succeeded[0], DeviceId::new("AA:BB:CC:DD:EE:01").unwrap());
+                assert_eq!(failed[0].0, DeviceId::new("AA:BB:CC:DD:EE:02").unwrap());
+            }
+            other => panic!("expected PartialFailure, got {:?}", other),
+        }
+    }
+
+    // -- apply_scene tests (#31) --
+
+    use crate::config::SceneConfig;
+    use crate::scene::SceneTarget;
+
+    fn mock_with_two_devices_and_state(state: DeviceState) -> Arc<dyn GoveeBackend> {
+        Arc::new(
+            MockBackend::new()
+                .with_devices(vec![
+                    make_device(
+                        "AA:BB:CC:DD:EE:01",
+                        "H6076",
+                        "Kitchen Light",
+                        BackendType::Cloud,
+                    ),
+                    make_device(
+                        "AA:BB:CC:DD:EE:02",
+                        "H6078",
+                        "Bedroom Light",
+                        BackendType::Cloud,
+                    ),
+                ])
+                .with_state(state)
+                .with_backend_type(BackendType::Cloud),
+        ) as Arc<dyn GoveeBackend>
+    }
+
+    #[tokio::test]
+    async fn apply_scene_single_device_rgb() {
+        let state = make_state(true, 50, 0, 0, 0);
+        let (cloud, id) = mock_with_device_and_state("AA:BB:CC:DD:EE:01", state);
+
+        let registry = DeviceRegistry::start_with_backends(default_config(), Some(cloud), None)
+            .await
+            .unwrap();
+
+        // Built-in "night" scene: brightness=10, color=Rgb(255,0,0)
+        registry
+            .apply_scene("night", SceneTarget::Device(id.clone()))
+            .await
+            .unwrap();
+
+        let cached = registry.get_state(&id).await.unwrap();
+        assert_eq!(cached.brightness, 10);
+        assert_eq!(cached.color, Color::new(255, 0, 0));
+        assert_eq!(cached.color_temp_kelvin, None);
+    }
+
+    #[tokio::test]
+    async fn apply_scene_single_device_color_temp() {
+        let state = make_state(true, 50, 0, 0, 0);
+        let (cloud, id) = mock_with_device_and_state("AA:BB:CC:DD:EE:01", state);
+
+        let registry = DeviceRegistry::start_with_backends(default_config(), Some(cloud), None)
+            .await
+            .unwrap();
+
+        // Built-in "warm" scene: brightness=40, color=Temp(2700)
+        registry
+            .apply_scene("warm", SceneTarget::Device(id.clone()))
+            .await
+            .unwrap();
+
+        let cached = registry.get_state(&id).await.unwrap();
+        assert_eq!(cached.brightness, 40);
+        assert_eq!(cached.color_temp_kelvin, Some(2700));
+    }
+
+    #[tokio::test]
+    async fn apply_scene_to_group() {
+        let state = make_state(true, 50, 0, 0, 0);
+        let cloud = mock_with_two_devices_and_state(state);
+
+        let mut groups = HashMap::new();
+        groups.insert(
+            "all".to_string(),
+            vec!["Kitchen Light".to_string(), "Bedroom Light".to_string()],
+        );
+        let config = config_with_groups(groups);
+
+        let registry = DeviceRegistry::start_with_backends(config, Some(cloud), None)
+            .await
+            .unwrap();
+
+        registry
+            .apply_scene("night", SceneTarget::Group("all".to_string()))
+            .await
+            .unwrap();
+
+        let id1 = DeviceId::new("AA:BB:CC:DD:EE:01").unwrap();
+        let id2 = DeviceId::new("AA:BB:CC:DD:EE:02").unwrap();
+
+        let cached1 = registry.get_state(&id1).await.unwrap();
+        assert_eq!(cached1.brightness, 10);
+        assert_eq!(cached1.color, Color::new(255, 0, 0));
+
+        let cached2 = registry.get_state(&id2).await.unwrap();
+        assert_eq!(cached2.brightness, 10);
+        assert_eq!(cached2.color, Color::new(255, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn apply_scene_to_all_devices() {
+        let state = make_state(true, 50, 0, 0, 0);
+        let cloud = mock_with_two_devices_and_state(state);
+
+        let registry = DeviceRegistry::start_with_backends(default_config(), Some(cloud), None)
+            .await
+            .unwrap();
+
+        registry
+            .apply_scene("focus", SceneTarget::All)
+            .await
+            .unwrap();
+
+        let id1 = DeviceId::new("AA:BB:CC:DD:EE:01").unwrap();
+        let id2 = DeviceId::new("AA:BB:CC:DD:EE:02").unwrap();
+
+        let cached1 = registry.get_state(&id1).await.unwrap();
+        assert_eq!(cached1.brightness, 80);
+        assert_eq!(cached1.color_temp_kelvin, Some(5500));
+
+        let cached2 = registry.get_state(&id2).await.unwrap();
+        assert_eq!(cached2.brightness, 80);
+        assert_eq!(cached2.color_temp_kelvin, Some(5500));
+    }
+
+    #[tokio::test]
+    async fn apply_scene_with_device_name() {
+        let state = make_state(true, 50, 0, 0, 0);
+        let cloud = mock_with_two_devices_and_state(state);
+
+        let registry = DeviceRegistry::start_with_backends(default_config(), Some(cloud), None)
+            .await
+            .unwrap();
+
+        registry
+            .apply_scene(
+                "night",
+                SceneTarget::DeviceName("Kitchen Light".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let id = DeviceId::new("AA:BB:CC:DD:EE:01").unwrap();
+        let cached = registry.get_state(&id).await.unwrap();
+        assert_eq!(cached.brightness, 10);
+        assert_eq!(cached.color, Color::new(255, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn apply_scene_unknown_scene_returns_error() {
+        let registry = DeviceRegistry::start_with_backends(default_config(), None, None)
+            .await
+            .unwrap();
+
+        let err = registry
+            .apply_scene("nonexistent", SceneTarget::All)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, GoveeError::DeviceNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn apply_scene_user_defined_rgb() {
+        let state = make_state(true, 50, 0, 0, 0);
+        let (cloud, id) = mock_with_device_and_state("AA:BB:CC:DD:EE:01", state);
+
+        let mut scenes = HashMap::new();
+        scenes.insert(
+            "custom".to_string(),
+            SceneConfig {
+                brightness: 75,
+                color: Some(Color::new(0, 128, 255)),
+                color_temp: None,
+            },
+        );
+        let config = Config::new(
+            None,
+            BackendPreference::Auto,
+            60,
+            HashMap::new(),
+            HashMap::new(),
+            scenes,
+        )
+        .unwrap();
+
+        let registry = DeviceRegistry::start_with_backends(config, Some(cloud), None)
+            .await
+            .unwrap();
+
+        registry
+            .apply_scene("custom", SceneTarget::Device(id.clone()))
+            .await
+            .unwrap();
+
+        let cached = registry.get_state(&id).await.unwrap();
+        assert_eq!(cached.brightness, 75);
+        assert_eq!(cached.color, Color::new(0, 128, 255));
+    }
+
+    #[tokio::test]
+    async fn apply_scene_user_defined_color_temp() {
+        let state = make_state(true, 50, 0, 0, 0);
+        let (cloud, id) = mock_with_device_and_state("AA:BB:CC:DD:EE:01", state);
+
+        let mut scenes = HashMap::new();
+        scenes.insert(
+            "daylight".to_string(),
+            SceneConfig {
+                brightness: 100,
+                color: None,
+                color_temp: Some(6500),
+            },
+        );
+        let config = Config::new(
+            None,
+            BackendPreference::Auto,
+            60,
+            HashMap::new(),
+            HashMap::new(),
+            scenes,
+        )
+        .unwrap();
+
+        let registry = DeviceRegistry::start_with_backends(config, Some(cloud), None)
+            .await
+            .unwrap();
+
+        registry
+            .apply_scene("daylight", SceneTarget::Device(id.clone()))
+            .await
+            .unwrap();
+
+        let cached = registry.get_state(&id).await.unwrap();
+        assert_eq!(cached.brightness, 100);
+        assert_eq!(cached.color_temp_kelvin, Some(6500));
+    }
+
+    #[tokio::test]
+    async fn apply_scene_partial_failure() {
+        use async_trait::async_trait;
+
+        struct FailingBackend;
+
+        #[async_trait]
+        impl GoveeBackend for FailingBackend {
+            async fn list_devices(&self) -> crate::error::Result<Vec<Device>> {
+                Ok(vec![Device {
+                    id: DeviceId::new("AA:BB:CC:DD:EE:02").unwrap(),
+                    model: "H6078".into(),
+                    name: "Failing Light".into(),
+                    alias: None,
+                    backend: BackendType::Local,
+                }])
+            }
+            async fn get_state(
+                &self,
+                _id: &DeviceId,
+            ) -> crate::error::Result<crate::types::DeviceState> {
+                Err(GoveeError::DiscoveryTimeout)
+            }
+            async fn set_power(&self, _id: &DeviceId, _on: bool) -> crate::error::Result<()> {
+                Err(GoveeError::DiscoveryTimeout)
+            }
+            async fn set_brightness(&self, _id: &DeviceId, _value: u8) -> crate::error::Result<()> {
+                Err(GoveeError::DiscoveryTimeout)
+            }
+            async fn set_color(
+                &self,
+                _id: &DeviceId,
+                _color: crate::types::Color,
+            ) -> crate::error::Result<()> {
+                Err(GoveeError::DiscoveryTimeout)
+            }
+            async fn set_color_temp(
+                &self,
+                _id: &DeviceId,
+                _kelvin: u32,
+            ) -> crate::error::Result<()> {
+                Err(GoveeError::DiscoveryTimeout)
+            }
+            fn backend_type(&self) -> BackendType {
+                BackendType::Local
+            }
+        }
+
+        let state = make_state(true, 50, 0, 255, 0);
+        let mut groups = HashMap::new();
+        groups.insert(
+            "all".to_string(),
+            vec!["Test Light".to_string(), "Failing Light".to_string()],
+        );
+
+        let config = Config::new(
+            None,
+            BackendPreference::Auto,
+            60,
+            HashMap::new(),
+            groups,
+            HashMap::new(),
+        )
+        .unwrap();
+
+        let cloud = Arc::new(
+            MockBackend::new()
+                .with_devices(vec![make_device(
+                    "AA:BB:CC:DD:EE:01",
+                    "H6076",
+                    "Test Light",
+                    BackendType::Cloud,
+                )])
+                .with_state(state)
+                .with_backend_type(BackendType::Cloud),
+        ) as Arc<dyn GoveeBackend>;
+        let local = Arc::new(FailingBackend) as Arc<dyn GoveeBackend>;
+
+        let registry = DeviceRegistry::start_with_backends(config, Some(cloud), Some(local))
+            .await
+            .unwrap();
+
+        let result = registry
+            .apply_scene("warm", SceneTarget::Group("all".into()))
+            .await;
+
+        assert!(result.is_err());
         match result.unwrap_err() {
             GoveeError::PartialFailure {
                 succeeded, failed, ..

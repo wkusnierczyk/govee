@@ -2,7 +2,20 @@ use std::collections::HashMap;
 
 use crate::config::SceneConfig;
 use crate::error::{GoveeError, Result};
-use crate::types::Color;
+use crate::types::{Color, DeviceId};
+
+/// Target specification for applying a scene.
+#[derive(Debug, Clone)]
+pub enum SceneTarget {
+    /// A specific device by ID.
+    Device(DeviceId),
+    /// A device resolved by name or alias.
+    DeviceName(String),
+    /// All devices in a named group.
+    Group(String),
+    /// Every registered device.
+    All,
+}
 
 /// The color component of a scene: either an RGB value or a color temperature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
