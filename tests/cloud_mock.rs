@@ -594,6 +594,81 @@ async fn control_command_api_error_in_body() {
     }
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn rate_limit_warning_logged() {
+    use std::sync::{Arc, Mutex};
+
+    // Capture tracing output via a custom subscriber installed globally.
+    // We use try_init to avoid panicking if another test already set a global.
+    let buf: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+    struct TestLayer {
+        buf: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for TestLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut visitor = MessageVisitor(String::new());
+            event.record(&mut visitor);
+            self.buf.lock().unwrap().push(visitor.0);
+        }
+    }
+
+    struct MessageVisitor(String);
+    impl tracing::field::Visit for MessageVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write;
+            let _ = write!(self.0, "{}: {:?} ", field.name(), value);
+        }
+    }
+
+    use tracing_subscriber::layer::SubscriberExt;
+    let subscriber = tracing_subscriber::registry().with(TestLayer { buf: buf.clone() });
+
+    // Try to set as global default. If another subscriber was already
+    // installed, this will fail silently and we fall back to thread-local.
+    // Either way, one of them should capture events from our thread.
+    let global_ok = tracing::subscriber::set_global_default(subscriber).is_ok();
+    let _guard;
+    if !global_ok {
+        // Global already set by another test. Use thread-local as fallback.
+        let subscriber2 = tracing_subscriber::registry().with(TestLayer { buf: buf.clone() });
+        _guard = Some(tracing::subscriber::set_default(subscriber2));
+    } else {
+        _guard = None;
+    }
+
+    let server = MockServer::start().await;
+    let backend = backend_for(&server, "test-key");
+    populate_device_cache(&server, &backend).await;
+
+    Mock::given(method("PUT"))
+        .and(path("/v1/devices/control"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("Retry-After", "90")
+                .set_body_string("Too Many Requests"),
+        )
+        .mount(&server)
+        .await;
+
+    let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+    let result = backend.set_power(&id, true).await;
+    assert!(result.is_err());
+
+    // Verify a warning was logged containing "rate limited".
+    let logs = buf.lock().unwrap();
+    let all_logs = logs.join("\n");
+    assert!(
+        all_logs.contains("rate limited"),
+        "expected 'rate limited' in logs, got: {all_logs}"
+    );
+}
+
 #[tokio::test]
 async fn set_color_temp_zero_rejected() {
     let server = MockServer::start().await;
