@@ -1,5 +1,9 @@
 # `govee`
 
+[![CI](https://github.com/wkusnierczyk/govee/actions/workflows/ci.yml/badge.svg)](https://github.com/wkusnierczyk/govee/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/govee.svg)](https://crates.io/crates/govee)
+[![docs.rs](https://docs.rs/govee/badge.svg)](https://docs.rs/govee)
+
 A Rust library for controlling Govee smart lighting devices. Provides idiomatic async access to both the Govee cloud API (v1) and the local LAN API over UDP, a unified backend abstraction, device registry with name/alias resolution, and a scene system for multi-device presets.
 
 Designed as a foundation for higher-level consumers — it has no opinion about how it is invoked.
@@ -218,4 +222,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for build, test, lint, and git hooks setu
 | **M4 — Local LAN backend** | `LocalBackend` with UDP multicast discovery, unicast control, state queries, port conflict detection, TTL-based device cache | v0.4.0 |
 | **M5 — Device registry** | `DeviceRegistry`: cloud+local merge, name/alias resolution, backend auto-selection, optimistic state cache, groups | v0.5.0 |
 | **M6 — Scenes** | Built-in + user-defined scene presets, `apply_scene` with device/group/all targeting, scene validation | v0.6.0 |
-| **M7 — SRE & hardening** | Structured tracing, retry/backoff, graceful degradation, security audit, integration test suite, threat model docs | Pending |
+| **M7 — SRE & hardening** | Structured tracing, retry/backoff, graceful degradation, security audit, integration test suite, threat model docs | In progress |

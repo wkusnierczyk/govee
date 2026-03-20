@@ -6,6 +6,24 @@ and cannot be resolved at the library level.
 
 ---
 
+## Trust boundaries
+
+The library interacts with four trust boundaries:
+
+| Boundary | Trust level | Notes |
+|----------|-------------|-------|
+| **Govee cloud API** | Remote, authenticated | HTTPS with system CA; API key sent in every request header |
+| **LAN network** | Local, unauthenticated | Plaintext UDP; any host on the LAN segment can participate |
+| **Configuration file** | Local filesystem | Controls API key, backend selection, `base_url` override |
+| **Caller (library consumer)** | In-process | Full access to all library types; responsible for input validation at the application boundary |
+
+The library assumes a **single-user, trusted-caller** model. It does not
+enforce access control between callers, nor does it sandbox backends from
+each other. If the caller is compromised, all backends and credentials are
+exposed.
+
+---
+
 ## Threat model
 
 The `govee` library controls consumer smart lighting devices. The primary
@@ -19,6 +37,45 @@ assets are:
 The library is designed for trusted environments: it is a single-user library
 intended to run under the same account as its configuration file. It is not
 designed for multi-tenant or adversarial-user scenarios.
+
+### Threats per backend
+
+#### Cloud backend
+
+| Threat | Description |
+|--------|-------------|
+| **API key exposure** | Key leaked via logs, serialized config, or process memory dump grants full account control with no revocation mechanism |
+| **Man-in-the-middle** | Attacker with a trusted CA (corporate proxy, compromised CA store) can intercept HTTPS traffic and capture the API key |
+| **`base_url` redirection** | Attacker who controls the config file can redirect API calls (including the key header) to an arbitrary server |
+
+#### LAN backend
+
+| Threat | Description |
+|--------|-------------|
+| **Unauthenticated UDP** | Any host on the LAN can send control commands to any Govee device — no credentials required |
+| **Device spoofing** | A malicious host can respond to multicast scans with crafted payloads, injecting fake devices into the registry |
+| **State poisoning** | A malicious host can send unsolicited state-update packets, causing the library to cache incorrect device state |
+| **Device enumeration** | Multicast scans reveal all Govee devices on the LAN, including firmware version strings useful for fingerprinting |
+
+### Mitigation summary
+
+What the library does:
+
+- Redacts the API key from `Debug` output and error messages
+- Warns at load time if the config file has overly broad permissions
+- Enforces HTTPS for all cloud API requests (HTTP allowed only on loopback)
+- Uses UDP source IP instead of payload-claimed IP for LAN device addresses
+- Expires LAN device entries via TTL to limit the window for spoofed devices
+- Restricts scene names to `[a-zA-Z0-9_-]` to prevent log injection
+- Caps color temperature at 10000K to avoid undefined firmware behavior
+
+What the library cannot mitigate:
+
+- The Govee LAN protocol has no authentication or encryption (platform limitation)
+- The Govee cloud API has no key rotation or revocation endpoint (platform limitation)
+- An attacker with a trusted CA can intercept HTTPS traffic (OS/network-level issue)
+- The API key is stored in memory in plaintext (inherent to the design)
+- `Config`'s `Serialize` implementation does not redact the key (intended for config round-trips)
 
 ---
 
