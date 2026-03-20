@@ -149,7 +149,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-The API key is obtained from the Govee Home mobile app. Store it in an environment variable or the config file (`api_key` field) — never hardcode it in source. HTTPS is enforced for all remote URLs.
+The API key is obtained from the Govee Home mobile app. Store it in an environment variable or a `.env` file — never hardcode it in source or commit it to version control. HTTPS is enforced for all remote URLs.
 
 ### Local LAN backend
 
@@ -172,7 +172,6 @@ Requires the device to be on the same LAN segment. Port 4002 must be available (
 ### Configuration
 
 ```toml
-api_key = "your-api-key"
 backend = "auto"            # auto | cloud | local
 discovery_interval_secs = 60
 
@@ -188,6 +187,8 @@ all = ["kitchen", "bedroom"]
 color_temp = 4000
 brightness = 60
 ```
+
+The API key should be provided via the `GOVEE_API_KEY` environment variable or a `.env` file — not in the config file, which may be committed to version control.
 
 See `Config` docs for all available options.
 
