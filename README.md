@@ -192,7 +192,7 @@ brightness = 60
 
 The API key should be provided via the `GOVEE_API_KEY` environment variable or a `.env` file — not in the config file, which may be committed to version control.
 
-See `Config` docs for all available options.
+See [`Config`](src/config.rs) for all available options.
 
 ## Security
 
