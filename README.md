@@ -171,6 +171,8 @@ No API key required. Requires the device to be on the same LAN segment. Port 400
 
 ### Configuration
 
+Create a config file (conventionally `~/.config/govee/config.toml`):
+
 ```toml
 backend = "auto"            # auto | cloud | local
 discovery_interval_secs = 60
