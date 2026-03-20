@@ -22,6 +22,10 @@ struct RegisteredDevice {
     device: Device,
     /// Which backend handles commands for this device.
     active_backend: BackendType,
+    /// Whether this device was seen in the cloud backend's device list.
+    has_cloud: bool,
+    /// Whether this device was seen in the local backend's device list.
+    has_local: bool,
 }
 
 /// State cache entry with provenance tracking.
@@ -149,6 +153,8 @@ impl DeviceRegistry {
                 RegisteredDevice {
                     device: dev,
                     active_backend: BackendType::Cloud,
+                    has_cloud: true,
+                    has_local: false,
                 },
             );
         }
@@ -159,6 +165,7 @@ impl DeviceRegistry {
                     // Device found in both: keep cloud's name, update backend.
                     existing.active_backend = BackendType::Local;
                     existing.device.backend = BackendType::Local;
+                    existing.has_local = true;
                     tracing::debug!(
                         device = %existing.device.id,
                         "device found in both backends, using local"
@@ -171,6 +178,8 @@ impl DeviceRegistry {
                         RegisteredDevice {
                             device: dev,
                             active_backend: BackendType::Local,
+                            has_cloud: false,
+                            has_local: true,
                         },
                     );
                 }
@@ -381,8 +390,13 @@ impl DeviceRegistry {
 
     /// Return a reference to the fallback backend for a device, if available.
     ///
-    /// Only returns `Some` when the backend preference is [`BackendPreference::Auto`]
-    /// and the opposite backend from the device's `active_backend` is configured.
+    /// Only returns `Some` when:
+    /// - The backend preference is [`BackendPreference::Auto`], and
+    /// - The device was seen in the fallback backend's device list during
+    ///   registry construction (i.e. `has_local` or `has_cloud` is true).
+    ///
+    /// This prevents masking the original error with a `DeviceNotFound` from
+    /// a backend that never had the device.
     ///
     /// # Security (RT-M07-03)
     ///
@@ -395,9 +409,27 @@ impl DeviceRegistry {
         }
         let reg = self.devices.get(id)?;
         match reg.active_backend {
-            BackendType::Cloud => self.local.as_deref(),
-            BackendType::Local => self.cloud.as_deref(),
+            BackendType::Cloud if reg.has_local => self.local.as_deref(),
+            BackendType::Local if reg.has_cloud => self.cloud.as_deref(),
+            _ => None,
         }
+    }
+
+    /// Return true if the error is a transient backend/transport failure
+    /// that warrants a fallback attempt on the other backend.
+    ///
+    /// Client-side validation errors (`InvalidBrightness`, `InvalidConfig`,
+    /// etc.) return false — retrying on another backend cannot fix them.
+    fn is_transport_error(err: &GoveeError) -> bool {
+        matches!(
+            err,
+            GoveeError::BackendUnavailable(_)
+                | GoveeError::Request(_)
+                | GoveeError::DiscoveryTimeout
+                | GoveeError::RateLimited { .. }
+                | GoveeError::Api { code: 500.., .. }
+                | GoveeError::Io(_)
+        )
     }
 
     /// Return `(DeviceId, BackendType)` for every registered device.
@@ -431,7 +463,9 @@ impl DeviceRegistry {
         let state = match primary.get_state(id).await {
             Ok(s) => s,
             Err(primary_err) => {
-                if let Some(fallback) = self.fallback_backend(id) {
+                if Self::is_transport_error(&primary_err)
+                    && let Some(fallback) = self.fallback_backend(id)
+                {
                     tracing::warn!(
                         device = %id,
                         error = %primary_err,
@@ -493,7 +527,9 @@ impl DeviceRegistry {
     pub async fn set_power(self: &Arc<Self>, id: &DeviceId, on: bool) -> Result<()> {
         let backend = self.backend_for(id)?;
         if let Err(primary_err) = backend.set_power(id, on).await {
-            if let Some(fallback) = self.fallback_backend(id) {
+            if Self::is_transport_error(&primary_err)
+                && let Some(fallback) = self.fallback_backend(id)
+            {
                 tracing::warn!(
                     device = %id,
                     error = %primary_err,
@@ -523,7 +559,9 @@ impl DeviceRegistry {
     pub async fn set_brightness(self: &Arc<Self>, id: &DeviceId, value: u8) -> Result<()> {
         let backend = self.backend_for(id)?;
         if let Err(primary_err) = backend.set_brightness(id, value).await {
-            if let Some(fallback) = self.fallback_backend(id) {
+            if Self::is_transport_error(&primary_err)
+                && let Some(fallback) = self.fallback_backend(id)
+            {
                 tracing::warn!(
                     device = %id,
                     error = %primary_err,
@@ -555,7 +593,9 @@ impl DeviceRegistry {
     pub async fn set_color(self: &Arc<Self>, id: &DeviceId, color: Color) -> Result<()> {
         let backend = self.backend_for(id)?;
         if let Err(primary_err) = backend.set_color(id, color).await {
-            if let Some(fallback) = self.fallback_backend(id) {
+            if Self::is_transport_error(&primary_err)
+                && let Some(fallback) = self.fallback_backend(id)
+            {
                 tracing::warn!(
                     device = %id,
                     error = %primary_err,
@@ -588,7 +628,9 @@ impl DeviceRegistry {
     pub async fn set_color_temp(self: &Arc<Self>, id: &DeviceId, kelvin: u32) -> Result<()> {
         let backend = self.backend_for(id)?;
         if let Err(primary_err) = backend.set_color_temp(id, kelvin).await {
-            if let Some(fallback) = self.fallback_backend(id) {
+            if Self::is_transport_error(&primary_err)
+                && let Some(fallback) = self.fallback_backend(id)
+            {
                 tracing::warn!(
                     device = %id,
                     error = %primary_err,

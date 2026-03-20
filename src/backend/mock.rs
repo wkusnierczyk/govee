@@ -17,7 +17,7 @@ pub(crate) struct MockBackend {
     state: Option<DeviceState>,
     backend_type: BackendType,
     /// If set, all setter and get_state calls return this error.
-    /// Uses `Mutex<Option<...>>` so the error can be taken once or reused.
+    /// Uses `Mutex<Option<...>>` for thread-safe optional configuration.
     injected_error: Mutex<Option<InjectedError>>,
 }
 

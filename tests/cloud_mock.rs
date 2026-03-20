@@ -628,19 +628,9 @@ async fn rate_limit_warning_logged() {
 
     use tracing_subscriber::layer::SubscriberExt;
     let subscriber = tracing_subscriber::registry().with(TestLayer { buf: buf.clone() });
-
-    // Try to set as global default. If another subscriber was already
-    // installed, this will fail silently and we fall back to thread-local.
-    // Either way, one of them should capture events from our thread.
-    let global_ok = tracing::subscriber::set_global_default(subscriber).is_ok();
-    let _guard;
-    if !global_ok {
-        // Global already set by another test. Use thread-local as fallback.
-        let subscriber2 = tracing_subscriber::registry().with(TestLayer { buf: buf.clone() });
-        _guard = Some(tracing::subscriber::set_default(subscriber2));
-    } else {
-        _guard = None;
-    }
+    // Use a thread-local subscriber so this test does not modify global state
+    // and cannot interfere with concurrently running tests.
+    let _guard = tracing::subscriber::set_default(subscriber);
 
     let server = MockServer::start().await;
     let backend = backend_for(&server, "test-key");
