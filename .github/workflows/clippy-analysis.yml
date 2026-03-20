@@ -1,4 +1,5 @@
 name: Clippy Analysis
+run-name: Clippy Analysis
 on:
   push:
     branches: [main]
