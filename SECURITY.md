@@ -92,6 +92,27 @@ trust. Do not expose UDP port 4002 to untrusted network segments.
 
 ---
 
+## Auto-mode backend fallback (RT-M07-03)
+
+When backend preference is `Auto`, the library attempts to use the device's
+primary backend (typically local for devices discovered on the LAN, cloud
+otherwise). If the primary backend call fails, the library automatically
+retries the command on the other backend.
+
+**Trust boundary implication:** If the primary backend is cloud and the
+fallback is local, the command is sent over the unauthenticated, unencrypted
+LAN protocol (see "Local LAN backend" above). This means:
+
+- A cloud-to-local fallback inherits the LAN trust model: any host on the
+  same network can observe and interfere with the fallback command.
+- The library logs a warning with the device ID and original error whenever
+  a fallback occurs, so operators can detect unexpected backend switches.
+
+If strict cloud-only or local-only behavior is required, use `CloudOnly` or
+`LocalOnly` backend preference — these modes never fall back.
+
+---
+
 ## `apply_scene` scope
 
 `apply_scene` with `SceneTarget::All` sends commands to every device in the

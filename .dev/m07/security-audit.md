@@ -1,7 +1,7 @@
 # M07 Security Audit
 
-Audit date: 2026-03-20
-Branch: `main` (commit f4d4e91)
+Audit date: 2026-03-20 (updated 2026-03-21 for Waves 2–4)
+Branch: `main` (commit 6504b06 — Wave 4)
 Auditor: automated review via Claude
 
 ---
@@ -63,30 +63,30 @@ Auditor: automated review via Claude
 
 ### 6. User-Agent header injection (RT-M07-01, #73)
 
-**Status: Not addressed**
+**Status: Addressed** (Wave 2, #93)
 
-- `user_agent()` returns `govee/{version}` using `env!("CARGO_PKG_VERSION")` (`src/backend/cloud.rs:23-25`).
-- The User-Agent is built from a compile-time constant, so there is no injection vector from runtime input.
-- No custom User-Agent override is exposed to callers, so no validation is needed.
-- If a future API adds user-configurable User-Agent suffix, validation would be needed. Currently safe by construction.
+- `CloudBackend::new` now accepts an optional `user_agent: Option<String>` parameter (`src/backend/cloud.rs:112`).
+- Validation rejects any string containing control characters (bytes < 0x20 or DEL 0x7f) and returns `GoveeError::InvalidConfig` (`src/backend/cloud.rs:114-120`).
+- When `None`, the default `govee/{version}` string is used (compile-time constant, no injection vector).
+- `build_client` passes the validated string directly to `reqwest`'s `user_agent()` builder (`src/backend/cloud.rs:56-61`).
 
 ### 7. Retry-after DoS vector (RT-M07-02, #34)
 
-**Status: Not addressed**
+**Status: Addressed** (Wave 3, #99)
 
-- `parse_retry_after` parses the `Retry-After` header as `u64` with a fallback of 60s (`src/backend/cloud.rs:313-320`).
-- There is no upper-bound cap on the parsed value. A malicious or misconfigured server could return `Retry-After: 999999999` and the library would report `retry_after_secs: 999999999` to the caller.
-- The library does not automatically retry or sleep on rate limits -- it returns `GoveeError::RateLimited` to the caller, so the caller controls the backoff behavior. The DoS vector is mitigated by the library not acting on the value automatically, but callers that naively sleep for `retry_after_secs` would be vulnerable.
-- A cap (e.g., 3600s) would be a defense-in-depth improvement.
+- `MAX_RETRY_AFTER_SECS = 300` is defined as a compile-time constant (`src/backend/cloud.rs:24`).
+- The internal retry delay for `RateLimited` errors is capped at 300s via `.min(MAX_RETRY_AFTER_SECS)` in `retry_delay` (`src/backend/cloud.rs:266`).
+- `parse_retry_after` still returns the raw parsed value and `GoveeError::RateLimited { retry_after_secs }` carries the uncapped value (so callers that naively sleep for `retry_after_secs` remain responsible for their own capping). The library's internal behavior is bounded.
+- Residual risk: callers reading `GoveeError::RateLimited::retry_after_secs` directly and sleeping for that duration can still be DoS'd by a malicious server. This is documented as a caller responsibility.
 
 ### 8. Cross-trust-boundary fallback (RT-M07-03, #35)
 
-**Status: Not addressed**
+**Status: Addressed** (Wave 4, #100)
 
-- In `DeviceRegistry::start`, when `BackendPreference::Auto` is set and cloud `list_devices` fails, the error is logged and cloud devices are skipped (`src/registry.rs:121-130`). The same pattern applies to local (`src/registry.rs:131-141`).
-- There is no explicit cross-trust-boundary fallback logic. If a backend fails at list time, its devices are simply absent. There is no runtime fallback from cloud to local or vice versa for individual commands.
-- `backend_for()` returns the statically assigned backend per device; it does not attempt a fallback if that backend fails.
-- This is a design choice (fail-fast per device) rather than a vulnerability, but it means a cloud API outage makes cloud-only devices unreachable even if they could theoretically be controlled via LAN.
+- `DeviceRegistry` now attempts a fallback backend when the primary backend fails with a transport error (`BackendUnavailable`, `Request`, `DiscoveryTimeout`, `RateLimited`, `Api` 5xx, `Io`, `Protocol`) (`src/registry.rs:is_transport_error`).
+- Fallback is gated on two conditions: (1) the error is a transport error (validation errors like `InvalidBrightness` are not retried), and (2) the device is known to be present on the fallback backend (tracked via `has_cloud`/`has_local` per `RegisteredDevice`).
+- CloudOnly and LocalOnly modes never fall back.
+- Trust boundary documentation added to `SECURITY.md` (§ "Auto-mode backend fallback"): a cloud-to-local fallback inherits the LAN trust model; commands are sent unencrypted over UDP; a `warn!` tracing event is emitted on every fallback so operators can detect unexpected backend switches.
 
 ### 9. Thundering herd on cache refresh (RT-M07-04, #71)
 
@@ -127,9 +127,9 @@ Auditor: automated review via Claude
 | 3 | Dependency audit (cargo-deny) | Addressed |
 | 4 | LAN protocol threat surface | Addressed |
 | 5 | Config file permissions | Addressed |
-| 6 | User-Agent header injection | Not addressed (safe by construction; no runtime input) |
-| 7 | Retry-after DoS vector | Not addressed (no cap; mitigated by caller-controlled backoff) |
-| 8 | Cross-trust-boundary fallback | Not addressed (design choice: fail-fast) |
+| 6 | User-Agent header injection | Addressed (Wave 2: optional custom UA with control-char validation) |
+| 7 | Retry-after DoS vector | Addressed (Wave 3: internal retry capped at 300s; raw value still in error) |
+| 8 | Cross-trust-boundary fallback | Addressed (Wave 4: transport-error gated fallback; trust boundary documented) |
 | 9 | Thundering herd on cache refresh | Not addressed (sequential reconciliation; no request coalescing) |
 | 10 | Group/device name log injection | Partially addressed (tracing structured fields; no explicit sanitization) |
 | 11 | `base_url` SSRF | Addressed |
