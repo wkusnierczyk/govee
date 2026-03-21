@@ -1,3 +1,5 @@
+use std::sync::Mutex;
+
 use async_trait::async_trait;
 
 use crate::error::{GoveeError, Result};
@@ -9,11 +11,20 @@ use super::GoveeBackend;
 ///
 /// Devices and state are set via builder methods. `get_state` returns
 /// `DeviceNotFound` when no state is configured. Setter methods always
-/// return `Ok(())`.
+/// return `Ok(())` unless an error is injected via [`with_error`].
 pub(crate) struct MockBackend {
     devices: Vec<Device>,
     state: Option<DeviceState>,
     backend_type: BackendType,
+    /// If set, all setter and get_state calls return this error.
+    /// Uses `Mutex<Option<...>>` for thread-safe optional configuration.
+    injected_error: Mutex<Option<InjectedError>>,
+}
+
+/// Controls how injected errors behave.
+enum InjectedError {
+    /// Return the error on every call.
+    Persistent(fn() -> GoveeError),
 }
 
 impl MockBackend {
@@ -22,6 +33,7 @@ impl MockBackend {
             devices: Vec::new(),
             state: None,
             backend_type: BackendType::Cloud,
+            injected_error: Mutex::new(None),
         }
     }
 
@@ -39,6 +51,21 @@ impl MockBackend {
         self.backend_type = backend_type;
         self
     }
+
+    /// Inject a persistent error: all setter and get_state calls will fail.
+    pub(crate) fn with_error(self, error_fn: fn() -> GoveeError) -> Self {
+        *self.injected_error.lock().unwrap() = Some(InjectedError::Persistent(error_fn));
+        self
+    }
+
+    /// Check if an error should be returned.
+    fn check_error(&self) -> Result<()> {
+        let guard = self.injected_error.lock().unwrap();
+        match &*guard {
+            Some(InjectedError::Persistent(f)) => Err(f()),
+            None => Ok(()),
+        }
+    }
 }
 
 #[async_trait]
@@ -48,24 +75,29 @@ impl GoveeBackend for MockBackend {
     }
 
     async fn get_state(&self, id: &DeviceId) -> Result<DeviceState> {
+        self.check_error()?;
         self.state
             .clone()
             .ok_or_else(|| GoveeError::DeviceNotFound(id.to_string()))
     }
 
     async fn set_power(&self, _id: &DeviceId, _on: bool) -> Result<()> {
+        self.check_error()?;
         Ok(())
     }
 
     async fn set_brightness(&self, _id: &DeviceId, _value: u8) -> Result<()> {
+        self.check_error()?;
         Ok(())
     }
 
     async fn set_color(&self, _id: &DeviceId, _color: Color) -> Result<()> {
+        self.check_error()?;
         Ok(())
     }
 
     async fn set_color_temp(&self, _id: &DeviceId, _kelvin: u32) -> Result<()> {
+        self.check_error()?;
         Ok(())
     }
 

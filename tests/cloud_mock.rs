@@ -11,7 +11,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 ///
 /// `CloudBackend::new` allows HTTP for loopback addresses (wiremock binds to 127.0.0.1).
 fn backend_for(server: &MockServer, api_key: &str) -> CloudBackend {
-    CloudBackend::new(api_key.to_string(), Some(server.uri())).unwrap()
+    CloudBackend::new(api_key.to_string(), Some(server.uri()), None).unwrap()
 }
 
 const HAPPY_RESPONSE: &str = r#"{
@@ -277,6 +277,18 @@ async fn get_state_device_not_found_without_cache() {
     let server = MockServer::start().await;
     let backend = backend_for(&server, "test-key");
 
+    // Auto-refresh will call list_devices — mock an empty device list.
+    Mock::given(method("GET"))
+        .and(path("/v1/devices"))
+        .and(header("Govee-API-Key", "test-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": { "devices": [] },
+            "message": "Success",
+            "code": 200
+        })))
+        .mount(&server)
+        .await;
+
     let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
     let result = backend.get_state(&id).await;
 
@@ -498,9 +510,10 @@ async fn control_command_rate_limited() {
 
     Mock::given(method("PUT"))
         .and(path("/v1/devices/control"))
+        .and(header("Govee-API-Key", "test-key"))
         .respond_with(
             ResponseTemplate::new(429)
-                .insert_header("Retry-After", "45")
+                .insert_header("Retry-After", "1")
                 .set_body_string("Too Many Requests"),
         )
         .mount(&server)
@@ -509,7 +522,7 @@ async fn control_command_rate_limited() {
     let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
     let result = backend.set_power(&id, true).await;
     match result.unwrap_err() {
-        GoveeError::RateLimited { retry_after_secs } => assert_eq!(retry_after_secs, 45),
+        GoveeError::RateLimited { retry_after_secs } => assert_eq!(retry_after_secs, 1),
         other => panic!("expected RateLimited, got: {other:?}"),
     }
 }
@@ -592,6 +605,69 @@ async fn control_command_api_error_in_body() {
         }
         other => panic!("expected Api error, got: {other:?}"),
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn rate_limit_warning_logged() {
+    use std::sync::{Arc, Mutex, OnceLock};
+    use tracing_subscriber::layer::SubscriberExt;
+
+    // Callsite interest is only rebuilt when a global dispatcher is registered.
+    // Install an empty registry once so all callsites become "always interested",
+    // enabling per-test thread-local subscribers to capture events.
+    static GLOBAL_INIT: OnceLock<()> = OnceLock::new();
+    GLOBAL_INIT.get_or_init(|| {
+        let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+    });
+
+    // Per-test subscriber installed on this thread only.
+    let buf: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let buf2 = buf.clone();
+    struct TestLayer(Arc<Mutex<Vec<String>>>);
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for TestLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut msg = String::new();
+            event.record(
+                &mut |field: &tracing::field::Field, value: &dyn std::fmt::Debug| {
+                    if field.name() == "message" {
+                        use std::fmt::Write;
+                        let _ = write!(msg, "{value:?}");
+                    }
+                },
+            );
+            self.0.lock().unwrap().push(msg);
+        }
+    }
+    let subscriber = tracing_subscriber::registry().with(TestLayer(buf2));
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let server = MockServer::start().await;
+    let backend = backend_for(&server, "test-key");
+    populate_device_cache(&server, &backend).await;
+
+    Mock::given(method("PUT"))
+        .and(path("/v1/devices/control"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("Retry-After", "1")
+                .set_body_string("Too Many Requests"),
+        )
+        .mount(&server)
+        .await;
+
+    let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+    let result = backend.set_power(&id, true).await;
+    assert!(result.is_err());
+
+    let logs = buf.lock().unwrap().join("\n");
+    assert!(
+        logs.contains("rate limited"),
+        "expected 'rate limited' in logs, got: {logs}"
+    );
 }
 
 #[tokio::test]
