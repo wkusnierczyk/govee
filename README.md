@@ -223,4 +223,5 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for build, test, lint, and git hooks setu
 | **M4 — Local LAN backend** | `LocalBackend` with UDP multicast discovery, unicast control, state queries, port conflict detection, TTL-based device cache | v0.4.0 |
 | **M5 — Device registry** | `DeviceRegistry`: cloud+local merge, name/alias resolution, backend auto-selection, optimistic state cache, groups | v0.5.0 |
 | **M6 — Scenes** | Built-in + user-defined scene presets, `apply_scene` with device/group/all targeting, scene validation | v0.6.0 |
-| **M7 — SRE & hardening** | Structured tracing, retry/backoff, graceful degradation, security audit, integration test suite, threat model docs | In progress |
+| **M7 — SRE & hardening** | Structured tracing, retry/backoff, graceful degradation, security audit, integration test suite, threat model docs | v0.7.0 |
+| **M8 — API v2** | Govee v2 API | In progress | 
