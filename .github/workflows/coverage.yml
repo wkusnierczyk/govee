@@ -2,9 +2,10 @@
 #
 # Coverage target: ≥95% line coverage. CI fails if coverage drops below
 # this threshold (see issue #63 acceptance criteria).
-# Uses `--lib` to measure only library code, which automatically excludes
-# test utilities (tests/, src/backend/mock.rs behind cfg(test)), so no
-# --ignore-filename-regex is needed.
+# Runs all tests (unit + integration) so that cloud.rs and local.rs are
+# covered by their respective mock integration test suites.
+# src/backend/mock.rs is excluded automatically as it is only compiled
+# under #[cfg(test)] and does not appear in the lcov output.
 
 name: Coverage
 
@@ -30,7 +31,7 @@ jobs:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - uses: taiki-e/install-action@6a7173cc8ec3c85e2ec49a01180be9a1185c73eb # cargo-llvm-cov
-      - run: cargo llvm-cov --lib --lcov --output-path lcov.info
+      - run: cargo llvm-cov --lcov --output-path lcov.info
       - name: Upload LCOV report
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -38,7 +39,7 @@ jobs:
           path: lcov.info
       - name: Check coverage threshold
         run: |
-          COVERAGE=$(cargo llvm-cov --lib --json --summary-only | jq '.data[0].totals.lines.percent')
+          COVERAGE=$(cargo llvm-cov --json --summary-only | jq '.data[0].totals.lines.percent')
           echo "Coverage: ${COVERAGE}%"
           python3 - <<PY
           import sys
