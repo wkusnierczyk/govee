@@ -1,0 +1,53 @@
+# Code coverage workflow using cargo-llvm-cov.
+#
+# Coverage target: ≥95% line coverage. CI fails if coverage drops below
+# this threshold (see issue #63 acceptance criteria).
+# Runs all tests (unit + integration) so that cloud.rs and local.rs are
+# covered by their respective mock integration test suites.
+# src/backend/mock.rs is excluded automatically as it is only compiled
+# under #[cfg(test)] and does not appear in the lcov output.
+
+name: Coverage
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: taiki-e/install-action@6a7173cc8ec3c85e2ec49a01180be9a1185c73eb # cargo-llvm-cov
+      - run: cargo llvm-cov --lcov --output-path lcov.info
+      - name: Upload LCOV report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: coverage-lcov
+          path: lcov.info
+      - name: Check coverage threshold
+        run: |
+          COVERAGE=$(cargo llvm-cov --json --summary-only | jq '.data[0].totals.lines.percent')
+          echo "Coverage: ${COVERAGE}%"
+          python3 - <<PY
+          import sys
+          coverage = float("${COVERAGE}")
+          threshold = 95.0
+          if coverage < threshold:
+              print(f"::error::Coverage {coverage:.2f}% is below target {threshold:.2f}%")
+              sys.exit(1)
+          else:
+              print(f"Coverage {coverage:.2f}% meets target {threshold:.2f}%")
+          PY

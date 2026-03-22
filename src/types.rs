@@ -221,6 +221,13 @@ mod tests {
         assert_eq!(id.as_str(), "AA:BB:CC:DD:EE:FF");
     }
 
+    #[test]
+    fn device_id_into_string() {
+        let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+        let s: String = id.into();
+        assert_eq!(s, "AA:BB:CC:DD:EE:FF");
+    }
+
     // Brightness validation tests
 
     #[test]
