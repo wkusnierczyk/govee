@@ -373,6 +373,22 @@ mod tests {
     }
 
     #[test]
+    fn config_serialize_redacts_api_key() {
+        let cfg = Config::new(
+            Some("secret-key".into()),
+            BackendPreference::Auto,
+            60,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .unwrap();
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains("\"api_key\":null"));
+        assert!(!json.contains("secret-key"));
+    }
+
+    #[test]
     fn config_debug_redacts_api_key() {
         let cfg = Config::new(
             Some("secret-key-12345".into()),
