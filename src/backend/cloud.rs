@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use reqwest::Client;
-use tracing::{debug, warn};
+use tracing::{debug, instrument, warn};
 
 use super::GoveeBackend;
 use crate::error::{GoveeError, Result};
@@ -18,6 +18,13 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Default connection timeout (TCP + TLS handshake).
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Maximum retry-after delay honored from a 429 response (RT-M07-02).
+/// Prevents a server from blocking the client indefinitely.
+const MAX_RETRY_AFTER_SECS: u64 = 300;
+
+/// Maximum number of retries for transient errors and rate limiting.
+const MAX_RETRIES: u32 = 3;
 
 /// User-Agent header identifying the library and version.
 fn user_agent() -> String {
@@ -46,11 +53,12 @@ fn is_loopback(url: &reqwest::Url) -> bool {
 }
 
 /// Build a configured `reqwest::Client` with timeouts and User-Agent.
-fn build_client() -> std::result::Result<Client, reqwest::Error> {
+fn build_client(custom_ua: Option<&str>) -> std::result::Result<Client, reqwest::Error> {
+    let ua = custom_ua.map(|s| s.to_string()).unwrap_or_else(user_agent);
     Client::builder()
         .timeout(DEFAULT_TIMEOUT)
         .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
-        .user_agent(user_agent())
+        .user_agent(ua)
         .build()
 }
 
@@ -66,9 +74,14 @@ fn build_client() -> std::result::Result<Client, reqwest::Error> {
 ///   malware can intercept all traffic, capturing the API key. The
 ///   Govee API does not provide key rotation or revocation. (RT-08)
 ///
-/// **Note:** `std::sync::RwLock` is used for the device cache because the
-/// lock is held only for brief HashMap lookups/swaps and never across
-/// `.await` points. This avoids the overhead of `tokio::sync::RwLock`.
+/// # Resource lifecycle
+///
+/// - **HTTP client:** A single `reqwest::Client` is created at construction
+///   time and shared across all requests. `reqwest` pools connections
+///   internally — no manual connection management needed.
+/// - **Device model cache:** `std::sync::RwLock<HashMap>` holding device→model
+///   mappings. Populated by `list_devices`, read by `get_state`/`send_control`.
+///   Lock is held only for brief lookups/swaps and never across `.await` points.
 pub struct CloudBackend {
     client: Client,
     base_url: reqwest::Url,
@@ -76,6 +89,8 @@ pub struct CloudBackend {
     /// Device ID → model mapping, populated by `list_devices`.
     /// Required because `GET /v1/devices/state` needs both `device` and `model`.
     device_models: RwLock<HashMap<DeviceId, String>>,
+    /// Single-flight guard for auto-refresh of device_models cache (RT-M07-04).
+    refresh_guard: tokio::sync::Mutex<()>,
 }
 
 impl CloudBackend {
@@ -91,7 +106,20 @@ impl CloudBackend {
     /// all API calls (including the API key) are sent to the attacker's
     /// endpoint. Callers must never derive `base_url` from untrusted
     /// input. (RT-09)
-    pub fn new(api_key: String, base_url: Option<String>) -> Result<Self> {
+    pub fn new(
+        api_key: String,
+        base_url: Option<String>,
+        user_agent: Option<String>,
+    ) -> Result<Self> {
+        // Validate user_agent: reject control characters (bytes < 0x20 or DEL 0x7F).
+        if let Some(ref ua) = user_agent
+            && ua.bytes().any(|b| b < 0x20 || b == 0x7f)
+        {
+            return Err(GoveeError::InvalidConfig(
+                "user_agent contains invalid characters".into(),
+            ));
+        }
+
         let raw = base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
         let parsed = reqwest::Url::parse(&raw)
             .map_err(|e| GoveeError::InvalidConfig(format!("invalid base URL \"{raw}\": {e}")))?;
@@ -100,13 +128,14 @@ impl CloudBackend {
                 "base URL must use HTTPS (HTTP is only allowed for loopback addresses), got: {raw}"
             )));
         }
-        let client = build_client()
+        let client = build_client(user_agent.as_deref())
             .map_err(|e| GoveeError::InvalidConfig(format!("failed to build HTTP client: {e}")))?;
         Ok(Self {
             client,
             base_url: parsed,
             api_key,
             device_models: RwLock::new(HashMap::new()),
+            refresh_guard: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -152,27 +181,56 @@ impl CloudBackend {
             }
         });
 
-        let response = self
-            .client
-            .put(url)
-            .header("Govee-API-Key", &self.api_key)
-            .json(&payload)
-            .send()
-            .await?;
+        for attempt in 0..=MAX_RETRIES {
+            let result = self
+                .client
+                .put(url.clone())
+                .header("Govee-API-Key", &self.api_key)
+                .json(&payload)
+                .send()
+                .await;
 
-        let response = self.check_response(response).await?;
+            let response = match result {
+                Ok(r) => r,
+                Err(e) => {
+                    let err = GoveeError::Request(e);
+                    if let Some(delay) = Self::retry_delay(&err, attempt)
+                        && attempt < MAX_RETRIES
+                    {
+                        debug!(attempt, ?delay, "retrying after request error");
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    return Err(err);
+                }
+            };
 
-        // Check API-level error code in response body.
-        let body: V1ControlResponse = response.json().await?;
-        if body.code != 200 {
-            return Err(GoveeError::Api {
-                code: body.code,
-                message: body.message,
-            });
+            match self.check_response(response).await {
+                Ok(response) => {
+                    let body: V1ControlResponse = response.json().await?;
+                    if body.code != 200 {
+                        return Err(GoveeError::Api {
+                            code: body.code,
+                            message: body.message,
+                        });
+                    }
+                    debug!(device = %id, cmd = cmd_name, "sent control command");
+                    return Ok(());
+                }
+                Err(err) => {
+                    if let Some(delay) = Self::retry_delay(&err, attempt)
+                        && attempt < MAX_RETRIES
+                    {
+                        debug!(attempt, ?delay, "retrying after error");
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
         }
 
-        debug!(device = %id, cmd = cmd_name, "sent control command");
-        Ok(())
+        unreachable!("retry loop always returns on the final attempt")
     }
 
     /// Check an HTTP response for rate limiting and error status codes.
@@ -197,6 +255,24 @@ impl CloudBackend {
             });
         }
         Ok(response)
+    }
+
+    /// Compute retry delay for a failed request.
+    ///
+    /// Returns `Some(duration)` if the error is retryable, `None` otherwise.
+    fn retry_delay(err: &GoveeError, attempt: u32) -> Option<Duration> {
+        match err {
+            GoveeError::RateLimited { retry_after_secs } => {
+                let capped = (*retry_after_secs).min(MAX_RETRY_AFTER_SECS);
+                Some(Duration::from_secs(capped))
+            }
+            GoveeError::Request(_) | GoveeError::Api { code: 500.., .. } => {
+                // Exponential backoff: 1s, 2s, 4s (deterministic, no randomness)
+                let delay_ms = 1000u64 * 2u64.pow(attempt);
+                Some(Duration::from_millis(delay_ms))
+            }
+            _ => None,
+        }
     }
 }
 
@@ -321,6 +397,7 @@ fn parse_retry_after(response: &reqwest::Response) -> u64 {
 
 #[async_trait]
 impl GoveeBackend for CloudBackend {
+    #[instrument(skip(self), fields(backend = "cloud"))]
     async fn list_devices(&self) -> Result<Vec<Device>> {
         let url = self
             .base_url
@@ -369,10 +446,27 @@ impl GoveeBackend for CloudBackend {
 
     /// Query the current state of a device.
     ///
-    /// Requires a prior `list_devices` call to populate the device→model
-    /// cache. Returns `DeviceNotFound` if the device is not cached.
+    /// Uses an internal device→model cache and will automatically refresh
+    /// the cache with `list_devices` on a cache miss. Returns
+    /// `DeviceNotFound` if the device is still unknown after refreshing.
+    #[instrument(skip(self), fields(backend = "cloud", device = %id))]
     async fn get_state(&self, id: &DeviceId) -> Result<DeviceState> {
-        let model = self.get_model(id)?;
+        // Auto-refresh device cache on miss (single-flight guard).
+        let model = match self.get_model(id) {
+            Ok(m) => m,
+            Err(_) => {
+                let _guard = self.refresh_guard.lock().await;
+                // Re-check after acquiring lock (another task may have refreshed).
+                match self.get_model(id) {
+                    Ok(m) => m,
+                    Err(_) => {
+                        debug!(device = %id, "model cache miss, refreshing device list");
+                        self.list_devices().await?;
+                        self.get_model(id)?
+                    }
+                }
+            }
+        };
         let mut url = self
             .base_url
             .join("v1/devices/state")
@@ -403,12 +497,14 @@ impl GoveeBackend for CloudBackend {
         Ok(state)
     }
 
+    #[instrument(skip(self), fields(backend = "cloud", device = %id))]
     async fn set_power(&self, id: &DeviceId, on: bool) -> Result<()> {
         let value = if on { "on" } else { "off" };
         self.send_control(id, "turn", serde_json::json!(value))
             .await
     }
 
+    #[instrument(skip(self), fields(backend = "cloud", device = %id))]
     async fn set_brightness(&self, id: &DeviceId, value: u8) -> Result<()> {
         if value > 100 {
             return Err(GoveeError::InvalidBrightness(value));
@@ -417,6 +513,7 @@ impl GoveeBackend for CloudBackend {
             .await
     }
 
+    #[instrument(skip(self, color), fields(backend = "cloud", device = %id))]
     async fn set_color(&self, id: &DeviceId, color: Color) -> Result<()> {
         self.send_control(
             id,
@@ -426,14 +523,12 @@ impl GoveeBackend for CloudBackend {
         .await
     }
 
-    /// Set color temperature in Kelvin.
-    ///
-    /// No device-specific range validation — the Govee API rejects
-    /// unsupported values. We only reject `0` as physically meaningless.
+    /// Set color temperature in Kelvin (1-10000).
+    #[instrument(skip(self), fields(backend = "cloud", device = %id))]
     async fn set_color_temp(&self, id: &DeviceId, kelvin: u32) -> Result<()> {
-        if kelvin == 0 {
+        if kelvin == 0 || kelvin > 10000 {
             return Err(GoveeError::InvalidConfig(
-                "color temperature must be > 0K".into(),
+                "color temperature must be 1-10000K".into(),
             ));
         }
         self.send_control(id, "colorTem", serde_json::json!(kelvin))
@@ -462,7 +557,7 @@ mod tests {
 
     #[test]
     fn rejects_http_non_loopback() {
-        let result = CloudBackend::new("key".into(), Some("http://example.com".into()));
+        let result = CloudBackend::new("key".into(), Some("http://example.com".into()), None);
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, GoveeError::InvalidConfig(_)));
@@ -471,40 +566,45 @@ mod tests {
 
     #[test]
     fn allows_http_loopback() {
-        assert!(CloudBackend::new("key".into(), Some("http://127.0.0.1:8080".into())).is_ok());
-        assert!(CloudBackend::new("key".into(), Some("http://localhost:8080".into())).is_ok());
-        assert!(CloudBackend::new("key".into(), Some("http://[::1]:8080".into())).is_ok());
+        assert!(
+            CloudBackend::new("key".into(), Some("http://127.0.0.1:8080".into()), None).is_ok()
+        );
+        assert!(
+            CloudBackend::new("key".into(), Some("http://localhost:8080".into()), None).is_ok()
+        );
+        assert!(CloudBackend::new("key".into(), Some("http://[::1]:8080".into()), None).is_ok());
     }
 
     #[test]
     fn rejects_invalid_url() {
-        let result = CloudBackend::new("key".into(), Some("not a url".into()));
+        let result = CloudBackend::new("key".into(), Some("not a url".into()), None);
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), GoveeError::InvalidConfig(_)));
     }
 
     #[test]
     fn accepts_https_base_url() {
-        let result = CloudBackend::new("key".into(), Some("https://example.com".into()));
+        let result = CloudBackend::new("key".into(), Some("https://example.com".into()), None);
         assert!(result.is_ok());
     }
 
     #[test]
     fn default_base_url_is_https() {
-        let backend = CloudBackend::new("key".into(), None).unwrap();
+        let backend = CloudBackend::new("key".into(), None, None).unwrap();
         assert_eq!(backend.base_url.scheme(), "https");
     }
 
     #[test]
     fn trailing_slash_normalized() {
-        let backend = CloudBackend::new("key".into(), Some("https://example.com/".into())).unwrap();
+        let backend =
+            CloudBackend::new("key".into(), Some("https://example.com/".into()), None).unwrap();
         let url = backend.base_url.join("v1/devices").unwrap();
         assert_eq!(url.path(), "/v1/devices");
     }
 
     #[test]
     fn debug_redacts_api_key() {
-        let backend = CloudBackend::new("super-secret-key".into(), None).unwrap();
+        let backend = CloudBackend::new("super-secret-key".into(), None, None).unwrap();
         let debug = format!("{:?}", backend);
         assert!(!debug.contains("super-secret-key"));
         assert!(debug.contains("[REDACTED]"));
@@ -604,5 +704,49 @@ mod tests {
         let ua = user_agent();
         assert!(ua.starts_with("govee/"));
         assert!(ua.contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn custom_user_agent_accepted() {
+        let result = CloudBackend::new("key".into(), None, Some("my-app/1.0".into()));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn user_agent_crlf_rejected() {
+        let result = CloudBackend::new("key".into(), None, Some("foo\r\nbar".into()));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, GoveeError::InvalidConfig(_)));
+        assert!(
+            err.to_string()
+                .contains("user_agent contains invalid characters")
+        );
+    }
+
+    #[test]
+    fn user_agent_null_byte_rejected() {
+        let result = CloudBackend::new("key".into(), None, Some("foo\0bar".into()));
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), GoveeError::InvalidConfig(_)));
+    }
+
+    #[tokio::test]
+    async fn set_color_temp_kelvin_zero_rejected() {
+        let backend = CloudBackend::new("key".into(), None, None).unwrap();
+        let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+        // Validation runs before cache lookup, so no need to populate cache.
+        let result = backend.set_color_temp(&id, 0).await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), GoveeError::InvalidConfig(_)));
+    }
+
+    #[tokio::test]
+    async fn set_color_temp_kelvin_above_10000_rejected() {
+        let backend = CloudBackend::new("key".into(), None, None).unwrap();
+        let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+        let result = backend.set_color_temp(&id, 10001).await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), GoveeError::InvalidConfig(_)));
     }
 }

@@ -1,0 +1,23 @@
+name: Clippy Analysis
+run-name: Clippy Analysis
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  security-events: write
+  contents: read
+jobs:
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          components: clippy
+      - run: cargo install clippy-sarif sarif-fmt
+      - run: cargo clippy --message-format=json -- -D warnings | clippy-sarif | tee results.sarif | sarif-fmt
+        continue-on-error: true
+      - uses: github/codeql-action/upload-sarif@603b797f8b14b413fe025cd935a91c16c4782713 # v3
+        with:
+          sarif_file: results.sarif

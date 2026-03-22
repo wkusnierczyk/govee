@@ -22,6 +22,10 @@ struct RegisteredDevice {
     device: Device,
     /// Which backend handles commands for this device.
     active_backend: BackendType,
+    /// Whether this device was seen in the cloud backend's device list.
+    has_cloud: bool,
+    /// Whether this device was seen in the local backend's device list.
+    has_local: bool,
 }
 
 /// State cache entry with provenance tracking.
@@ -47,6 +51,16 @@ pub(crate) enum CacheSource {
 /// Created via [`DeviceRegistry::start`], which returns an `Arc<Self>`.
 /// The registry merges device lists from cloud and local backends
 /// and routes commands to the appropriate backend per device.
+///
+/// # Resource lifecycle
+///
+/// - **Backends:** Held as `Arc<dyn GoveeBackend>`. Dropped when the
+///   registry is dropped.
+/// - **Reconciliation task:** Spawned at construction, holds a
+///   `Weak<DeviceRegistry>`. Exits when the `Weak` can no longer
+///   upgrade (registry dropped) or when the `CancellationToken` fires.
+/// - **Drop:** Cancels the `CancellationToken`, signaling the
+///   reconciliation task to exit.
 pub struct DeviceRegistry {
     devices: HashMap<DeviceId, RegisteredDevice>,
     cloud: Option<Arc<dyn GoveeBackend>>,
@@ -81,7 +95,7 @@ impl DeviceRegistry {
         let cloud: Option<Arc<dyn GoveeBackend>> =
             if config.backend() != BackendPreference::LocalOnly {
                 if let Some(key) = config.api_key() {
-                    Some(Arc::new(CloudBackend::new(key.to_string(), None)?))
+                    Some(Arc::new(CloudBackend::new(key.to_string(), None, None)?))
                 } else {
                     None
                 }
@@ -149,6 +163,8 @@ impl DeviceRegistry {
                 RegisteredDevice {
                     device: dev,
                     active_backend: BackendType::Cloud,
+                    has_cloud: true,
+                    has_local: false,
                 },
             );
         }
@@ -159,6 +175,7 @@ impl DeviceRegistry {
                     // Device found in both: keep cloud's name, update backend.
                     existing.active_backend = BackendType::Local;
                     existing.device.backend = BackendType::Local;
+                    existing.has_local = true;
                     tracing::debug!(
                         device = %existing.device.id,
                         "device found in both backends, using local"
@@ -171,13 +188,57 @@ impl DeviceRegistry {
                         RegisteredDevice {
                             device: dev,
                             active_backend: BackendType::Local,
+                            has_cloud: false,
+                            has_local: true,
                         },
                     );
                 }
             }
         }
 
+        // Backend selection refinement: adjust active_backend per preference.
+        match config.backend() {
+            BackendPreference::CloudOnly => {
+                for reg in devices.values_mut() {
+                    reg.active_backend = BackendType::Cloud;
+                    reg.device.backend = BackendType::Cloud;
+                }
+                tracing::debug!("CloudOnly mode: all devices assigned to cloud backend");
+            }
+            BackendPreference::LocalOnly => {
+                let before = devices.len();
+                devices.retain(|_id, reg| reg.active_backend == BackendType::Local);
+                let removed = before - devices.len();
+                if removed > 0 {
+                    tracing::info!(
+                        removed,
+                        "LocalOnly mode: removed cloud-only device(s) from registry"
+                    );
+                }
+                tracing::debug!(
+                    remaining = devices.len(),
+                    "LocalOnly mode: all remaining devices assigned to local backend"
+                );
+            }
+            BackendPreference::Auto => {
+                for reg in devices.values() {
+                    tracing::debug!(
+                        device = %reg.device.id,
+                        backend = %reg.active_backend,
+                        "Auto mode: device backend assignment"
+                    );
+                }
+            }
+        }
+
+        // Remove devices whose assigned backend is unavailable.
+        devices.retain(|_id, reg| match reg.active_backend {
+            BackendType::Cloud => cloud.is_some(),
+            BackendType::Local => local.is_some(),
+        });
+
         // Populate name_map: lowercased device name → device ID.
+        // Built AFTER backend selection so pruned devices are excluded.
         // Sort by DeviceId for deterministic collision resolution.
         let mut name_map = HashMap::new();
         let mut sorted_devices: Vec<_> = devices.values().collect();
@@ -222,41 +283,6 @@ impl DeviceRegistry {
                         alias = %alias,
                         target = %target,
                         "alias target does not match any device name"
-                    );
-                }
-            }
-        }
-
-        // Backend selection refinement: adjust active_backend per preference.
-        match config.backend() {
-            BackendPreference::CloudOnly => {
-                for reg in devices.values_mut() {
-                    reg.active_backend = BackendType::Cloud;
-                    reg.device.backend = BackendType::Cloud;
-                }
-                tracing::debug!("CloudOnly mode: all devices assigned to cloud backend");
-            }
-            BackendPreference::LocalOnly => {
-                let before = devices.len();
-                devices.retain(|_id, reg| reg.active_backend == BackendType::Local);
-                let removed = before - devices.len();
-                if removed > 0 {
-                    tracing::info!(
-                        removed,
-                        "LocalOnly mode: removed cloud-only device(s) from registry"
-                    );
-                }
-                tracing::debug!(
-                    remaining = devices.len(),
-                    "LocalOnly mode: all remaining devices assigned to local backend"
-                );
-            }
-            BackendPreference::Auto => {
-                for reg in devices.values() {
-                    tracing::debug!(
-                        device = %reg.device.id,
-                        backend = %reg.active_backend,
-                        "Auto mode: device backend assignment"
                     );
                 }
             }
@@ -379,6 +405,51 @@ impl DeviceRegistry {
         }
     }
 
+    /// Return a reference to the fallback backend for a device, if available.
+    ///
+    /// Only returns `Some` when:
+    /// - The backend preference is [`BackendPreference::Auto`], and
+    /// - The device was seen in the fallback backend's device list during
+    ///   registry construction (i.e. `has_local` or `has_cloud` is true).
+    ///
+    /// This prevents masking the original error with a `DeviceNotFound` from
+    /// a backend that never had the device.
+    ///
+    /// # Security (RT-M07-03)
+    ///
+    /// When the primary backend is cloud and the fallback is local, the
+    /// command is sent over the unauthenticated, unencrypted LAN protocol.
+    /// See `SECURITY.md` for trust-model implications.
+    fn fallback_backend(&self, id: &DeviceId) -> Option<&dyn GoveeBackend> {
+        if self.config.backend() != BackendPreference::Auto {
+            return None;
+        }
+        let reg = self.devices.get(id)?;
+        match reg.active_backend {
+            BackendType::Cloud if reg.has_local => self.local.as_deref(),
+            BackendType::Local if reg.has_cloud => self.cloud.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Return true if the error is a transient backend/transport failure
+    /// that warrants a fallback attempt on the other backend.
+    ///
+    /// Client-side validation errors (`InvalidBrightness`, `InvalidConfig`,
+    /// etc.) return false — retrying on another backend cannot fix them.
+    fn is_transport_error(err: &GoveeError) -> bool {
+        matches!(
+            err,
+            GoveeError::BackendUnavailable(_)
+                | GoveeError::Request(_)
+                | GoveeError::DiscoveryTimeout
+                | GoveeError::RateLimited { .. }
+                | GoveeError::Api { code: 500.., .. }
+                | GoveeError::Io(_)
+                | GoveeError::Protocol(_)
+        )
+    }
+
     /// Return `(DeviceId, BackendType)` for every registered device.
     pub fn backend_status(&self) -> Vec<(DeviceId, BackendType)> {
         self.devices
@@ -405,8 +476,26 @@ impl DeviceRegistry {
             }
         }
 
-        // Cache miss or stale — query backend.
-        let state = self.backend_for(id)?.get_state(id).await?;
+        // Cache miss or stale — query backend, with fallback in Auto mode.
+        let primary = self.backend_for(id)?;
+        let state = match primary.get_state(id).await {
+            Ok(s) => s,
+            Err(primary_err) => {
+                if Self::is_transport_error(&primary_err)
+                    && let Some(fallback) = self.fallback_backend(id)
+                {
+                    tracing::warn!(
+                        device = %id,
+                        error = %primary_err,
+                        "primary backend failed, falling back to {}",
+                        fallback.backend_type()
+                    );
+                    fallback.get_state(id).await?
+                } else {
+                    return Err(primary_err);
+                }
+            }
+        };
 
         // Cache as confirmed.
         {
@@ -451,10 +540,25 @@ impl DeviceRegistry {
     /// Turn a device on or off.
     ///
     /// Delegates to the device's backend and updates the state cache
-    /// optimistically on success.
+    /// optimistically on success. In [`Auto`](BackendPreference::Auto) mode,
+    /// falls back to the other backend on failure (see [`fallback_backend`]).
     pub async fn set_power(self: &Arc<Self>, id: &DeviceId, on: bool) -> Result<()> {
         let backend = self.backend_for(id)?;
-        backend.set_power(id, on).await?;
+        if let Err(primary_err) = backend.set_power(id, on).await {
+            if Self::is_transport_error(&primary_err)
+                && let Some(fallback) = self.fallback_backend(id)
+            {
+                tracing::warn!(
+                    device = %id,
+                    error = %primary_err,
+                    "primary backend failed, falling back to {}",
+                    fallback.backend_type()
+                );
+                fallback.set_power(id, on).await?;
+            } else {
+                return Err(primary_err);
+            }
+        }
 
         if let Ok(mut state) = self.get_state(id).await {
             state.on = on;
@@ -468,10 +572,25 @@ impl DeviceRegistry {
     /// Set device brightness (0–100).
     ///
     /// Delegates to the device's backend and updates the state cache
-    /// optimistically on success.
+    /// optimistically on success. In [`Auto`](BackendPreference::Auto) mode,
+    /// falls back to the other backend on failure (see [`fallback_backend`]).
     pub async fn set_brightness(self: &Arc<Self>, id: &DeviceId, value: u8) -> Result<()> {
         let backend = self.backend_for(id)?;
-        backend.set_brightness(id, value).await?;
+        if let Err(primary_err) = backend.set_brightness(id, value).await {
+            if Self::is_transport_error(&primary_err)
+                && let Some(fallback) = self.fallback_backend(id)
+            {
+                tracing::warn!(
+                    device = %id,
+                    error = %primary_err,
+                    "primary backend failed, falling back to {}",
+                    fallback.backend_type()
+                );
+                fallback.set_brightness(id, value).await?;
+            } else {
+                return Err(primary_err);
+            }
+        }
 
         if let Ok(mut state) = self.get_state(id).await {
             state.brightness = value;
@@ -486,10 +605,26 @@ impl DeviceRegistry {
     ///
     /// Delegates to the device's backend and updates the state cache
     /// optimistically on success. Clears `color_temp_kelvin` since
-    /// color and color temperature are mutually exclusive.
+    /// color and color temperature are mutually exclusive. In
+    /// [`Auto`](BackendPreference::Auto) mode, falls back to the other
+    /// backend on failure (see [`fallback_backend`]).
     pub async fn set_color(self: &Arc<Self>, id: &DeviceId, color: Color) -> Result<()> {
         let backend = self.backend_for(id)?;
-        backend.set_color(id, color).await?;
+        if let Err(primary_err) = backend.set_color(id, color).await {
+            if Self::is_transport_error(&primary_err)
+                && let Some(fallback) = self.fallback_backend(id)
+            {
+                tracing::warn!(
+                    device = %id,
+                    error = %primary_err,
+                    "primary backend failed, falling back to {}",
+                    fallback.backend_type()
+                );
+                fallback.set_color(id, color).await?;
+            } else {
+                return Err(primary_err);
+            }
+        }
 
         if let Ok(mut state) = self.get_state(id).await {
             state.color = color;
@@ -505,10 +640,26 @@ impl DeviceRegistry {
     ///
     /// Delegates to the device's backend and updates the state cache
     /// optimistically on success. Resets `color` to black since color
-    /// temperature and RGB color are mutually exclusive.
+    /// temperature and RGB color are mutually exclusive. In
+    /// [`Auto`](BackendPreference::Auto) mode, falls back to the other
+    /// backend on failure (see [`fallback_backend`]).
     pub async fn set_color_temp(self: &Arc<Self>, id: &DeviceId, kelvin: u32) -> Result<()> {
         let backend = self.backend_for(id)?;
-        backend.set_color_temp(id, kelvin).await?;
+        if let Err(primary_err) = backend.set_color_temp(id, kelvin).await {
+            if Self::is_transport_error(&primary_err)
+                && let Some(fallback) = self.fallback_backend(id)
+            {
+                tracing::warn!(
+                    device = %id,
+                    error = %primary_err,
+                    "primary backend failed, falling back to {}",
+                    fallback.backend_type()
+                );
+                fallback.set_color_temp(id, kelvin).await?;
+            } else {
+                return Err(primary_err);
+            }
+        }
 
         if let Ok(mut state) = self.get_state(id).await {
             state.color_temp_kelvin = Some(kelvin);
@@ -2443,52 +2594,77 @@ mod tests {
 
     #[tokio::test]
     async fn group_partial_failure() {
-        // Two devices in one group: cloud mock succeeds for device 1,
-        // FailingBackend always returns errors for device 2.
-        // Result: PartialFailure with one succeeded, one failed.
+        // Two devices in one group, both on cloud (CloudOnly mode,
+        // no fallback). A selective backend succeeds for device 01
+        // but fails for device 02.
         use async_trait::async_trait;
 
-        struct FailingBackend;
+        struct SelectiveBackend {
+            ok_device: DeviceId,
+            state: DeviceState,
+        }
 
         #[async_trait]
-        impl GoveeBackend for FailingBackend {
+        impl GoveeBackend for SelectiveBackend {
             async fn list_devices(&self) -> crate::error::Result<Vec<Device>> {
-                Ok(vec![Device {
-                    id: DeviceId::new("AA:BB:CC:DD:EE:02").unwrap(),
-                    model: "H6078".into(),
-                    name: "Failing Light".into(),
-                    alias: None,
-                    backend: BackendType::Local,
-                }])
+                Ok(vec![
+                    Device {
+                        id: self.ok_device.clone(),
+                        model: "H6076".into(),
+                        name: "Test Light".into(),
+                        alias: None,
+                        backend: BackendType::Cloud,
+                    },
+                    Device {
+                        id: DeviceId::new("AA:BB:CC:DD:EE:02").unwrap(),
+                        model: "H6078".into(),
+                        name: "Failing Light".into(),
+                        alias: None,
+                        backend: BackendType::Cloud,
+                    },
+                ])
             }
-            async fn get_state(
-                &self,
-                _id: &DeviceId,
-            ) -> crate::error::Result<crate::types::DeviceState> {
-                Err(GoveeError::DiscoveryTimeout)
+            async fn get_state(&self, id: &DeviceId) -> crate::error::Result<DeviceState> {
+                if *id == self.ok_device {
+                    Ok(self.state.clone())
+                } else {
+                    Err(GoveeError::DiscoveryTimeout)
+                }
             }
-            async fn set_power(&self, _id: &DeviceId, _on: bool) -> crate::error::Result<()> {
-                Err(GoveeError::DiscoveryTimeout)
+            async fn set_power(&self, id: &DeviceId, _on: bool) -> crate::error::Result<()> {
+                if *id == self.ok_device {
+                    Ok(())
+                } else {
+                    Err(GoveeError::DiscoveryTimeout)
+                }
             }
-            async fn set_brightness(&self, _id: &DeviceId, _value: u8) -> crate::error::Result<()> {
-                Err(GoveeError::DiscoveryTimeout)
+            async fn set_brightness(&self, id: &DeviceId, _value: u8) -> crate::error::Result<()> {
+                if *id == self.ok_device {
+                    Ok(())
+                } else {
+                    Err(GoveeError::DiscoveryTimeout)
+                }
             }
-            async fn set_color(
-                &self,
-                _id: &DeviceId,
-                _color: crate::types::Color,
-            ) -> crate::error::Result<()> {
-                Err(GoveeError::DiscoveryTimeout)
+            async fn set_color(&self, id: &DeviceId, _color: Color) -> crate::error::Result<()> {
+                if *id == self.ok_device {
+                    Ok(())
+                } else {
+                    Err(GoveeError::DiscoveryTimeout)
+                }
             }
             async fn set_color_temp(
                 &self,
-                _id: &DeviceId,
+                id: &DeviceId,
                 _kelvin: u32,
             ) -> crate::error::Result<()> {
-                Err(GoveeError::DiscoveryTimeout)
+                if *id == self.ok_device {
+                    Ok(())
+                } else {
+                    Err(GoveeError::DiscoveryTimeout)
+                }
             }
             fn backend_type(&self) -> BackendType {
-                BackendType::Local
+                BackendType::Cloud
             }
         }
 
@@ -2501,8 +2677,8 @@ mod tests {
         );
 
         let config = Config::new(
-            None,
-            BackendPreference::Auto,
+            Some("test-key".into()),
+            BackendPreference::CloudOnly,
             60,
             HashMap::new(),
             groups,
@@ -2510,21 +2686,12 @@ mod tests {
         )
         .unwrap();
 
-        let cloud = Arc::new(
-            MockBackend::new()
-                .with_devices(vec![make_device(
-                    "AA:BB:CC:DD:EE:01",
-                    "H6076",
-                    "Test Light",
-                    BackendType::Cloud,
-                )])
-                .with_state(state)
-                .with_backend_type(BackendType::Cloud),
-        ) as Arc<dyn GoveeBackend>;
+        let cloud = Arc::new(SelectiveBackend {
+            ok_device: DeviceId::new("AA:BB:CC:DD:EE:01").unwrap(),
+            state,
+        }) as Arc<dyn GoveeBackend>;
 
-        let local = Arc::new(FailingBackend) as Arc<dyn GoveeBackend>;
-
-        let registry = DeviceRegistry::start_with_backends(config, Some(cloud), Some(local))
+        let registry = DeviceRegistry::start_with_backends(config, Some(cloud), None)
             .await
             .unwrap();
 
@@ -2785,49 +2952,77 @@ mod tests {
 
     #[tokio::test]
     async fn apply_scene_partial_failure() {
+        // Same selective-backend pattern as group_partial_failure:
+        // single cloud backend that succeeds for device 01 but fails
+        // for device 02, CloudOnly mode (no fallback).
         use async_trait::async_trait;
 
-        struct FailingBackend;
+        struct SelectiveBackend {
+            ok_device: DeviceId,
+            state: DeviceState,
+        }
 
         #[async_trait]
-        impl GoveeBackend for FailingBackend {
+        impl GoveeBackend for SelectiveBackend {
             async fn list_devices(&self) -> crate::error::Result<Vec<Device>> {
-                Ok(vec![Device {
-                    id: DeviceId::new("AA:BB:CC:DD:EE:02").unwrap(),
-                    model: "H6078".into(),
-                    name: "Failing Light".into(),
-                    alias: None,
-                    backend: BackendType::Local,
-                }])
+                Ok(vec![
+                    Device {
+                        id: self.ok_device.clone(),
+                        model: "H6076".into(),
+                        name: "Test Light".into(),
+                        alias: None,
+                        backend: BackendType::Cloud,
+                    },
+                    Device {
+                        id: DeviceId::new("AA:BB:CC:DD:EE:02").unwrap(),
+                        model: "H6078".into(),
+                        name: "Failing Light".into(),
+                        alias: None,
+                        backend: BackendType::Cloud,
+                    },
+                ])
             }
-            async fn get_state(
-                &self,
-                _id: &DeviceId,
-            ) -> crate::error::Result<crate::types::DeviceState> {
-                Err(GoveeError::DiscoveryTimeout)
+            async fn get_state(&self, id: &DeviceId) -> crate::error::Result<DeviceState> {
+                if *id == self.ok_device {
+                    Ok(self.state.clone())
+                } else {
+                    Err(GoveeError::DiscoveryTimeout)
+                }
             }
-            async fn set_power(&self, _id: &DeviceId, _on: bool) -> crate::error::Result<()> {
-                Err(GoveeError::DiscoveryTimeout)
+            async fn set_power(&self, id: &DeviceId, _on: bool) -> crate::error::Result<()> {
+                if *id == self.ok_device {
+                    Ok(())
+                } else {
+                    Err(GoveeError::DiscoveryTimeout)
+                }
             }
-            async fn set_brightness(&self, _id: &DeviceId, _value: u8) -> crate::error::Result<()> {
-                Err(GoveeError::DiscoveryTimeout)
+            async fn set_brightness(&self, id: &DeviceId, _value: u8) -> crate::error::Result<()> {
+                if *id == self.ok_device {
+                    Ok(())
+                } else {
+                    Err(GoveeError::DiscoveryTimeout)
+                }
             }
-            async fn set_color(
-                &self,
-                _id: &DeviceId,
-                _color: crate::types::Color,
-            ) -> crate::error::Result<()> {
-                Err(GoveeError::DiscoveryTimeout)
+            async fn set_color(&self, id: &DeviceId, _color: Color) -> crate::error::Result<()> {
+                if *id == self.ok_device {
+                    Ok(())
+                } else {
+                    Err(GoveeError::DiscoveryTimeout)
+                }
             }
             async fn set_color_temp(
                 &self,
-                _id: &DeviceId,
+                id: &DeviceId,
                 _kelvin: u32,
             ) -> crate::error::Result<()> {
-                Err(GoveeError::DiscoveryTimeout)
+                if *id == self.ok_device {
+                    Ok(())
+                } else {
+                    Err(GoveeError::DiscoveryTimeout)
+                }
             }
             fn backend_type(&self) -> BackendType {
-                BackendType::Local
+                BackendType::Cloud
             }
         }
 
@@ -2839,8 +3034,8 @@ mod tests {
         );
 
         let config = Config::new(
-            None,
-            BackendPreference::Auto,
+            Some("test-key".into()),
+            BackendPreference::CloudOnly,
             60,
             HashMap::new(),
             groups,
@@ -2848,20 +3043,12 @@ mod tests {
         )
         .unwrap();
 
-        let cloud = Arc::new(
-            MockBackend::new()
-                .with_devices(vec![make_device(
-                    "AA:BB:CC:DD:EE:01",
-                    "H6076",
-                    "Test Light",
-                    BackendType::Cloud,
-                )])
-                .with_state(state)
-                .with_backend_type(BackendType::Cloud),
-        ) as Arc<dyn GoveeBackend>;
-        let local = Arc::new(FailingBackend) as Arc<dyn GoveeBackend>;
+        let cloud = Arc::new(SelectiveBackend {
+            ok_device: DeviceId::new("AA:BB:CC:DD:EE:01").unwrap(),
+            state,
+        }) as Arc<dyn GoveeBackend>;
 
-        let registry = DeviceRegistry::start_with_backends(config, Some(cloud), Some(local))
+        let registry = DeviceRegistry::start_with_backends(config, Some(cloud), None)
             .await
             .unwrap();
 
@@ -2881,5 +3068,550 @@ mod tests {
             }
             other => panic!("expected PartialFailure, got {:?}", other),
         }
+    }
+
+    // --- Integration-style tests (#38) ---
+
+    #[tokio::test]
+    async fn integration_merge_and_resolve() {
+        // Cloud+local with overlapping device MAC. Cloud provides the canonical
+        // name; local wins for backend routing. Resolve by name should work.
+        let mac = "AA:BB:CC:DD:EE:FF";
+        let cloud_devices = vec![
+            make_device(mac, "H6076", "Kitchen Light", BackendType::Cloud),
+            make_device(
+                "11:22:33:44:55:66",
+                "H6078",
+                "Bedroom Strip",
+                BackendType::Cloud,
+            ),
+        ];
+        let local_devices = vec![make_device(mac, "H6076", "H6076_AABB", BackendType::Local)];
+
+        let cloud = Arc::new(
+            MockBackend::new()
+                .with_devices(cloud_devices)
+                .with_state(
+                    DeviceState::new(true, 80, Color::new(255, 200, 100), None, false).unwrap(),
+                )
+                .with_backend_type(BackendType::Cloud),
+        ) as Arc<dyn GoveeBackend>;
+        let local = Arc::new(
+            MockBackend::new()
+                .with_devices(local_devices)
+                .with_state(
+                    DeviceState::new(true, 80, Color::new(255, 200, 100), None, false).unwrap(),
+                )
+                .with_backend_type(BackendType::Local),
+        ) as Arc<dyn GoveeBackend>;
+
+        let registry =
+            DeviceRegistry::start_with_backends(default_config(), Some(cloud), Some(local))
+                .await
+                .unwrap();
+
+        // Both devices present.
+        assert_eq!(registry.devices().len(), 2);
+
+        // Resolve by cloud name for the overlapping device.
+        let resolved = registry.resolve("Kitchen Light").unwrap();
+        assert_eq!(resolved, DeviceId::new(mac).unwrap());
+
+        // The overlapping device should be routed to local backend.
+        let backend = registry.backend_for(&resolved).unwrap();
+        assert_eq!(backend.backend_type(), BackendType::Local);
+
+        // The cloud-only device resolves by name too.
+        let cloud_only = registry.resolve("Bedroom Strip").unwrap();
+        assert_eq!(cloud_only, DeviceId::new("11:22:33:44:55:66").unwrap());
+        let cloud_backend = registry.backend_for(&cloud_only).unwrap();
+        assert_eq!(cloud_backend.backend_type(), BackendType::Cloud);
+
+        // get_state works through the registry.
+        let state = registry.get_state(&resolved).await.unwrap();
+        assert_eq!(state.brightness, 80);
+    }
+
+    #[tokio::test]
+    async fn integration_scene_apply_to_group() {
+        // Set up a group with 2 devices, apply a scene, verify all devices get
+        // the scene (MockBackend set_* always returns Ok).
+        let devices = vec![
+            make_device(
+                "AA:BB:CC:DD:EE:01",
+                "H6076",
+                "Living Room 1",
+                BackendType::Cloud,
+            ),
+            make_device(
+                "AA:BB:CC:DD:EE:02",
+                "H6078",
+                "Living Room 2",
+                BackendType::Cloud,
+            ),
+        ];
+
+        let state = DeviceState::new(true, 50, Color::new(0, 0, 0), Some(5500), false).unwrap();
+        let cloud = Arc::new(
+            MockBackend::new()
+                .with_devices(devices)
+                .with_state(state)
+                .with_backend_type(BackendType::Cloud),
+        ) as Arc<dyn GoveeBackend>;
+
+        let mut groups = HashMap::new();
+        groups.insert(
+            "living-room".to_string(),
+            vec!["Living Room 1".to_string(), "Living Room 2".to_string()],
+        );
+
+        let config = Config::new(
+            Some("test-key".into()),
+            BackendPreference::Auto,
+            60,
+            HashMap::new(),
+            groups,
+            HashMap::new(),
+        )
+        .unwrap();
+
+        let registry = DeviceRegistry::start_with_backends(config, Some(cloud), None)
+            .await
+            .unwrap();
+
+        // Verify group resolves to both devices.
+        let members = registry.resolve_group("living-room").unwrap();
+        assert_eq!(members.len(), 2);
+
+        // Apply built-in "warm" scene to the group.
+        let result = registry
+            .apply_scene("warm", SceneTarget::Group("living-room".to_string()))
+            .await;
+        assert!(result.is_ok(), "apply_scene failed: {:?}", result.err());
+
+        // Verify cached state was updated via optimistic writes.
+        let state1 = registry
+            .get_state(&DeviceId::new("AA:BB:CC:DD:EE:01").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(state1.brightness, 40); // warm scene = 40% brightness
+
+        let state2 = registry
+            .get_state(&DeviceId::new("AA:BB:CC:DD:EE:02").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(state2.brightness, 40);
+    }
+
+    #[tokio::test]
+    async fn integration_alias_resolution() {
+        // Set up aliases in config, resolve alias -> get state -> set brightness.
+        let devices = vec![make_device(
+            "AA:BB:CC:DD:EE:FF",
+            "H6076",
+            "Kitchen Light",
+            BackendType::Cloud,
+        )];
+
+        let state = DeviceState::new(true, 60, Color::new(255, 255, 255), None, false).unwrap();
+        let cloud = Arc::new(
+            MockBackend::new()
+                .with_devices(devices)
+                .with_state(state)
+                .with_backend_type(BackendType::Cloud),
+        ) as Arc<dyn GoveeBackend>;
+
+        let mut aliases = HashMap::new();
+        aliases.insert("kitchen".to_string(), "Kitchen Light".to_string());
+
+        let config = Config::new(
+            Some("test-key".into()),
+            BackendPreference::Auto,
+            60,
+            aliases,
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .unwrap();
+
+        let registry = DeviceRegistry::start_with_backends(config, Some(cloud), None)
+            .await
+            .unwrap();
+
+        // Resolve via alias.
+        let id = registry.resolve("kitchen").unwrap();
+        assert_eq!(id, DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap());
+
+        // Get state through the resolved ID.
+        let state = registry.get_state(&id).await.unwrap();
+        assert_eq!(state.brightness, 60);
+        assert!(state.on);
+
+        // Set brightness through the resolved ID.
+        let result = registry.set_brightness(&id, 80).await;
+        assert!(result.is_ok());
+
+        // Verify optimistic cache update.
+        let updated = registry.get_state(&id).await.unwrap();
+        assert_eq!(updated.brightness, 80);
+    }
+
+    #[tokio::test]
+    async fn integration_backend_modes() {
+        // Same device set, different BackendPreference values yield different
+        // device counts and backend assignments.
+        let cloud_devices = vec![
+            make_device(
+                "AA:BB:CC:DD:EE:01",
+                "H6076",
+                "Cloud Only Device",
+                BackendType::Cloud,
+            ),
+            make_device(
+                "AA:BB:CC:DD:EE:02",
+                "H6078",
+                "Both Device",
+                BackendType::Cloud,
+            ),
+        ];
+        let local_devices = vec![make_device(
+            "AA:BB:CC:DD:EE:02",
+            "H6078",
+            "H6078_LAN",
+            BackendType::Local,
+        )];
+
+        // --- Auto mode: 2 devices; overlapping device uses local backend ---
+        let cloud = Arc::new(
+            MockBackend::new()
+                .with_devices(cloud_devices.clone())
+                .with_backend_type(BackendType::Cloud),
+        ) as Arc<dyn GoveeBackend>;
+        let local = Arc::new(
+            MockBackend::new()
+                .with_devices(local_devices.clone())
+                .with_backend_type(BackendType::Local),
+        ) as Arc<dyn GoveeBackend>;
+
+        let auto_config = Config::new(
+            Some("key".into()),
+            BackendPreference::Auto,
+            60,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .unwrap();
+        let auto_registry =
+            DeviceRegistry::start_with_backends(auto_config, Some(cloud), Some(local))
+                .await
+                .unwrap();
+        assert_eq!(auto_registry.devices().len(), 2);
+
+        let both_id = DeviceId::new("AA:BB:CC:DD:EE:02").unwrap();
+        let auto_backend = auto_registry.backend_for(&both_id).unwrap();
+        assert_eq!(auto_backend.backend_type(), BackendType::Local);
+
+        // --- CloudOnly mode: 2 devices; all use cloud backend ---
+        let cloud = Arc::new(
+            MockBackend::new()
+                .with_devices(cloud_devices.clone())
+                .with_backend_type(BackendType::Cloud),
+        ) as Arc<dyn GoveeBackend>;
+        let local = Arc::new(
+            MockBackend::new()
+                .with_devices(local_devices.clone())
+                .with_backend_type(BackendType::Local),
+        ) as Arc<dyn GoveeBackend>;
+
+        let cloud_config = Config::new(
+            Some("key".into()),
+            BackendPreference::CloudOnly,
+            60,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .unwrap();
+        let cloud_registry =
+            DeviceRegistry::start_with_backends(cloud_config, Some(cloud), Some(local))
+                .await
+                .unwrap();
+        assert_eq!(cloud_registry.devices().len(), 2);
+
+        let cloud_backend = cloud_registry.backend_for(&both_id).unwrap();
+        assert_eq!(cloud_backend.backend_type(), BackendType::Cloud);
+
+        // --- LocalOnly mode: only 1 device (the one seen locally) ---
+        let cloud = Arc::new(
+            MockBackend::new()
+                .with_devices(cloud_devices)
+                .with_backend_type(BackendType::Cloud),
+        ) as Arc<dyn GoveeBackend>;
+        let local = Arc::new(
+            MockBackend::new()
+                .with_devices(local_devices)
+                .with_backend_type(BackendType::Local),
+        ) as Arc<dyn GoveeBackend>;
+
+        let local_config = Config::new(
+            None,
+            BackendPreference::LocalOnly,
+            60,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .unwrap();
+        let local_registry =
+            DeviceRegistry::start_with_backends(local_config, Some(cloud), Some(local))
+                .await
+                .unwrap();
+        // Cloud-only device is pruned in LocalOnly mode.
+        assert_eq!(local_registry.devices().len(), 1);
+        assert_eq!(local_registry.devices()[0].id, both_id);
+
+        let local_backend = local_registry.backend_for(&both_id).unwrap();
+        assert_eq!(local_backend.backend_type(), BackendType::Local);
+    }
+
+    // --- Graceful degradation / fallback tests ---
+
+    #[tokio::test]
+    async fn auto_mode_fallback_on_primary_failure() {
+        // Device in both backends. Primary (local) is set to fail.
+        // Auto mode should fall back to cloud.
+        let mac = "AA:BB:CC:DD:EE:FF";
+        let device_cloud = make_device(mac, "H6076", "Kitchen Light", BackendType::Cloud);
+        let device_local = make_device(mac, "H6076", "H6076_AABB", BackendType::Local);
+
+        let cloud = Arc::new(
+            MockBackend::new()
+                .with_devices(vec![device_cloud])
+                .with_backend_type(BackendType::Cloud),
+        ) as Arc<dyn GoveeBackend>;
+
+        // Local backend will fail on all commands.
+        let local = Arc::new(
+            MockBackend::new()
+                .with_devices(vec![device_local])
+                .with_backend_type(BackendType::Local)
+                .with_error(|| GoveeError::BackendUnavailable("LAN timeout".into())),
+        ) as Arc<dyn GoveeBackend>;
+
+        let registry = DeviceRegistry::start_with_backends(
+            default_config(), // Auto mode
+            Some(cloud),
+            Some(local),
+        )
+        .await
+        .unwrap();
+
+        let id = DeviceId::new(mac).unwrap();
+
+        // Primary is local (overlapping device uses local), which fails.
+        // Auto mode should fall back to cloud and succeed.
+        registry.set_power(&id, true).await.unwrap();
+        registry.set_brightness(&id, 50).await.unwrap();
+        registry
+            .set_color(&id, Color::new(255, 0, 0))
+            .await
+            .unwrap();
+        registry.set_color_temp(&id, 4000).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cloud_only_no_fallback_on_failure() {
+        // CloudOnly mode: cloud fails, no fallback should be attempted.
+        let mac = "AA:BB:CC:DD:EE:FF";
+        let device_cloud = make_device(mac, "H6076", "Kitchen Light", BackendType::Cloud);
+
+        let cloud = Arc::new(
+            MockBackend::new()
+                .with_devices(vec![device_cloud])
+                .with_backend_type(BackendType::Cloud)
+                .with_error(|| GoveeError::BackendUnavailable("cloud timeout".into())),
+        ) as Arc<dyn GoveeBackend>;
+
+        let config = Config::new(
+            Some("test-key".into()),
+            BackendPreference::CloudOnly,
+            60,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .unwrap();
+
+        let registry = DeviceRegistry::start_with_backends(config, Some(cloud), None)
+            .await
+            .unwrap();
+
+        let id = DeviceId::new(mac).unwrap();
+
+        // Should fail — no fallback in CloudOnly mode.
+        let result = registry.set_power(&id, true).await;
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            GoveeError::BackendUnavailable(_)
+        ));
+    }
+
+    // -- Bug #90: resolve() must not return pruned device IDs --
+
+    #[tokio::test]
+    async fn local_only_resolve_cloud_device_returns_not_found() {
+        // A cloud-only device should be pruned in LocalOnly mode,
+        // and resolve() must NOT return it.
+        let cloud_devices = vec![make_device(
+            "AA:BB:CC:DD:EE:01",
+            "H6076",
+            "Cloud Light",
+            BackendType::Cloud,
+        )];
+        let local_devices = vec![make_device(
+            "AA:BB:CC:DD:EE:02",
+            "H6078",
+            "Local Light",
+            BackendType::Local,
+        )];
+
+        let cloud = Arc::new(
+            MockBackend::new()
+                .with_devices(cloud_devices)
+                .with_backend_type(BackendType::Cloud),
+        ) as Arc<dyn GoveeBackend>;
+        let local = Arc::new(
+            MockBackend::new()
+                .with_devices(local_devices)
+                .with_backend_type(BackendType::Local),
+        ) as Arc<dyn GoveeBackend>;
+
+        let config = Config::new(
+            None,
+            BackendPreference::LocalOnly,
+            60,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .unwrap();
+
+        let registry = DeviceRegistry::start_with_backends(config, Some(cloud), Some(local))
+            .await
+            .unwrap();
+
+        // The local device should be resolvable.
+        let id = registry.resolve("Local Light").unwrap();
+        assert_eq!(id, DeviceId::new("AA:BB:CC:DD:EE:02").unwrap());
+
+        // The cloud-only device should NOT be resolvable.
+        let err = registry.resolve("Cloud Light").unwrap_err();
+        assert!(matches!(err, GoveeError::DeviceNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn local_only_group_excludes_pruned_cloud_device() {
+        // A group containing a cloud-only device in LocalOnly mode
+        // should not include the pruned device.
+        let cloud_devices = vec![make_device(
+            "AA:BB:CC:DD:EE:01",
+            "H6076",
+            "Cloud Light",
+            BackendType::Cloud,
+        )];
+        let local_devices = vec![make_device(
+            "AA:BB:CC:DD:EE:02",
+            "H6078",
+            "Local Light",
+            BackendType::Local,
+        )];
+
+        let cloud = Arc::new(
+            MockBackend::new()
+                .with_devices(cloud_devices)
+                .with_backend_type(BackendType::Cloud),
+        ) as Arc<dyn GoveeBackend>;
+        let local = Arc::new(
+            MockBackend::new()
+                .with_devices(local_devices)
+                .with_backend_type(BackendType::Local),
+        ) as Arc<dyn GoveeBackend>;
+
+        let mut groups = HashMap::new();
+        groups.insert(
+            "all".to_string(),
+            vec!["Cloud Light".to_string(), "Local Light".to_string()],
+        );
+
+        let config = Config::new(
+            None,
+            BackendPreference::LocalOnly,
+            60,
+            HashMap::new(),
+            groups,
+            HashMap::new(),
+        )
+        .unwrap();
+
+        let registry = DeviceRegistry::start_with_backends(config, Some(cloud), Some(local))
+            .await
+            .unwrap();
+
+        let members = registry.resolve_group("all").unwrap();
+        // Only the local device should be in the group.
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0], DeviceId::new("AA:BB:CC:DD:EE:02").unwrap());
+    }
+
+    #[tokio::test]
+    async fn auto_mode_cloud_device_is_resolvable() {
+        // In Auto mode with both backends, a cloud-only device should
+        // remain resolvable.
+        let cloud_devices = vec![
+            make_device(
+                "AA:BB:CC:DD:EE:01",
+                "H6076",
+                "Cloud Light",
+                BackendType::Cloud,
+            ),
+            make_device(
+                "AA:BB:CC:DD:EE:02",
+                "H6078",
+                "Both Light",
+                BackendType::Cloud,
+            ),
+        ];
+        let local_devices = vec![make_device(
+            "AA:BB:CC:DD:EE:02",
+            "H6078",
+            "H6078_X",
+            BackendType::Local,
+        )];
+
+        let cloud = Arc::new(
+            MockBackend::new()
+                .with_devices(cloud_devices)
+                .with_backend_type(BackendType::Cloud),
+        ) as Arc<dyn GoveeBackend>;
+        let local = Arc::new(
+            MockBackend::new()
+                .with_devices(local_devices)
+                .with_backend_type(BackendType::Local),
+        ) as Arc<dyn GoveeBackend>;
+
+        let registry =
+            DeviceRegistry::start_with_backends(default_config(), Some(cloud), Some(local))
+                .await
+                .unwrap();
+
+        // Cloud-only device is resolvable in Auto mode.
+        let id = registry.resolve("Cloud Light").unwrap();
+        assert_eq!(id, DeviceId::new("AA:BB:CC:DD:EE:01").unwrap());
+
+        // Device present in both backends is also resolvable.
+        let id = registry.resolve("Both Light").unwrap();
+        assert_eq!(id, DeviceId::new("AA:BB:CC:DD:EE:02").unwrap());
     }
 }

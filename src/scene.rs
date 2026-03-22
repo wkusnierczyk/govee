@@ -49,7 +49,7 @@ impl Scene {
             && (*temp == 0 || *temp > 10000)
         {
             return Err(GoveeError::InvalidConfig(
-                "color temp must be 1\u{2013}10000".to_string(),
+                "color temp must be 1-10000".to_string(),
             ));
         }
 
@@ -321,6 +321,45 @@ mod tests {
         assert_eq!(scene.name(), "cozy");
         assert_eq!(scene.brightness(), 30);
         assert_eq!(*scene.color(), SceneColor::Rgb(Color::new(255, 200, 100)));
+    }
+
+    #[test]
+    fn user_scene_neither_color_nor_temp_rejected() {
+        let mut user = HashMap::new();
+        user.insert(
+            "bad".to_string(),
+            SceneConfig {
+                brightness: 50,
+                color: None,
+                color_temp: None,
+            },
+        );
+        let err = SceneRegistry::new().with_user_scenes(&user).unwrap_err();
+        assert!(matches!(err, crate::error::GoveeError::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn user_scene_collision_between_two_user_scenes() {
+        let mut user = HashMap::new();
+        user.insert(
+            "Cozy".to_string(),
+            SceneConfig {
+                brightness: 30,
+                color: Some(Color::new(255, 200, 100)),
+                color_temp: None,
+            },
+        );
+        user.insert(
+            "cozy".to_string(),
+            SceneConfig {
+                brightness: 80,
+                color: Some(Color::new(100, 100, 255)),
+                color_temp: None,
+            },
+        );
+        // Both entries are valid; last-wins for case-insensitive collision.
+        let registry = SceneRegistry::new().with_user_scenes(&user).unwrap();
+        assert!(registry.get("cozy").is_ok());
     }
 
     #[test]
