@@ -1,6 +1,7 @@
 # `govee`
 
 [![CI](https://github.com/wkusnierczyk/govee/actions/workflows/ci.yml/badge.svg)](https://github.com/wkusnierczyk/govee/actions/workflows/ci.yml)
+[![Release](https://github.com/wkusnierczyk/govee/actions/workflows/release.yml/badge.svg)](https://github.com/wkusnierczyk/govee/actions/workflows/release.yml)
 [![crates.io](https://img.shields.io/crates/v/govee.svg)](https://crates.io/crates/govee)
 [![docs.rs](https://docs.rs/govee/badge.svg)](https://docs.rs/govee)
 

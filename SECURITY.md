@@ -14,7 +14,7 @@ The library interacts with four trust boundaries:
 |----------|-------------|-------|
 | **Govee cloud API** | Remote, authenticated | HTTPS with system CA; API key sent in every request header |
 | **LAN network** | Local, unauthenticated | Plaintext UDP; any host on the LAN segment can participate |
-| **Configuration file** | Local filesystem | Controls API key, backend selection, `base_url` override |
+| **Configuration file** | Local filesystem | Controls API key and backend selection |
 | **Caller (library consumer)** | In-process | Full access to all library types; responsible for input validation at the application boundary |
 
 The library assumes a **single-user, trusted-caller** model. It does not
@@ -62,7 +62,7 @@ designed for multi-tenant or adversarial-user scenarios.
 What the library does:
 
 - Redacts the API key from `Debug` output and error messages
-- Warns at load time if the config file has overly broad permissions
+- On Unix platforms, warns at load time if the config file has overly broad permissions
 - Enforces HTTPS for all cloud API requests (HTTP allowed only on loopback)
 - Uses UDP source IP instead of payload-claimed IP for LAN device addresses
 - Expires LAN device entries via TTL to limit the window for spoofed devices
@@ -75,7 +75,6 @@ What the library cannot mitigate:
 - The Govee cloud API has no key rotation or revocation endpoint (platform limitation)
 - An attacker with a trusted CA can intercept HTTPS traffic (OS/network-level issue)
 - The API key is stored in memory in plaintext (inherent to the design)
-- `Config`'s `Serialize` implementation does not redact the key (intended for config round-trips)
 
 ---
 
@@ -88,8 +87,8 @@ convention). Keep this file readable only by the owning user (`chmod 600`).
 The library warns at load time if the file has broader permissions.
 
 The key is redacted from `Debug` output and never included in error messages.
-Do not serialize `Config` to untrusted output — the `Serialize` implementation
-is provided for config round-trips and does not redact the key.
+The `Serialize` implementation serializes `api_key` as `null`, so serializing
+`Config` to TOML or JSON does not expose the key.
 
 ### No revocation mechanism
 
