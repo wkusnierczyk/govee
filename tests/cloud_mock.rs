@@ -5,13 +5,36 @@ use govee::backend::cloud::CloudBackend;
 use govee::error::GoveeError;
 use govee::types::{Color, DeviceId};
 use wiremock::matchers::{body_json, body_partial_json, header, method, path, query_param};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Match, Mock, MockServer, Request, ResponseTemplate};
 
-/// Create a CloudBackend pointing at the mock server.
+/// Assert that a JSON request body contains a non-empty `requestId` string field.
+///
+/// Used in v2 API tests alongside `body_partial_json` to verify the request
+/// envelope is complete even when `requestId` is a random UUID.
+struct HasRequestId;
+
+impl Match for HasRequestId {
+    fn matches(&self, request: &Request) -> bool {
+        let Ok(body) = serde_json::from_slice::<serde_json::Value>(&request.body) else {
+            return false;
+        };
+        body.get("requestId")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.is_empty())
+    }
+}
+
+/// Create a CloudBackend pointing at the mock server for both the legacy and new APIs.
 ///
 /// `CloudBackend::new` allows HTTP for loopback addresses (wiremock binds to 127.0.0.1).
+/// Both the legacy v1 base URL and the new OpenAPI base URL are pointed at the mock server
+/// so that tests do not make real network requests. Unregistered paths return 404 from
+/// wiremock, which causes `list_devices` to fall back to the legacy device list gracefully.
 fn backend_for(server: &MockServer, api_key: &str) -> CloudBackend {
-    CloudBackend::new(api_key.to_string(), Some(server.uri()), None).unwrap()
+    CloudBackend::new(api_key.to_string(), Some(server.uri()), None)
+        .unwrap()
+        .with_new_api_base(&server.uri())
+        .unwrap()
 }
 
 const HAPPY_RESPONSE: &str = r#"{
@@ -1105,6 +1128,305 @@ async fn new_api_get_http_401() {
     }
 }
 
+/// Build a CloudBackend where both the v1 base URL and the new-API base URL
+/// point at the same mock server.  This is needed for tests that exercise
+/// the v2 control path (which calls new_api_post) as well as the v1 legacy
+/// fallback (which calls send_control via PUT /v1/devices/control).
+fn combined_backend_for(server: &MockServer, api_key: &str) -> CloudBackend {
+    CloudBackend::new(api_key.to_string(), Some(server.uri()), None)
+        .unwrap()
+        .with_new_api_base(&server.uri())
+        .unwrap()
+}
+
+const NEW_API_CONTROL_SUCCESS: &str = r#"{
+    "requestId": "test-req-id",
+    "msg": "success",
+    "code": 200,
+    "payload": {}
+}"#;
+
+/// Helper: mount list_devices + v2 control mock, returning a combined backend.
+async fn setup_v2_control(server: &MockServer) -> (CloudBackend, DeviceId) {
+    let backend = combined_backend_for(server, "test-key");
+    // Populate device cache via v1 list endpoint.
+    Mock::given(method("GET"))
+        .and(path("/v1/devices"))
+        .and(header("Govee-API-Key", "test-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(HAPPY_RESPONSE, "application/json"))
+        .mount(server)
+        .await;
+    backend.list_devices().await.unwrap();
+    let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+    (backend, id)
+}
+
+// --- get_state_v2 tests ---
+
+/// Build a CloudBackend where both the legacy base URL and the new API base URL
+/// point at the same mock server.
+fn v2_state_backend_for(server: &MockServer) -> CloudBackend {
+    let uri = server.uri();
+    CloudBackend::new("test-key".to_string(), Some(uri.clone()), None)
+        .unwrap()
+        .with_new_api_base(&uri)
+        .unwrap()
+}
+
+/// Helper: populate device cache via a list_devices mock for v2 tests.
+async fn populate_v2_device_cache(server: &MockServer, backend: &CloudBackend) {
+    Mock::given(method("GET"))
+        .and(path("/v1/devices"))
+        .and(header("Govee-API-Key", "test-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(HAPPY_RESPONSE, "application/json"))
+        .mount(server)
+        .await;
+    backend.list_devices().await.unwrap();
+}
+
+const V2_STATE_RESPONSE: &str = r#"{
+    "requestId": "test-req-id",
+    "msg": "success",
+    "code": 200,
+    "payload": {
+        "sku": "H6076",
+        "device": "AA:BB:CC:DD:EE:FF",
+        "capabilities": [
+            { "type": "devices.capabilities.on_off", "instance": "powerSwitch", "state": { "value": 1 } },
+            { "type": "devices.capabilities.range", "instance": "brightness", "state": { "value": 80 } },
+            { "type": "devices.capabilities.color_setting", "instance": "colorRgb", "state": { "value": 16744448 } },
+            { "type": "devices.capabilities.color_setting", "instance": "colorTemperatureK", "state": { "value": 4000 } }
+        ]
+    }
+}"#;
+
+#[tokio::test]
+async fn control_v2_set_power_on() {
+    let server = MockServer::start().await;
+    let (backend, id) = setup_v2_control(&server).await;
+
+    Mock::given(method("POST"))
+        .and(path("/router/api/v1/device/control"))
+        .and(header("Govee-API-Key", "test-key"))
+        .and(HasRequestId)
+        .and(body_partial_json(serde_json::json!({
+            "payload": {
+                "sku": "H6076",
+                "device": "AA:BB:CC:DD:EE:FF",
+                "capability": {
+                    "type": "devices.capabilities.on_off",
+                    "instance": "powerSwitch",
+                    "value": 1
+                }
+            }
+        })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(NEW_API_CONTROL_SUCCESS, "application/json"),
+        )
+        .mount(&server)
+        .await;
+
+    backend.set_power(&id, true).await.unwrap();
+}
+
+#[tokio::test]
+async fn control_v2_set_brightness() {
+    let server = MockServer::start().await;
+    let (backend, id) = setup_v2_control(&server).await;
+
+    Mock::given(method("POST"))
+        .and(path("/router/api/v1/device/control"))
+        .and(header("Govee-API-Key", "test-key"))
+        .and(HasRequestId)
+        .and(body_partial_json(serde_json::json!({
+            "payload": {
+                "sku": "H6076",
+                "device": "AA:BB:CC:DD:EE:FF",
+                "capability": {
+                    "type": "devices.capabilities.range",
+                    "instance": "brightness",
+                    "value": 80
+                }
+            }
+        })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(NEW_API_CONTROL_SUCCESS, "application/json"),
+        )
+        .mount(&server)
+        .await;
+
+    backend.set_brightness(&id, 80).await.unwrap();
+}
+
+#[tokio::test]
+async fn control_v2_set_color() {
+    let server = MockServer::start().await;
+    let (backend, id) = setup_v2_control(&server).await;
+
+    // Color::new(255, 128, 0) packed = 0xFF8000 = 16744448
+    Mock::given(method("POST"))
+        .and(path("/router/api/v1/device/control"))
+        .and(header("Govee-API-Key", "test-key"))
+        .and(HasRequestId)
+        .and(body_partial_json(serde_json::json!({
+            "payload": {
+                "sku": "H6076",
+                "device": "AA:BB:CC:DD:EE:FF",
+                "capability": {
+                    "type": "devices.capabilities.color_setting",
+                    "instance": "colorRgb",
+                    "value": 0xFF8000u32
+                }
+            }
+        })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(NEW_API_CONTROL_SUCCESS, "application/json"),
+        )
+        .mount(&server)
+        .await;
+
+    backend
+        .set_color(&id, Color::new(255, 128, 0))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn control_v2_fallback() {
+    let server = MockServer::start().await;
+    let (backend, id) = setup_v2_control(&server).await;
+
+    // v2 endpoint returns 404 (API error) → should fall back to legacy PUT.
+    Mock::given(method("POST"))
+        .and(path("/router/api/v1/device/control"))
+        .and(header("Govee-API-Key", "test-key"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("Not Found"))
+        .mount(&server)
+        .await;
+
+    // Legacy PUT endpoint should be called as fallback.
+    Mock::given(method("PUT"))
+        .and(path("/v1/devices/control"))
+        .and(header("Govee-API-Key", "test-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(CONTROL_SUCCESS, "application/json"))
+        .mount(&server)
+        .await;
+
+    backend.set_power(&id, true).await.unwrap();
+}
+
+#[tokio::test]
+async fn get_state_v2_success() {
+    let server = MockServer::start().await;
+    let backend = v2_state_backend_for(&server);
+    populate_v2_device_cache(&server, &backend).await;
+
+    Mock::given(method("POST"))
+        .and(path("/router/api/v1/device/state"))
+        .and(header("Govee-API-Key", "test-key"))
+        .and(HasRequestId)
+        .and(body_partial_json(serde_json::json!({
+            "payload": { "sku": "H6076", "device": "AA:BB:CC:DD:EE:FF" }
+        })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(V2_STATE_RESPONSE, "application/json"),
+        )
+        .mount(&server)
+        .await;
+
+    let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+    let state = backend.get_state(&id).await.unwrap();
+
+    assert!(state.on);
+    assert_eq!(state.brightness, 80);
+    // 0xFF8000 = 16744448 → r=255, g=128, b=0
+    assert_eq!(state.color, govee::types::Color::new(255, 128, 0));
+    assert_eq!(state.color_temp_kelvin, Some(4000));
+    assert!(state.raw.is_empty());
+}
+
+#[tokio::test]
+async fn get_state_v2_unknown_capability_in_raw() {
+    let server = MockServer::start().await;
+    let backend = v2_state_backend_for(&server);
+    populate_v2_device_cache(&server, &backend).await;
+
+    let response_with_unknown = r#"{
+        "requestId": "test-req-id",
+        "msg": "success",
+        "code": 200,
+        "payload": {
+            "sku": "H6076",
+            "device": "AA:BB:CC:DD:EE:FF",
+            "capabilities": [
+                { "type": "devices.capabilities.on_off", "instance": "powerSwitch", "state": { "value": 1 } },
+                { "type": "devices.capabilities.range", "instance": "brightness", "state": { "value": 80 } },
+                { "type": "devices.capabilities.color_setting", "instance": "colorRgb", "state": { "value": 16744448 } },
+                { "type": "devices.capabilities.color_setting", "instance": "colorTemperatureK", "state": { "value": 4000 } },
+                { "type": "devices.capabilities.music_mode", "instance": "musicMode", "state": { "value": 2 } }
+            ]
+        }
+    }"#;
+
+    Mock::given(method("POST"))
+        .and(path("/router/api/v1/device/state"))
+        .and(header("Govee-API-Key", "test-key"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(response_with_unknown, "application/json"),
+        )
+        .mount(&server)
+        .await;
+
+    let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+    let state = backend.get_state(&id).await.unwrap();
+
+    assert!(state.on);
+    assert_eq!(state.brightness, 80);
+    assert_eq!(state.color, govee::types::Color::new(255, 128, 0));
+    assert_eq!(state.color_temp_kelvin, Some(4000));
+
+    let raw_key = "devices.capabilities.music_mode/musicMode";
+    assert!(
+        state.raw.contains_key(raw_key),
+        "expected key {raw_key:?} in raw, got: {:?}",
+        state.raw.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(state.raw[raw_key], serde_json::json!(2));
+}
+
+#[tokio::test]
+async fn get_state_v2_fallback() {
+    let server = MockServer::start().await;
+    let backend = v2_state_backend_for(&server);
+    populate_v2_device_cache(&server, &backend).await;
+
+    // v2 endpoint returns 500 → should fall back to legacy v1 endpoint.
+    Mock::given(method("POST"))
+        .and(path("/router/api/v1/device/state"))
+        .and(header("Govee-API-Key", "test-key"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/devices/state"))
+        .and(header("Govee-API-Key", "test-key"))
+        .and(query_param("device", "AA:BB:CC:DD:EE:FF"))
+        .and(query_param("model", "H6076"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(STATE_RESPONSE, "application/json"))
+        .mount(&server)
+        .await;
+
+    let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+    let state = backend.get_state(&id).await.unwrap();
+
+    // Values from the legacy STATE_RESPONSE
+    assert!(state.on);
+    assert_eq!(state.brightness, 75);
+    assert_eq!(state.color, govee::types::Color::new(255, 128, 0));
+    assert_eq!(state.color_temp_kelvin, Some(5000));
+}
+
 /// Concrete payload type used in the envelope error test below.
 #[derive(Debug, serde::Deserialize)]
 struct ConcretePayload {
@@ -1147,4 +1469,160 @@ async fn new_api_post_envelope_error_with_concrete_type() {
         }
         other => panic!("expected GoveeError::Api(400), got: {other:?}"),
     }
+}
+
+// --- list_devices_v2 tests ---
+
+/// Build a CloudBackend whose both legacy and new-API base URLs point at the mock server.
+fn full_backend_for(server: &MockServer, api_key: &str) -> CloudBackend {
+    CloudBackend::new(api_key.to_string(), Some(server.uri()), None)
+        .unwrap()
+        .with_new_api_base(&server.uri())
+        .unwrap()
+}
+
+const V2_DEVICES_RESPONSE: &str = r#"{
+    "code": 200,
+    "msg": "success",
+    "requestId": "x",
+    "data": [
+        {
+            "sku": "H6076",
+            "device": "AA:BB:CC:DD:EE:FF",
+            "deviceName": "Kitchen",
+            "capabilities": [
+                {
+                    "type": "devices.capabilities.on_off",
+                    "instance": "powerSwitch",
+                    "parameters": {
+                        "dataType": "ENUM",
+                        "options": []
+                    }
+                }
+            ]
+        }
+    ]
+}"#;
+
+#[tokio::test]
+async fn list_devices_v2_success() {
+    let server = MockServer::start().await;
+
+    // v2 endpoint returns one device with capabilities.
+    Mock::given(method("GET"))
+        .and(path("/router/api/v1/user/devices"))
+        .and(header("Govee-API-Key", "test-key"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(V2_DEVICES_RESPONSE, "application/json"),
+        )
+        .mount(&server)
+        .await;
+
+    let backend = full_backend_for(&server, "test-key");
+    let devices = backend.list_devices().await.unwrap();
+
+    assert_eq!(devices.len(), 1);
+    assert_eq!(devices[0].id.as_str(), "AA:BB:CC:DD:EE:FF");
+    assert_eq!(devices[0].model, "H6076");
+    assert_eq!(devices[0].name, "Kitchen");
+
+    // Capabilities should be stored and retrievable.
+    let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+    let caps = backend.get_capabilities(&id).unwrap();
+    assert_eq!(caps.len(), 1);
+    assert_eq!(caps[0].type_, "devices.capabilities.on_off");
+    assert_eq!(caps[0].instance, "powerSwitch");
+}
+
+#[tokio::test]
+async fn list_devices_v2_unknown_capability() {
+    let response = r#"{
+        "code": 200,
+        "msg": "success",
+        "requestId": "x",
+        "data": [
+            {
+                "sku": "H6076",
+                "device": "AA:BB:CC:DD:EE:FF",
+                "deviceName": "Kitchen",
+                "capabilities": [
+                    {
+                        "type": "devices.capabilities.future",
+                        "instance": "futureSwitch",
+                        "parameters": {
+                            "dataType": "UNKNOWN_FUTURE_TYPE",
+                            "someField": 99
+                        }
+                    }
+                ]
+            }
+        ]
+    }"#;
+
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/devices"))
+        .and(header("Govee-API-Key", "test-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": { "devices": [] },
+            "code": 200,
+            "message": "Success"
+        })))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/router/api/v1/user/devices"))
+        .and(header("Govee-API-Key", "test-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(response, "application/json"))
+        .mount(&server)
+        .await;
+
+    let backend = full_backend_for(&server, "test-key");
+    // Must succeed — unknown capability deserialized as Unknown variant.
+    let devices = backend.list_devices().await.unwrap();
+    assert_eq!(devices.len(), 1);
+
+    let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+    let caps = backend.get_capabilities(&id).unwrap();
+    assert_eq!(caps.len(), 1);
+    assert_eq!(caps[0].type_, "devices.capabilities.future");
+    // Verify it deserialized as the Unknown variant.
+    match &caps[0].parameters {
+        govee::capability::CapabilityParameters::Unknown(v) => {
+            assert_eq!(v["dataType"], "UNKNOWN_FUTURE_TYPE");
+            assert_eq!(v["someField"], 99);
+        }
+        other => panic!("expected Unknown capability parameters, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn list_devices_fallback_to_legacy() {
+    let server = MockServer::start().await;
+
+    // Legacy v1 endpoint returns one device.
+    Mock::given(method("GET"))
+        .and(path("/v1/devices"))
+        .and(header("Govee-API-Key", "test-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(HAPPY_RESPONSE, "application/json"))
+        .mount(&server)
+        .await;
+
+    // v2 endpoint returns 500 — should trigger fallback to legacy.
+    Mock::given(method("GET"))
+        .and(path("/router/api/v1/user/devices"))
+        .and(header("Govee-API-Key", "test-key"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
+        .mount(&server)
+        .await;
+
+    let backend = full_backend_for(&server, "test-key");
+    let devices = backend.list_devices().await.unwrap();
+
+    // Should fall back to legacy device list (2 devices from HAPPY_RESPONSE).
+    assert_eq!(devices.len(), 2);
+    assert_eq!(devices[0].id.as_str(), "AA:BB:CC:DD:EE:FF");
+    assert_eq!(devices[1].id.as_str(), "11:22:33:44:55:66");
 }

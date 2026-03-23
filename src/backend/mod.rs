@@ -75,7 +75,15 @@ mod tests {
 
     #[tokio::test]
     async fn mock_get_state_returns_configured() {
-        let state = DeviceState::new(true, 75, Color::new(255, 0, 0), None, false).unwrap();
+        let state = DeviceState::new(
+            true,
+            75,
+            Color::new(255, 0, 0),
+            None,
+            false,
+            std::collections::HashMap::new(),
+        )
+        .unwrap();
         let mock = MockBackend::new().with_state(state);
         let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
         let result = mock.get_state(&id).await.unwrap();
