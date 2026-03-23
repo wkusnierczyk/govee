@@ -13,6 +13,9 @@ use crate::types::{BackendType, Color, Device, DeviceId, DeviceState};
 /// Default base URL for the Govee cloud API.
 const DEFAULT_BASE_URL: &str = "https://developer-api.govee.com";
 
+/// Base URL for the Govee new (OpenAPI) cloud API.
+const NEW_API_BASE: &str = "https://openapi.api.govee.com";
+
 /// Default request timeout (covers the entire request lifecycle).
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -85,6 +88,8 @@ fn build_client(custom_ua: Option<&str>) -> std::result::Result<Client, reqwest:
 pub struct CloudBackend {
     client: Client,
     base_url: reqwest::Url,
+    /// Base URL for the new (OpenAPI) Govee API.
+    new_api_base: String,
     api_key: String,
     /// Device ID → model mapping, populated by `list_devices`.
     /// Required because `GET /v1/devices/state` needs both `device` and `model`.
@@ -133,6 +138,7 @@ impl CloudBackend {
         Ok(Self {
             client,
             base_url: parsed,
+            new_api_base: NEW_API_BASE.to_string(),
             api_key,
             device_models: RwLock::new(HashMap::new()),
             refresh_guard: tokio::sync::Mutex::new(()),
@@ -274,6 +280,149 @@ impl CloudBackend {
             _ => None,
         }
     }
+
+    /// Map a `NewApiResponse` code to a domain error.
+    fn map_new_api_code<T: serde::de::DeserializeOwned>(response: NewApiResponse<T>) -> Result<T> {
+        match response.code {
+            200 => Ok(response.payload),
+            400 => Err(GoveeError::Api {
+                code: 400,
+                message: response.msg,
+            }),
+            401 => Err(GoveeError::Api {
+                code: 401,
+                message: response.msg,
+            }),
+            404 => Err(GoveeError::Api {
+                code: 404,
+                message: format!("not found: {}", response.msg),
+            }),
+            429 => Err(GoveeError::RateLimited {
+                retry_after_secs: 60,
+            }),
+            other => Err(GoveeError::Api {
+                code: other as u16,
+                message: response.msg,
+            }),
+        }
+    }
+
+    /// Map an HTTP status code (non-2xx) to a domain error without reading the body.
+    fn map_http_status(status: reqwest::StatusCode) -> GoveeError {
+        match status.as_u16() {
+            400 => GoveeError::Api {
+                code: 400,
+                message: "bad request".into(),
+            },
+            401 => GoveeError::Api {
+                code: 401,
+                message: "unauthorized".into(),
+            },
+            404 => GoveeError::Api {
+                code: 404,
+                message: "not found".into(),
+            },
+            429 => GoveeError::RateLimited {
+                retry_after_secs: 60,
+            },
+            500 => GoveeError::Api {
+                code: 500,
+                message: "internal error".into(),
+            },
+            other => GoveeError::Api {
+                code: other,
+                message: "request failed".into(),
+            },
+        }
+    }
+
+    /// POST to the new (OpenAPI) Govee endpoint.
+    ///
+    /// Wraps `payload` in a `{requestId, payload}` envelope and deserializes
+    /// the `{requestId, msg, code, payload}` response envelope, mapping all
+    /// documented error codes to existing `GoveeError` variants.
+    pub async fn new_api_post<Req, Res>(&self, path: &str, payload: Req) -> Result<Res>
+    where
+        Req: serde::Serialize,
+        Res: serde::de::DeserializeOwned,
+    {
+        let url = format!("{}{path}", self.new_api_base);
+        let envelope = NewApiRequest {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            payload,
+        };
+        let response = self
+            .client
+            .post(&url)
+            .header("Govee-API-Key", &self.api_key)
+            .json(&envelope)
+            .send()
+            .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(Self::map_http_status(status));
+        }
+
+        let body: NewApiResponse<Res> = response.json().await?;
+        Self::map_new_api_code(body)
+    }
+
+    /// GET from the new (OpenAPI) Govee endpoint.
+    ///
+    /// Deserializes the `{requestId, msg, code, payload}` response envelope,
+    /// mapping all documented error codes to existing `GoveeError` variants.
+    pub async fn new_api_get<Res>(&self, path: &str) -> Result<Res>
+    where
+        Res: serde::de::DeserializeOwned,
+    {
+        let url = format!("{}{path}", self.new_api_base);
+        let response = self
+            .client
+            .get(&url)
+            .header("Govee-API-Key", &self.api_key)
+            .send()
+            .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(Self::map_http_status(status));
+        }
+
+        let body: NewApiResponse<Res> = response.json().await?;
+        Self::map_new_api_code(body)
+    }
+
+    /// Override the new API base URL.
+    ///
+    /// This is provided primarily for testing (pointing at a mock server).
+    /// In production, the default `NEW_API_BASE` constant is used.
+    #[doc(hidden)]
+    pub fn with_new_api_base(mut self, base: &str) -> Self {
+        self.new_api_base = base.to_string();
+        self
+    }
+}
+
+// --- New (OpenAPI) request/response envelope types (internal) ---
+
+/// Request envelope for the new Govee OpenAPI.
+#[derive(serde::Serialize)]
+struct NewApiRequest<T: serde::Serialize> {
+    #[serde(rename = "requestId")]
+    request_id: String,
+    payload: T,
+}
+
+/// Response envelope for the new Govee OpenAPI.
+#[derive(serde::Deserialize)]
+struct NewApiResponse<T> {
+    /// Echo of the request ID from the caller; not used beyond deserialization.
+    #[serde(rename = "requestId")]
+    _request_id: String,
+    msg: String,
+    code: u32,
+    payload: T,
 }
 
 // --- v1 API response types (internal) ---
