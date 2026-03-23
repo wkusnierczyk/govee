@@ -10,18 +10,44 @@ pub struct Capability {
 }
 
 /// The typed parameters for a capability, tagged by `dataType`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "dataType")]
+#[derive(Debug, Clone, Serialize)] // custom Deserialize below
 pub enum CapabilityParameters {
     #[serde(rename = "ENUM")]
     Enum { options: Vec<EnumOption> },
     #[serde(rename = "INTEGER")]
-    Integer(IntRange),
+    Integer {
+        #[serde(flatten)]
+        range: IntRange,
+    },
     #[serde(rename = "STRUCT")]
     Struct { fields: Vec<StructField> },
     /// Forward-compatibility catch-all for unknown `dataType` values.
-    #[serde(other)]
-    Unknown,
+    /// Preserves the raw JSON payload for forward compatibility.
+    Unknown(serde_json::Value),
+}
+
+impl<'de> Deserialize<'de> for CapabilityParameters {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(d)?;
+        match value.get("dataType").and_then(|v| v.as_str()) {
+            Some("ENUM") => {
+                let options = serde_json::from_value(value["options"].clone())
+                    .map_err(serde::de::Error::custom)?;
+                Ok(CapabilityParameters::Enum { options })
+            }
+            Some("INTEGER") => {
+                let range =
+                    serde_json::from_value(value.clone()).map_err(serde::de::Error::custom)?;
+                Ok(CapabilityParameters::Integer { range })
+            }
+            Some("STRUCT") => {
+                let fields = serde_json::from_value(value["fields"].clone())
+                    .map_err(serde::de::Error::custom)?;
+                Ok(CapabilityParameters::Struct { fields })
+            }
+            _ => Ok(CapabilityParameters::Unknown(value)),
+        }
+    }
 }
 
 /// A single option in an ENUM capability.
@@ -64,9 +90,7 @@ pub struct StateValue {
 }
 
 /// Control value for issuing commands to a device.
-///
-/// This enum is **not** serde-deserializable — it is constructed in code.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub enum CapabilityValue {
     OnOff(u8),
     Rgb(u32),
@@ -129,7 +153,7 @@ mod tests {
         let json = r#"{"dataType":"INTEGER","min":0,"max":100,"precision":1,"unit":"percent"}"#;
         let p: CapabilityParameters = serde_json::from_str(json).unwrap();
         match p {
-            CapabilityParameters::Integer(range) => {
+            CapabilityParameters::Integer { range } => {
                 assert_eq!(range.min, 0);
                 assert_eq!(range.max, 100);
                 assert_eq!(range.precision, 1);
@@ -154,13 +178,16 @@ mod tests {
     }
 
     #[test]
-    fn capability_parameters_unknown_variant() {
+    fn capability_parameters_unknown_variant_preserves_payload() {
         let json = r#"{"dataType":"FUTURE_TYPE","someField":42}"#;
         let p: CapabilityParameters = serde_json::from_str(json).unwrap();
-        assert!(
-            matches!(p, CapabilityParameters::Unknown),
-            "expected Unknown, got {p:?}"
-        );
+        match p {
+            CapabilityParameters::Unknown(v) => {
+                assert_eq!(v["dataType"], "FUTURE_TYPE");
+                assert_eq!(v["someField"], 42);
+            }
+            other => panic!("expected Unknown, got {other:?}"),
+        }
     }
 
     #[test]
@@ -200,5 +227,51 @@ mod tests {
         assert_eq!(deserialized.type_, original.type_);
         assert_eq!(deserialized.instance, original.instance);
         assert_eq!(deserialized.state.value, original.state.value);
+    }
+
+    #[test]
+    fn capability_value_on_off_serializes() {
+        let v = CapabilityValue::OnOff(1);
+        let json = serde_json::to_value(&v).unwrap();
+        assert_eq!(json, serde_json::json!({ "OnOff": 1 }));
+    }
+
+    #[test]
+    fn capability_value_rgb_serializes() {
+        let v = CapabilityValue::Rgb(0xFF0000);
+        let json = serde_json::to_value(&v).unwrap();
+        assert_eq!(json, serde_json::json!({ "Rgb": 0xFF0000u32 }));
+    }
+
+    #[test]
+    fn capability_value_color_temp_k_serializes() {
+        let v = CapabilityValue::ColorTempK(6500);
+        let json = serde_json::to_value(&v).unwrap();
+        assert_eq!(json, serde_json::json!({ "ColorTempK": 6500 }));
+    }
+
+    #[test]
+    fn capability_value_brightness_serializes() {
+        let v = CapabilityValue::Brightness(80);
+        let json = serde_json::to_value(&v).unwrap();
+        assert_eq!(json, serde_json::json!({ "Brightness": 80 }));
+    }
+
+    #[test]
+    fn capability_value_dynamic_scene_preset_round_trips() {
+        let v = CapabilityValue::DynamicScene(DynamicSceneValue::Preset { param_id: 1, id: 2 });
+        let json = serde_json::to_value(&v).unwrap();
+        // DynamicSceneValue is untagged so Preset serializes as object
+        assert_eq!(
+            json,
+            serde_json::json!({ "DynamicScene": { "paramId": 1, "id": 2 } })
+        );
+    }
+
+    #[test]
+    fn capability_value_diy_scene_serializes() {
+        let v = CapabilityValue::DiyScene(42);
+        let json = serde_json::to_value(&v).unwrap();
+        assert_eq!(json, serde_json::json!({ "DiyScene": 42 }));
     }
 }
