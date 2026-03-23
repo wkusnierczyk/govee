@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
 
@@ -96,6 +97,7 @@ impl fmt::Display for BackendType {
 /// - `brightness`: 0–100 (validated on construction and deserialization)
 /// - `color`: RGB, each component 0–255 (bounded by `u8`)
 /// - `color_temp_kelvin`: device-dependent Kelvin range, or `None`
+/// - `raw`: unknown capabilities keyed by `"type/instance"`, values as raw JSON
 #[derive(Debug, Clone, Serialize)]
 pub struct DeviceState {
     pub on: bool,
@@ -103,6 +105,7 @@ pub struct DeviceState {
     pub color: Color,
     pub color_temp_kelvin: Option<u32>,
     pub stale: bool,
+    pub raw: HashMap<String, serde_json::Value>,
 }
 
 impl DeviceState {
@@ -113,6 +116,7 @@ impl DeviceState {
         color: Color,
         color_temp_kelvin: Option<u32>,
         stale: bool,
+        raw: HashMap<String, serde_json::Value>,
     ) -> Result<Self> {
         if brightness > 100 {
             return Err(GoveeError::InvalidBrightness(brightness));
@@ -123,6 +127,7 @@ impl DeviceState {
             color,
             color_temp_kelvin,
             stale,
+            raw,
         })
     }
 }
@@ -139,15 +144,18 @@ impl<'de> Deserialize<'de> for DeviceState {
             color: Color,
             color_temp_kelvin: Option<u32>,
             stale: bool,
+            #[serde(default)]
+            raw: HashMap<String, serde_json::Value>,
         }
 
-        let raw = Raw::deserialize(deserializer)?;
+        let r = Raw::deserialize(deserializer)?;
         DeviceState::new(
-            raw.on,
-            raw.brightness,
-            raw.color,
-            raw.color_temp_kelvin,
-            raw.stale,
+            r.on,
+            r.brightness,
+            r.color,
+            r.color_temp_kelvin,
+            r.stale,
+            r.raw,
         )
         .map_err(serde::de::Error::custom)
     }
@@ -237,16 +245,22 @@ mod tests {
 
     #[test]
     fn device_state_valid_brightness() {
-        let state = DeviceState::new(true, 50, Color::new(255, 0, 0), None, false);
+        let state = DeviceState::new(true, 50, Color::new(255, 0, 0), None, false, HashMap::new());
         assert!(state.is_ok());
         assert_eq!(state.unwrap().brightness, 50);
     }
 
     #[test]
     fn device_state_brightness_boundary() {
-        assert!(DeviceState::new(true, 0, Color::new(0, 0, 0), None, false).is_ok());
-        assert!(DeviceState::new(true, 100, Color::new(0, 0, 0), None, false).is_ok());
-        assert!(DeviceState::new(true, 101, Color::new(0, 0, 0), None, false).is_err());
+        assert!(
+            DeviceState::new(true, 0, Color::new(0, 0, 0), None, false, HashMap::new()).is_ok()
+        );
+        assert!(
+            DeviceState::new(true, 100, Color::new(0, 0, 0), None, false, HashMap::new()).is_ok()
+        );
+        assert!(
+            DeviceState::new(true, 101, Color::new(0, 0, 0), None, false, HashMap::new()).is_err()
+        );
     }
 
     // Color tests

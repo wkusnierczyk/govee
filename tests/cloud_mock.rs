@@ -1144,6 +1144,45 @@ async fn setup_v2_control(server: &MockServer) -> (CloudBackend, DeviceId) {
     (backend, id)
 }
 
+// --- get_state_v2 tests ---
+
+/// Build a CloudBackend where both the legacy base URL and the new API base URL
+/// point at the same mock server.
+fn v2_state_backend_for(server: &MockServer) -> CloudBackend {
+    let uri = server.uri();
+    CloudBackend::new("test-key".to_string(), Some(uri.clone()), None)
+        .unwrap()
+        .with_new_api_base(&uri)
+        .unwrap()
+}
+
+/// Helper: populate device cache via a list_devices mock for v2 tests.
+async fn populate_v2_device_cache(server: &MockServer, backend: &CloudBackend) {
+    Mock::given(method("GET"))
+        .and(path("/v1/devices"))
+        .and(header("Govee-API-Key", "test-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(HAPPY_RESPONSE, "application/json"))
+        .mount(server)
+        .await;
+    backend.list_devices().await.unwrap();
+}
+
+const V2_STATE_RESPONSE: &str = r#"{
+    "requestId": "test-req-id",
+    "msg": "success",
+    "code": 200,
+    "payload": {
+        "sku": "H6076",
+        "device": "AA:BB:CC:DD:EE:FF",
+        "capabilities": [
+            { "type": "devices.capabilities.on_off", "instance": "powerSwitch", "state": { "value": 1 } },
+            { "type": "devices.capabilities.range", "instance": "brightness", "state": { "value": 80 } },
+            { "type": "devices.capabilities.color_setting", "instance": "colorRgb", "state": { "value": 16744448 } },
+            { "type": "devices.capabilities.color_setting", "instance": "colorTemperatureK", "state": { "value": 4000 } }
+        ]
+    }
+}"#;
+
 #[tokio::test]
 async fn control_v2_set_power_on() {
     let server = MockServer::start().await;
@@ -1254,6 +1293,117 @@ async fn control_v2_fallback() {
         .await;
 
     backend.set_power(&id, true).await.unwrap();
+}
+
+#[tokio::test]
+async fn get_state_v2_success() {
+    let server = MockServer::start().await;
+    let backend = v2_state_backend_for(&server);
+    populate_v2_device_cache(&server, &backend).await;
+
+    Mock::given(method("POST"))
+        .and(path("/router/api/v1/device/state"))
+        .and(header("Govee-API-Key", "test-key"))
+        .and(body_partial_json(serde_json::json!({
+            "payload": { "sku": "H6076", "device": "AA:BB:CC:DD:EE:FF" }
+        })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(V2_STATE_RESPONSE, "application/json"),
+        )
+        .mount(&server)
+        .await;
+
+    let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+    let state = backend.get_state(&id).await.unwrap();
+
+    assert!(state.on);
+    assert_eq!(state.brightness, 80);
+    // 0xFF8000 = 16744448 → r=255, g=128, b=0
+    assert_eq!(state.color, govee::types::Color::new(255, 128, 0));
+    assert_eq!(state.color_temp_kelvin, Some(4000));
+    assert!(state.raw.is_empty());
+}
+
+#[tokio::test]
+async fn get_state_v2_unknown_capability_in_raw() {
+    let server = MockServer::start().await;
+    let backend = v2_state_backend_for(&server);
+    populate_v2_device_cache(&server, &backend).await;
+
+    let response_with_unknown = r#"{
+        "requestId": "test-req-id",
+        "msg": "success",
+        "code": 200,
+        "payload": {
+            "sku": "H6076",
+            "device": "AA:BB:CC:DD:EE:FF",
+            "capabilities": [
+                { "type": "devices.capabilities.on_off", "instance": "powerSwitch", "state": { "value": 1 } },
+                { "type": "devices.capabilities.range", "instance": "brightness", "state": { "value": 80 } },
+                { "type": "devices.capabilities.color_setting", "instance": "colorRgb", "state": { "value": 16744448 } },
+                { "type": "devices.capabilities.color_setting", "instance": "colorTemperatureK", "state": { "value": 4000 } },
+                { "type": "devices.capabilities.music_mode", "instance": "musicMode", "state": { "value": 2 } }
+            ]
+        }
+    }"#;
+
+    Mock::given(method("POST"))
+        .and(path("/router/api/v1/device/state"))
+        .and(header("Govee-API-Key", "test-key"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(response_with_unknown, "application/json"),
+        )
+        .mount(&server)
+        .await;
+
+    let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+    let state = backend.get_state(&id).await.unwrap();
+
+    assert!(state.on);
+    assert_eq!(state.brightness, 80);
+    assert_eq!(state.color, govee::types::Color::new(255, 128, 0));
+    assert_eq!(state.color_temp_kelvin, Some(4000));
+
+    let raw_key = "devices.capabilities.music_mode/musicMode";
+    assert!(
+        state.raw.contains_key(raw_key),
+        "expected key {raw_key:?} in raw, got: {:?}",
+        state.raw.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(state.raw[raw_key], serde_json::json!(2));
+}
+
+#[tokio::test]
+async fn get_state_v2_fallback() {
+    let server = MockServer::start().await;
+    let backend = v2_state_backend_for(&server);
+    populate_v2_device_cache(&server, &backend).await;
+
+    // v2 endpoint returns 500 → should fall back to legacy v1 endpoint.
+    Mock::given(method("POST"))
+        .and(path("/router/api/v1/device/state"))
+        .and(header("Govee-API-Key", "test-key"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/devices/state"))
+        .and(header("Govee-API-Key", "test-key"))
+        .and(query_param("device", "AA:BB:CC:DD:EE:FF"))
+        .and(query_param("model", "H6076"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(STATE_RESPONSE, "application/json"))
+        .mount(&server)
+        .await;
+
+    let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+    let state = backend.get_state(&id).await.unwrap();
+
+    // Values from the legacy STATE_RESPONSE
+    assert!(state.on);
+    assert_eq!(state.brightness, 75);
+    assert_eq!(state.color, govee::types::Color::new(255, 128, 0));
+    assert_eq!(state.color_temp_kelvin, Some(5000));
 }
 
 /// Concrete payload type used in the envelope error test below.

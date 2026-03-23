@@ -385,6 +385,74 @@ impl CloudBackend {
         }
     }
 
+    /// Query device state using the v2 OpenAPI endpoint.
+    ///
+    /// POSTs to `/router/api/v1/device/state` with `{sku, device}` body.
+    /// Maps known capability instances to `DeviceState` fields; stores
+    /// all unknown capabilities in `DeviceState::raw` keyed by `"type/instance"`.
+    async fn get_state_v2(&self, id: &DeviceId) -> Result<DeviceState> {
+        let sku = self.get_model(id)?;
+
+        #[derive(serde::Deserialize)]
+        struct V2StateResponse {
+            #[allow(dead_code)]
+            sku: String,
+            #[allow(dead_code)]
+            device: String,
+            capabilities: Vec<crate::capability::CapabilityState>,
+        }
+
+        let payload = serde_json::json!({
+            "sku": sku,
+            "device": id.as_str(),
+        });
+
+        let resp: V2StateResponse = self
+            .new_api_post("/router/api/v1/device/state", payload)
+            .await?;
+
+        let mut on = false;
+        let mut brightness: u8 = 0;
+        let mut color = Color::new(0, 0, 0);
+        let mut color_temp_kelvin: Option<u32> = None;
+        let mut raw: HashMap<String, serde_json::Value> = HashMap::new();
+
+        for cap in resp.capabilities {
+            match (cap.type_.as_str(), cap.instance.as_str()) {
+                ("devices.capabilities.on_off", "powerSwitch") => {
+                    if let Some(v) = cap.state.value.as_u64() {
+                        on = v == 1;
+                    }
+                }
+                ("devices.capabilities.range", "brightness") => {
+                    if let Some(v) = cap.state.value.as_u64() {
+                        brightness = v.min(100) as u8;
+                    }
+                }
+                ("devices.capabilities.color_setting", "colorRgb") => {
+                    if let Some(v) = cap.state.value.as_u64() {
+                        let v = v as u32;
+                        let r = ((v >> 16) & 0xFF) as u8;
+                        let g = ((v >> 8) & 0xFF) as u8;
+                        let b = (v & 0xFF) as u8;
+                        color = Color::new(r, g, b);
+                    }
+                }
+                ("devices.capabilities.color_setting", "colorTemperatureK") => {
+                    if let Some(v) = cap.state.value.as_u64() {
+                        color_temp_kelvin = Some(u32::try_from(v).unwrap_or(u32::MAX));
+                    }
+                }
+                _ => {
+                    let key = format!("{}/{}", cap.type_, cap.instance);
+                    raw.insert(key, cap.state.value);
+                }
+            }
+        }
+
+        DeviceState::new(on, brightness, color, color_temp_kelvin, false, raw)
+    }
+
     /// Override the new API base URL.
     ///
     /// Returns `GoveeError::InvalidConfig` if `base` is not a valid URL or
@@ -478,6 +546,60 @@ impl CloudBackend {
         self.new_api_post::<_, serde_json::Value>("/router/api/v1/device/control", payload)
             .await
             .map(|_| ())
+    }
+}
+
+impl CloudBackend {
+    /// Query the current state of a device using the legacy v1 API.
+    ///
+    /// Uses an internal device→model cache and will automatically refresh
+    /// the cache with `list_devices` on a cache miss. Returns
+    /// `DeviceNotFound` if the device is still unknown after refreshing.
+    async fn v1_get_state(&self, id: &DeviceId) -> Result<DeviceState> {
+        // Auto-refresh device cache on miss (single-flight guard).
+        let model = match self.get_model(id) {
+            Ok(m) => m,
+            Err(_) => {
+                let _guard = self.refresh_guard.lock().await;
+                // Re-check after acquiring lock (another task may have refreshed).
+                match self.get_model(id) {
+                    Ok(m) => m,
+                    Err(_) => {
+                        debug!(device = %id, "model cache miss, refreshing device list");
+                        self.list_devices().await?;
+                        self.get_model(id)?
+                    }
+                }
+            }
+        };
+        let mut url = self
+            .base_url
+            .join("v1/devices/state")
+            .map_err(|e| GoveeError::InvalidConfig(format!("failed to build URL: {e}")))?;
+        url.query_pairs_mut()
+            .append_pair("device", id.as_str())
+            .append_pair("model", &model);
+
+        let response = self
+            .client
+            .get(url)
+            .header("Govee-API-Key", &self.api_key)
+            .send()
+            .await?;
+
+        let response = self.check_response(response).await?;
+
+        let body: V1StateResponse = response.json().await?;
+        if body.code != 200 {
+            return Err(GoveeError::Api {
+                code: body.code,
+                message: body.message,
+            });
+        }
+
+        let state = build_state_from_properties(body.data.properties)?;
+        debug!(device = %id, stale = state.stale, "queried v1 device state");
+        Ok(state)
     }
 }
 
@@ -633,7 +755,7 @@ fn build_state_from_properties(properties: Vec<serde_json::Value>) -> Result<Dev
         }
     }
 
-    DeviceState::new(on, brightness, color, color_temp, !online)
+    DeviceState::new(on, brightness, color, color_temp, !online, HashMap::new())
 }
 
 /// Response envelope from `PUT /v1/devices/control`.
@@ -765,55 +887,17 @@ impl GoveeBackend for CloudBackend {
 
     /// Query the current state of a device.
     ///
-    /// Uses an internal device→model cache and will automatically refresh
-    /// the cache with `list_devices` on a cache miss. Returns
-    /// `DeviceNotFound` if the device is still unknown after refreshing.
+    /// Tries the v2 OpenAPI endpoint first; falls back to the legacy v1 API
+    /// on any error.
     #[instrument(skip(self), fields(backend = "cloud", device = %id))]
     async fn get_state(&self, id: &DeviceId) -> Result<DeviceState> {
-        // Auto-refresh device cache on miss (single-flight guard).
-        let model = match self.get_model(id) {
-            Ok(m) => m,
-            Err(_) => {
-                let _guard = self.refresh_guard.lock().await;
-                // Re-check after acquiring lock (another task may have refreshed).
-                match self.get_model(id) {
-                    Ok(m) => m,
-                    Err(_) => {
-                        debug!(device = %id, "model cache miss, refreshing device list");
-                        self.list_devices().await?;
-                        self.get_model(id)?
-                    }
-                }
+        match self.get_state_v2(id).await {
+            Ok(state) => Ok(state),
+            Err(e) => {
+                debug!(device_id = %id, "v2 state unavailable ({e}), falling back to legacy");
+                self.v1_get_state(id).await
             }
-        };
-        let mut url = self
-            .base_url
-            .join("v1/devices/state")
-            .map_err(|e| GoveeError::InvalidConfig(format!("failed to build URL: {e}")))?;
-        url.query_pairs_mut()
-            .append_pair("device", id.as_str())
-            .append_pair("model", &model);
-
-        let response = self
-            .client
-            .get(url)
-            .header("Govee-API-Key", &self.api_key)
-            .send()
-            .await?;
-
-        let response = self.check_response(response).await?;
-
-        let body: V1StateResponse = response.json().await?;
-        if body.code != 200 {
-            return Err(GoveeError::Api {
-                code: body.code,
-                message: body.message,
-            });
         }
-
-        let state = build_state_from_properties(body.data.properties)?;
-        debug!(device = %id, stale = state.stale, "queried device state");
-        Ok(state)
     }
 
     #[instrument(skip(self), fields(backend = "cloud", device = %id))]

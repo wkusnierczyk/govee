@@ -1783,7 +1783,15 @@ mod tests {
 
     fn make_state(on: bool, brightness: u8, r: u8, g: u8, b: u8) -> DeviceState {
         use crate::types::Color;
-        DeviceState::new(on, brightness, Color::new(r, g, b), None, false).unwrap()
+        DeviceState::new(
+            on,
+            brightness,
+            Color::new(r, g, b),
+            None,
+            false,
+            std::collections::HashMap::new(),
+        )
+        .unwrap()
     }
 
     fn mock_with_device_and_state(
@@ -2151,7 +2159,15 @@ mod tests {
     async fn set_color_updates_color_and_clears_temp() {
         use crate::types::Color;
 
-        let state = DeviceState::new(true, 50, Color::new(0, 0, 0), Some(4000), false).unwrap();
+        let state = DeviceState::new(
+            true,
+            50,
+            Color::new(0, 0, 0),
+            Some(4000),
+            false,
+            std::collections::HashMap::new(),
+        )
+        .unwrap();
         let (cloud, id) = mock_with_device_and_state("AA:BB:CC:DD:EE:03", state);
 
         let registry = DeviceRegistry::start_with_backends(default_config(), Some(cloud), None)
@@ -3092,7 +3108,15 @@ mod tests {
             MockBackend::new()
                 .with_devices(cloud_devices)
                 .with_state(
-                    DeviceState::new(true, 80, Color::new(255, 200, 100), None, false).unwrap(),
+                    DeviceState::new(
+                        true,
+                        80,
+                        Color::new(255, 200, 100),
+                        None,
+                        false,
+                        std::collections::HashMap::new(),
+                    )
+                    .unwrap(),
                 )
                 .with_backend_type(BackendType::Cloud),
         ) as Arc<dyn GoveeBackend>;
@@ -3100,7 +3124,15 @@ mod tests {
             MockBackend::new()
                 .with_devices(local_devices)
                 .with_state(
-                    DeviceState::new(true, 80, Color::new(255, 200, 100), None, false).unwrap(),
+                    DeviceState::new(
+                        true,
+                        80,
+                        Color::new(255, 200, 100),
+                        None,
+                        false,
+                        std::collections::HashMap::new(),
+                    )
+                    .unwrap(),
                 )
                 .with_backend_type(BackendType::Local),
         ) as Arc<dyn GoveeBackend>;
@@ -3151,7 +3183,15 @@ mod tests {
             ),
         ];
 
-        let state = DeviceState::new(true, 50, Color::new(0, 0, 0), Some(5500), false).unwrap();
+        let state = DeviceState::new(
+            true,
+            50,
+            Color::new(0, 0, 0),
+            Some(5500),
+            false,
+            std::collections::HashMap::new(),
+        )
+        .unwrap();
         let cloud = Arc::new(
             MockBackend::new()
                 .with_devices(devices)
@@ -3213,7 +3253,15 @@ mod tests {
             BackendType::Cloud,
         )];
 
-        let state = DeviceState::new(true, 60, Color::new(255, 255, 255), None, false).unwrap();
+        let state = DeviceState::new(
+            true,
+            60,
+            Color::new(255, 255, 255),
+            None,
+            false,
+            std::collections::HashMap::new(),
+        )
+        .unwrap();
         let cloud = Arc::new(
             MockBackend::new()
                 .with_devices(devices)
