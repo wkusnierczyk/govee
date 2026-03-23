@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
 use std::time::Duration;
 
@@ -7,6 +7,7 @@ use reqwest::Client;
 use tracing::{debug, instrument, warn};
 
 use super::GoveeBackend;
+use crate::capability::Capability;
 use crate::error::{GoveeError, Result};
 use crate::types::{BackendType, Color, Device, DeviceId, DeviceState};
 
@@ -94,6 +95,8 @@ pub struct CloudBackend {
     /// Device ID → model mapping, populated by `list_devices`.
     /// Required because `GET /v1/devices/state` needs both `device` and `model`.
     device_models: RwLock<HashMap<DeviceId, String>>,
+    /// Device ID → capability list, populated by `list_devices` via v2 API.
+    device_capabilities: RwLock<HashMap<DeviceId, Vec<Capability>>>,
     /// Single-flight guard for auto-refresh of device_models cache (RT-M07-04).
     refresh_guard: tokio::sync::Mutex<()>,
 }
@@ -143,6 +146,7 @@ impl CloudBackend {
             new_api_base,
             api_key,
             device_models: RwLock::new(HashMap::new()),
+            device_capabilities: RwLock::new(HashMap::new()),
             refresh_guard: tokio::sync::Mutex::new(()),
         })
     }
@@ -402,6 +406,28 @@ impl CloudBackend {
         self.new_api_base = parsed;
         Ok(self)
     }
+
+    /// Fetch the device list from the v2 (OpenAPI) endpoint.
+    ///
+    /// Returns a list of `V2Device` with capabilities. Callers handle errors
+    /// from this method and fall back to the legacy v1 list on failure.
+    async fn list_devices_v2(&self) -> Result<Vec<V2Device>> {
+        self.new_api_get::<Vec<V2Device>, ()>("/router/api/v1/user/devices", None)
+            .await
+    }
+
+    /// Return the capability list for a device, if known.
+    ///
+    /// Populated after a successful call to `list_devices`. Returns `None`
+    /// if the device was not in the v2 response or `list_devices` has not
+    /// been called yet.
+    pub fn get_capabilities(&self, id: &DeviceId) -> Option<Vec<Capability>> {
+        self.device_capabilities
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(id)
+            .cloned()
+    }
 }
 
 // --- New (OpenAPI) request/response envelope types (internal) ---
@@ -424,6 +450,18 @@ struct NewApiResponse<T> {
     code: u32,
     #[serde(alias = "data")]
     payload: T,
+}
+
+// --- v2 (OpenAPI) device list types (internal) ---
+
+/// A single device as returned by the v2 `GET /router/api/v1/user/devices` endpoint.
+#[derive(serde::Deserialize)]
+struct V2Device {
+    sku: String,
+    device: String,
+    #[serde(rename = "deviceName")]
+    device_name: String,
+    capabilities: Vec<Capability>,
 }
 
 // --- v1 API response types (internal) ---
@@ -549,6 +587,7 @@ fn parse_retry_after(response: &reqwest::Response) -> u64 {
 impl GoveeBackend for CloudBackend {
     #[instrument(skip(self), fields(backend = "cloud"))]
     async fn list_devices(&self) -> Result<Vec<Device>> {
+        // --- Legacy v1 list ---
         let url = self
             .base_url
             .join("v1/devices")
@@ -570,7 +609,7 @@ impl GoveeBackend for CloudBackend {
             });
         }
 
-        let devices: Vec<Device> = body
+        let legacy: Vec<Device> = body
             .data
             .devices
             .into_iter()
@@ -579,7 +618,7 @@ impl GoveeBackend for CloudBackend {
 
         // Cache device→model mappings for get_state (atomic swap).
         {
-            let new_map: HashMap<DeviceId, String> = devices
+            let new_map: HashMap<DeviceId, String> = legacy
                 .iter()
                 .map(|d| (d.id.clone(), d.model.clone()))
                 .collect();
@@ -590,8 +629,68 @@ impl GoveeBackend for CloudBackend {
             *models = new_map;
         }
 
-        debug!(count = devices.len(), "listed cloud devices");
-        Ok(devices)
+        // --- v2 enrichment: capabilities ---
+        let v2_devices = match self.list_devices_v2().await {
+            Ok(devs) => devs,
+            Err(e) => {
+                debug!("v2 device list unavailable, using legacy only: {e}");
+                debug!(count = legacy.len(), "listed cloud devices");
+                return Ok(legacy);
+            }
+        };
+
+        // Store capabilities from v2 response.
+        {
+            let mut caps = self
+                .device_capabilities
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for d in &v2_devices {
+                if let Ok(id) = DeviceId::new(&d.device) {
+                    caps.insert(id, d.capabilities.clone());
+                }
+            }
+        }
+
+        // Build merged device list: v2 takes precedence.
+        let v2_ids: HashSet<String> = v2_devices.iter().map(|d| d.device.clone()).collect();
+        let mut result: Vec<Device> = v2_devices
+            .iter()
+            .filter_map(|d| {
+                let id = DeviceId::new(&d.device).ok()?;
+                Some(Device {
+                    id,
+                    model: d.sku.clone(),
+                    name: d.device_name.clone(),
+                    alias: None,
+                    backend: BackendType::Cloud,
+                })
+            })
+            .collect();
+
+        // Add legacy-only devices not present in v2 response.
+        for dev in legacy {
+            if !v2_ids.contains(dev.id.as_str()) {
+                debug!(device_id = %dev.id, "device not in v2 list, using legacy entry");
+                result.push(dev);
+            }
+        }
+
+        // Keep device→model cache in sync with merged result.
+        {
+            let new_map: HashMap<DeviceId, String> = result
+                .iter()
+                .map(|d| (d.id.clone(), d.model.clone()))
+                .collect();
+            let mut models = self
+                .device_models
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *models = new_map;
+        }
+
+        debug!(count = result.len(), "listed cloud devices");
+        Ok(result)
     }
 
     /// Query the current state of a device.
@@ -693,10 +792,16 @@ impl GoveeBackend for CloudBackend {
 impl std::fmt::Debug for CloudBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let cached = self.device_models.read().map(|m| m.len()).unwrap_or(0);
+        let cached_caps = self
+            .device_capabilities
+            .read()
+            .map(|m| m.len())
+            .unwrap_or(0);
         f.debug_struct("CloudBackend")
             .field("base_url", &self.base_url.as_str())
             .field("api_key", &"[REDACTED]")
             .field("cached_devices", &cached)
+            .field("cached_capabilities", &cached_caps)
             .finish()
     }
 }
