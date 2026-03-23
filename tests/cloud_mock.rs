@@ -4,7 +4,7 @@ use govee::backend::GoveeBackend;
 use govee::backend::cloud::CloudBackend;
 use govee::error::GoveeError;
 use govee::types::{Color, DeviceId};
-use wiremock::matchers::{body_json, header, method, path, query_param};
+use wiremock::matchers::{body_json, body_partial_json, header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Create a CloudBackend pointing at the mock server.
@@ -682,13 +682,14 @@ async fn set_color_temp_zero_rejected() {
     assert!(matches!(result.unwrap_err(), GoveeError::InvalidConfig(_)));
 }
 
-// --- new_api_post / new_api_get tests ---
+// --- new_api_post and new_api_get tests ---
 
 /// Build a CloudBackend whose new-API base URL points at the mock server.
 fn new_api_backend_for(server: &MockServer, api_key: &str) -> CloudBackend {
     CloudBackend::new(api_key.to_string(), None, None)
         .unwrap()
         .with_new_api_base(&server.uri())
+        .unwrap()
 }
 
 #[tokio::test]
@@ -705,6 +706,10 @@ async fn new_api_post_success() {
     Mock::given(method("POST"))
         .and(path("/v2/test/endpoint"))
         .and(header("Govee-API-Key", "test-key"))
+        // Assert the request envelope has a requestId field and the expected payload.
+        .and(body_partial_json(serde_json::json!({
+            "payload": { "cmd": "ping" }
+        })))
         .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
         .mount(&server)
         .await;
@@ -738,7 +743,7 @@ async fn new_api_post_http_401() {
     match result.unwrap_err() {
         GoveeError::Api { code, message } => {
             assert_eq!(code, 401);
-            assert_eq!(message, "unauthorized");
+            assert!(message.contains("Unauthorized"), "message was: {message}");
         }
         other => panic!("expected GoveeError::Api(401), got: {other:?}"),
     }
@@ -789,7 +794,7 @@ async fn new_api_post_http_400() {
     match result.unwrap_err() {
         GoveeError::Api { code, message } => {
             assert_eq!(code, 400);
-            assert_eq!(message, "bad request");
+            assert!(message.contains("Bad Request"), "message was: {message}");
         }
         other => panic!("expected GoveeError::Api(400), got: {other:?}"),
     }
@@ -984,7 +989,7 @@ async fn new_api_post_http_404() {
     match result.unwrap_err() {
         GoveeError::Api { code, message } => {
             assert_eq!(code, 404);
-            assert_eq!(message, "not found");
+            assert!(message.contains("Not Found"), "message was: {message}");
         }
         other => panic!("expected GoveeError::Api(404), got: {other:?}"),
     }
@@ -1010,7 +1015,10 @@ async fn new_api_post_http_500() {
     match result.unwrap_err() {
         GoveeError::Api { code, message } => {
             assert_eq!(code, 500);
-            assert_eq!(message, "internal error");
+            assert!(
+                message.contains("Internal Server Error"),
+                "message was: {message}"
+            );
         }
         other => panic!("expected GoveeError::Api(500), got: {other:?}"),
     }
@@ -1036,7 +1044,10 @@ async fn new_api_post_http_503() {
     match result.unwrap_err() {
         GoveeError::Api { code, message } => {
             assert_eq!(code, 503);
-            assert_eq!(message, "request failed");
+            assert!(
+                message.contains("Service Unavailable"),
+                "message was: {message}"
+            );
         }
         other => panic!("expected GoveeError::Api(503), got: {other:?}"),
     }
@@ -1061,7 +1072,10 @@ async fn new_api_get_success() {
         .await;
 
     let backend = new_api_backend_for(&server, "test-key");
-    let result: serde_json::Value = backend.new_api_get("/v2/test/resource").await.unwrap();
+    let result: serde_json::Value = backend
+        .new_api_get("/v2/test/resource", None::<&()>)
+        .await
+        .unwrap();
 
     assert_eq!(result["count"], 7);
 }
@@ -1078,14 +1092,59 @@ async fn new_api_get_http_401() {
         .await;
 
     let backend = new_api_backend_for(&server, "bad-key");
-    let result: Result<serde_json::Value, _> = backend.new_api_get("/v2/test/resource").await;
+    let result: Result<serde_json::Value, _> =
+        backend.new_api_get("/v2/test/resource", None::<&()>).await;
 
     assert!(result.is_err());
     match result.unwrap_err() {
         GoveeError::Api { code, message } => {
             assert_eq!(code, 401);
-            assert_eq!(message, "unauthorized");
+            assert!(message.contains("Unauthorized"), "message was: {message}");
         }
         other => panic!("expected GoveeError::Api(401), got: {other:?}"),
+    }
+}
+
+/// Concrete payload type used in the envelope error test below.
+#[derive(Debug, serde::Deserialize)]
+struct ConcretePayload {
+    #[allow(dead_code)]
+    value: String,
+}
+
+/// When the envelope carries a non-200 code, the error must be returned even
+/// if the payload cannot be deserialized into the concrete `Res` type.
+/// This verifies that envelope errors take precedence over serde failures.
+#[tokio::test]
+async fn new_api_post_envelope_error_with_concrete_type() {
+    let server = MockServer::start().await;
+
+    // HTTP 200, envelope code 400, payload is an empty object (not a valid ConcretePayload).
+    let response_body = serde_json::json!({
+        "requestId": "x",
+        "msg": "bad",
+        "code": 400,
+        "payload": {}
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/v2/test/endpoint"))
+        .and(header("Govee-API-Key", "test-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+        .mount(&server)
+        .await;
+
+    let backend = new_api_backend_for(&server, "test-key");
+    let result: Result<ConcretePayload, _> = backend
+        .new_api_post("/v2/test/endpoint", serde_json::json!({}))
+        .await;
+
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        GoveeError::Api { code, message } => {
+            assert_eq!(code, 400);
+            assert_eq!(message, "bad");
+        }
+        other => panic!("expected GoveeError::Api(400), got: {other:?}"),
     }
 }
