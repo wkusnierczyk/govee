@@ -1191,4 +1191,50 @@ mod tests {
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), GoveeError::InvalidConfig(_)));
     }
+
+    #[test]
+    fn map_new_api_code_err_overflows_u16() {
+        // code > u16::MAX (65535) falls into the Err(_) branch of try_from
+        let err = CloudBackend::map_new_api_code_err(100_000, "overflow".into());
+        assert!(matches!(err, GoveeError::Api { code: 500, .. }));
+    }
+
+    #[test]
+    fn with_new_api_base_rejects_invalid_url() {
+        let backend = CloudBackend::new("key".into(), None, None).unwrap();
+        let result = backend.with_new_api_base("not a url");
+        assert!(matches!(result.unwrap_err(), GoveeError::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn allows_http_ipv6_loopback() {
+        let result = CloudBackend::new("key".into(), Some("http://[::1]/".into()), None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn get_capabilities_returns_none_when_empty() {
+        let backend = CloudBackend::new("key".into(), None, None).unwrap();
+        let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+        assert!(backend.get_capabilities(&id).is_none());
+    }
+
+    #[tokio::test]
+    async fn control_v2_not_implemented_for_raw_variant() {
+        let backend = CloudBackend::new("key".into(), None, None).unwrap();
+        let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+        // Populate model cache so we get past DeviceNotFound.
+        backend
+            .device_models
+            .write()
+            .unwrap()
+            .insert(id.clone(), "H6076".into());
+        let result = backend
+            .control_v2(
+                &id,
+                crate::capability::CapabilityValue::Raw(serde_json::json!({})),
+            )
+            .await;
+        assert!(matches!(result.unwrap_err(), GoveeError::NotImplemented(_)));
+    }
 }
