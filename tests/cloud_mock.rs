@@ -4,7 +4,7 @@ use govee::backend::GoveeBackend;
 use govee::backend::cloud::CloudBackend;
 use govee::error::GoveeError;
 use govee::types::{Color, DeviceId};
-use wiremock::matchers::{body_json, header, method, path, query_param};
+use wiremock::matchers::{body_json, body_partial_json, header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Create a CloudBackend pointing at the mock server.
@@ -680,4 +680,471 @@ async fn set_color_temp_zero_rejected() {
     let result = backend.set_color_temp(&id, 0).await;
     assert!(result.is_err());
     assert!(matches!(result.unwrap_err(), GoveeError::InvalidConfig(_)));
+}
+
+// --- new_api_post and new_api_get tests ---
+
+/// Build a CloudBackend whose new-API base URL points at the mock server.
+fn new_api_backend_for(server: &MockServer, api_key: &str) -> CloudBackend {
+    CloudBackend::new(api_key.to_string(), None, None)
+        .unwrap()
+        .with_new_api_base(&server.uri())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn new_api_post_success() {
+    let server = MockServer::start().await;
+
+    let response_body = serde_json::json!({
+        "requestId": "test-req-id",
+        "msg": "success",
+        "code": 200,
+        "payload": { "value": 42 }
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/v2/test/endpoint"))
+        .and(header("Govee-API-Key", "test-key"))
+        // Assert the request envelope has a requestId field and the expected payload.
+        .and(body_partial_json(serde_json::json!({
+            "payload": { "cmd": "ping" }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+        .mount(&server)
+        .await;
+
+    let backend = new_api_backend_for(&server, "test-key");
+    let result: serde_json::Value = backend
+        .new_api_post("/v2/test/endpoint", serde_json::json!({"cmd": "ping"}))
+        .await
+        .unwrap();
+
+    assert_eq!(result["value"], 42);
+}
+
+#[tokio::test]
+async fn new_api_post_http_401() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v2/test/endpoint"))
+        .and(header("Govee-API-Key", "bad-key"))
+        .respond_with(ResponseTemplate::new(401).set_body_string("Unauthorized"))
+        .mount(&server)
+        .await;
+
+    let backend = new_api_backend_for(&server, "bad-key");
+    let result: Result<serde_json::Value, _> = backend
+        .new_api_post("/v2/test/endpoint", serde_json::json!({}))
+        .await;
+
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        GoveeError::Api { code, message } => {
+            assert_eq!(code, 401);
+            assert!(message.contains("Unauthorized"), "message was: {message}");
+        }
+        other => panic!("expected GoveeError::Api(401), got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn new_api_post_http_429() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v2/test/endpoint"))
+        .and(header("Govee-API-Key", "test-key"))
+        .respond_with(ResponseTemplate::new(429).set_body_string("Too Many Requests"))
+        .mount(&server)
+        .await;
+
+    let backend = new_api_backend_for(&server, "test-key");
+    let result: Result<serde_json::Value, _> = backend
+        .new_api_post("/v2/test/endpoint", serde_json::json!({}))
+        .await;
+
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        GoveeError::RateLimited { retry_after_secs } => {
+            assert_eq!(retry_after_secs, 60);
+        }
+        other => panic!("expected GoveeError::RateLimited, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn new_api_post_http_400() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v2/test/endpoint"))
+        .and(header("Govee-API-Key", "test-key"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("Bad Request"))
+        .mount(&server)
+        .await;
+
+    let backend = new_api_backend_for(&server, "test-key");
+    let result: Result<serde_json::Value, _> = backend
+        .new_api_post("/v2/test/endpoint", serde_json::json!({}))
+        .await;
+
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        GoveeError::Api { code, message } => {
+            assert_eq!(code, 400);
+            assert!(message.contains("Bad Request"), "message was: {message}");
+        }
+        other => panic!("expected GoveeError::Api(400), got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn new_api_post_envelope_code_400() {
+    let server = MockServer::start().await;
+
+    // HTTP 200 but the response envelope carries code 400.
+    let response_body = serde_json::json!({
+        "requestId": "test-req-id",
+        "msg": "Device offline",
+        "code": 400,
+        "payload": {}
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/v2/test/endpoint"))
+        .and(header("Govee-API-Key", "test-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+        .mount(&server)
+        .await;
+
+    let backend = new_api_backend_for(&server, "test-key");
+    let result: Result<serde_json::Value, _> = backend
+        .new_api_post("/v2/test/endpoint", serde_json::json!({}))
+        .await;
+
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        GoveeError::Api { code, message } => {
+            assert_eq!(code, 400);
+            assert_eq!(message, "Device offline");
+        }
+        other => panic!("expected GoveeError::Api(400), got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn new_api_post_envelope_code_401() {
+    let server = MockServer::start().await;
+
+    let response_body = serde_json::json!({
+        "requestId": "test-req-id",
+        "msg": "Invalid API key",
+        "code": 401,
+        "payload": {}
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/v2/test/endpoint"))
+        .and(header("Govee-API-Key", "test-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+        .mount(&server)
+        .await;
+
+    let backend = new_api_backend_for(&server, "test-key");
+    let result: Result<serde_json::Value, _> = backend
+        .new_api_post("/v2/test/endpoint", serde_json::json!({}))
+        .await;
+
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        GoveeError::Api { code, message } => {
+            assert_eq!(code, 401);
+            assert_eq!(message, "Invalid API key");
+        }
+        other => panic!("expected GoveeError::Api(401), got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn new_api_post_envelope_code_404() {
+    let server = MockServer::start().await;
+
+    let response_body = serde_json::json!({
+        "requestId": "test-req-id",
+        "msg": "Device not found",
+        "code": 404,
+        "payload": {}
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/v2/test/endpoint"))
+        .and(header("Govee-API-Key", "test-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+        .mount(&server)
+        .await;
+
+    let backend = new_api_backend_for(&server, "test-key");
+    let result: Result<serde_json::Value, _> = backend
+        .new_api_post("/v2/test/endpoint", serde_json::json!({}))
+        .await;
+
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        GoveeError::Api { code, message } => {
+            assert_eq!(code, 404);
+            assert!(
+                message.contains("Device not found"),
+                "message was: {message}"
+            );
+        }
+        other => panic!("expected GoveeError::Api(404), got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn new_api_post_envelope_code_429() {
+    let server = MockServer::start().await;
+
+    let response_body = serde_json::json!({
+        "requestId": "test-req-id",
+        "msg": "Too many requests",
+        "code": 429,
+        "payload": {}
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/v2/test/endpoint"))
+        .and(header("Govee-API-Key", "test-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+        .mount(&server)
+        .await;
+
+    let backend = new_api_backend_for(&server, "test-key");
+    let result: Result<serde_json::Value, _> = backend
+        .new_api_post("/v2/test/endpoint", serde_json::json!({}))
+        .await;
+
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        GoveeError::RateLimited { retry_after_secs } => {
+            assert_eq!(retry_after_secs, 60);
+        }
+        other => panic!("expected GoveeError::RateLimited, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn new_api_post_envelope_code_other() {
+    let server = MockServer::start().await;
+
+    // HTTP 200 but envelope carries an "other" code (503).
+    let response_body = serde_json::json!({
+        "requestId": "test-req-id",
+        "msg": "Service unavailable",
+        "code": 503,
+        "payload": {}
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/v2/test/endpoint"))
+        .and(header("Govee-API-Key", "test-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+        .mount(&server)
+        .await;
+
+    let backend = new_api_backend_for(&server, "test-key");
+    let result: Result<serde_json::Value, _> = backend
+        .new_api_post("/v2/test/endpoint", serde_json::json!({}))
+        .await;
+
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        GoveeError::Api { code, message } => {
+            assert_eq!(code, 503);
+            assert_eq!(message, "Service unavailable");
+        }
+        other => panic!("expected GoveeError::Api(503), got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn new_api_post_http_404() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v2/test/endpoint"))
+        .and(header("Govee-API-Key", "test-key"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("Not Found"))
+        .mount(&server)
+        .await;
+
+    let backend = new_api_backend_for(&server, "test-key");
+    let result: Result<serde_json::Value, _> = backend
+        .new_api_post("/v2/test/endpoint", serde_json::json!({}))
+        .await;
+
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        GoveeError::Api { code, message } => {
+            assert_eq!(code, 404);
+            assert!(message.contains("Not Found"), "message was: {message}");
+        }
+        other => panic!("expected GoveeError::Api(404), got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn new_api_post_http_500() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v2/test/endpoint"))
+        .and(header("Govee-API-Key", "test-key"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
+        .mount(&server)
+        .await;
+
+    let backend = new_api_backend_for(&server, "test-key");
+    let result: Result<serde_json::Value, _> = backend
+        .new_api_post("/v2/test/endpoint", serde_json::json!({}))
+        .await;
+
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        GoveeError::Api { code, message } => {
+            assert_eq!(code, 500);
+            assert!(
+                message.contains("Internal Server Error"),
+                "message was: {message}"
+            );
+        }
+        other => panic!("expected GoveeError::Api(500), got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn new_api_post_http_503() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v2/test/endpoint"))
+        .and(header("Govee-API-Key", "test-key"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("Service Unavailable"))
+        .mount(&server)
+        .await;
+
+    let backend = new_api_backend_for(&server, "test-key");
+    let result: Result<serde_json::Value, _> = backend
+        .new_api_post("/v2/test/endpoint", serde_json::json!({}))
+        .await;
+
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        GoveeError::Api { code, message } => {
+            assert_eq!(code, 503);
+            assert!(
+                message.contains("Service Unavailable"),
+                "message was: {message}"
+            );
+        }
+        other => panic!("expected GoveeError::Api(503), got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn new_api_get_success() {
+    let server = MockServer::start().await;
+
+    let response_body = serde_json::json!({
+        "requestId": "test-req-id",
+        "msg": "success",
+        "code": 200,
+        "payload": { "count": 7 }
+    });
+
+    Mock::given(method("GET"))
+        .and(path("/v2/test/resource"))
+        .and(header("Govee-API-Key", "test-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+        .mount(&server)
+        .await;
+
+    let backend = new_api_backend_for(&server, "test-key");
+    let result: serde_json::Value = backend
+        .new_api_get("/v2/test/resource", None::<&()>)
+        .await
+        .unwrap();
+
+    assert_eq!(result["count"], 7);
+}
+
+#[tokio::test]
+async fn new_api_get_http_401() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v2/test/resource"))
+        .and(header("Govee-API-Key", "bad-key"))
+        .respond_with(ResponseTemplate::new(401).set_body_string("Unauthorized"))
+        .mount(&server)
+        .await;
+
+    let backend = new_api_backend_for(&server, "bad-key");
+    let result: Result<serde_json::Value, _> =
+        backend.new_api_get("/v2/test/resource", None::<&()>).await;
+
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        GoveeError::Api { code, message } => {
+            assert_eq!(code, 401);
+            assert!(message.contains("Unauthorized"), "message was: {message}");
+        }
+        other => panic!("expected GoveeError::Api(401), got: {other:?}"),
+    }
+}
+
+/// Concrete payload type used in the envelope error test below.
+#[derive(Debug, serde::Deserialize)]
+struct ConcretePayload {
+    #[allow(dead_code)]
+    value: String,
+}
+
+/// When the envelope carries a non-200 code, the error must be returned even
+/// if the payload cannot be deserialized into the concrete `Res` type.
+/// This verifies that envelope errors take precedence over serde failures.
+#[tokio::test]
+async fn new_api_post_envelope_error_with_concrete_type() {
+    let server = MockServer::start().await;
+
+    // HTTP 200, envelope code 400, payload is an empty object (not a valid ConcretePayload).
+    let response_body = serde_json::json!({
+        "requestId": "x",
+        "msg": "bad",
+        "code": 400,
+        "payload": {}
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/v2/test/endpoint"))
+        .and(header("Govee-API-Key", "test-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+        .mount(&server)
+        .await;
+
+    let backend = new_api_backend_for(&server, "test-key");
+    let result: Result<ConcretePayload, _> = backend
+        .new_api_post("/v2/test/endpoint", serde_json::json!({}))
+        .await;
+
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        GoveeError::Api { code, message } => {
+            assert_eq!(code, 400);
+            assert_eq!(message, "bad");
+        }
+        other => panic!("expected GoveeError::Api(400), got: {other:?}"),
+    }
 }
