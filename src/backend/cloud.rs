@@ -440,7 +440,7 @@ impl CloudBackend {
                 }
                 ("devices.capabilities.color_setting", "colorTemperatureK") => {
                     if let Some(v) = cap.state.value.as_u64() {
-                        color_temp_kelvin = Some(u32::try_from(v).unwrap_or(u32::MAX));
+                        color_temp_kelvin = u32::try_from(v).ok();
                     }
                 }
                 _ => {
@@ -779,72 +779,80 @@ fn parse_retry_after(response: &reqwest::Response) -> u64 {
 impl GoveeBackend for CloudBackend {
     #[instrument(skip(self), fields(backend = "cloud"))]
     async fn list_devices(&self) -> Result<Vec<Device>> {
-        // --- Legacy v1 list ---
-        let url = self
-            .base_url
-            .join("v1/devices")
-            .map_err(|e| GoveeError::InvalidConfig(format!("failed to build URL: {e}")))?;
-        let response = self
-            .client
-            .get(url)
-            .header("Govee-API-Key", &self.api_key)
-            .send()
-            .await?;
-
-        let response = self.check_response(response).await?;
-
-        let body: V1DevicesResponse = response.json().await?;
-        if body.code != 200 {
-            return Err(GoveeError::Api {
-                code: body.code,
-                message: body.message,
-            });
+        // --- v2 attempt (primary): device list with capabilities ---
+        let v2_result = self.list_devices_v2().await;
+        match &v2_result {
+            Ok(devs) => {
+                // Atomic-swap capabilities cache so it exactly reflects the latest v2 response.
+                let new_caps: HashMap<DeviceId, Vec<Capability>> = devs
+                    .iter()
+                    .filter_map(|d| {
+                        DeviceId::new(&d.device)
+                            .ok()
+                            .map(|id| (id, d.capabilities.clone()))
+                    })
+                    .collect();
+                *self
+                    .device_capabilities
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = new_caps;
+            }
+            Err(e) => debug!("v2 device list unavailable: {e}"),
         }
 
-        let legacy: Vec<Device> = body
-            .data
-            .devices
-            .into_iter()
-            .map(V1Device::into_domain)
-            .collect::<Result<Vec<_>>>()?;
+        // --- v1 fetch (legacy: supplemental entries or sole source if v2 failed) ---
+        let v1_result: Result<Vec<Device>> = async {
+            let url = self
+                .base_url
+                .join("v1/devices")
+                .map_err(|e| GoveeError::InvalidConfig(format!("failed to build URL: {e}")))?;
+            let response = self
+                .client
+                .get(url)
+                .header("Govee-API-Key", &self.api_key)
+                .send()
+                .await?;
+            let response = self.check_response(response).await?;
+            let body: V1DevicesResponse = response.json().await?;
+            if body.code != 200 {
+                return Err(GoveeError::Api {
+                    code: body.code,
+                    message: body.message,
+                });
+            }
+            body.data
+                .devices
+                .into_iter()
+                .map(V1Device::into_domain)
+                .collect::<Result<Vec<_>>>()
+        }
+        .await;
 
-        // Cache device→model mappings for get_state (atomic swap).
-        {
+        // If v2 failed, fall back to v1 only (propagate v1 error if both failed).
+        if v2_result.is_err() {
+            let legacy = v1_result?;
             let new_map: HashMap<DeviceId, String> = legacy
                 .iter()
                 .map(|d| (d.id.clone(), d.model.clone()))
                 .collect();
-            let mut models = self
+            *self
                 .device_models
                 .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            *models = new_map;
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = new_map;
+            debug!(count = legacy.len(), "listed cloud devices (v1 only)");
+            return Ok(legacy);
         }
 
-        // --- v2 enrichment: capabilities ---
-        let v2_devices = match self.list_devices_v2().await {
-            Ok(devs) => devs,
+        let v2_devices = v2_result.unwrap(); // safe: checked above
+        let legacy = match v1_result {
+            Ok(devs) => Some(devs),
             Err(e) => {
-                debug!("v2 device list unavailable, using legacy only: {e}");
-                debug!(count = legacy.len(), "listed cloud devices");
-                return Ok(legacy);
+                debug!("v1 device list unavailable, using v2 only: {e}");
+                None
             }
         };
 
-        // Store capabilities from v2 response.
-        {
-            let mut caps = self
-                .device_capabilities
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            for d in &v2_devices {
-                if let Ok(id) = DeviceId::new(&d.device) {
-                    caps.insert(id, d.capabilities.clone());
-                }
-            }
-        }
-
-        // Build merged device list: v2 takes precedence.
+        // Merge: v2 devices take precedence; v1-only devices appended.
         let v2_ids: HashSet<String> = v2_devices.iter().map(|d| d.device.clone()).collect();
         let mut result: Vec<Device> = v2_devices
             .iter()
@@ -859,26 +867,25 @@ impl GoveeBackend for CloudBackend {
                 })
             })
             .collect();
-
-        // Add legacy-only devices not present in v2 response.
-        for dev in legacy {
-            if !v2_ids.contains(dev.id.as_str()) {
-                debug!(device_id = %dev.id, "device not in v2 list, using legacy entry");
-                result.push(dev);
+        if let Some(v1) = legacy {
+            for dev in v1 {
+                if !v2_ids.contains(dev.id.as_str()) {
+                    debug!(device_id = %dev.id, "device not in v2 list, using legacy entry");
+                    result.push(dev);
+                }
             }
         }
 
-        // Keep device→model cache in sync with merged result.
+        // Update model cache from merged result.
         {
             let new_map: HashMap<DeviceId, String> = result
                 .iter()
                 .map(|d| (d.id.clone(), d.model.clone()))
                 .collect();
-            let mut models = self
+            *self
                 .device_models
                 .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            *models = new_map;
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = new_map;
         }
 
         debug!(count = result.len(), "listed cloud devices");
@@ -888,15 +895,17 @@ impl GoveeBackend for CloudBackend {
     /// Query the current state of a device.
     ///
     /// Tries the v2 OpenAPI endpoint first; falls back to the legacy v1 API
-    /// on any error.
+    /// on `DeviceNotFound` or `Api` errors. `RateLimited` and other transient
+    /// errors are propagated directly so callers can respect back-off signals.
     #[instrument(skip(self), fields(backend = "cloud", device = %id))]
     async fn get_state(&self, id: &DeviceId) -> Result<DeviceState> {
         match self.get_state_v2(id).await {
             Ok(state) => Ok(state),
-            Err(e) => {
-                debug!(device_id = %id, "v2 state unavailable ({e}), falling back to legacy");
+            Err(GoveeError::DeviceNotFound(_)) | Err(GoveeError::Api { .. }) => {
+                debug!(device_id = %id, "v2 state unavailable, falling back to legacy");
                 self.v1_get_state(id).await
             }
+            Err(e) => Err(e),
         }
     }
 
@@ -905,7 +914,7 @@ impl GoveeBackend for CloudBackend {
         let cap_value = CapabilityValue::OnOff(if on { 1 } else { 0 });
         match self.control_v2(id, cap_value).await {
             Ok(()) => Ok(()),
-            Err(GoveeError::DeviceNotFound(_)) | Err(GoveeError::Api { .. }) => {
+            Err(GoveeError::DeviceNotFound(_)) | Err(GoveeError::Api { code: 404, .. }) => {
                 debug!(device_id = %id, "v2 control failed, falling back to legacy");
                 let value = if on { "on" } else { "off" };
                 self.send_control(id, "turn", serde_json::json!(value))
@@ -923,7 +932,7 @@ impl GoveeBackend for CloudBackend {
         let cap_value = CapabilityValue::Brightness(value);
         match self.control_v2(id, cap_value).await {
             Ok(()) => Ok(()),
-            Err(GoveeError::DeviceNotFound(_)) | Err(GoveeError::Api { .. }) => {
+            Err(GoveeError::DeviceNotFound(_)) | Err(GoveeError::Api { code: 404, .. }) => {
                 debug!(device_id = %id, "v2 control failed, falling back to legacy");
                 self.send_control(id, "brightness", serde_json::json!(value))
                     .await
@@ -938,7 +947,7 @@ impl GoveeBackend for CloudBackend {
         let cap_value = CapabilityValue::Rgb(packed);
         match self.control_v2(id, cap_value).await {
             Ok(()) => Ok(()),
-            Err(GoveeError::DeviceNotFound(_)) | Err(GoveeError::Api { .. }) => {
+            Err(GoveeError::DeviceNotFound(_)) | Err(GoveeError::Api { code: 404, .. }) => {
                 debug!(device_id = %id, "v2 control failed, falling back to legacy");
                 self.send_control(
                     id,
@@ -962,7 +971,7 @@ impl GoveeBackend for CloudBackend {
         let cap_value = CapabilityValue::ColorTempK(kelvin);
         match self.control_v2(id, cap_value).await {
             Ok(()) => Ok(()),
-            Err(GoveeError::DeviceNotFound(_)) | Err(GoveeError::Api { .. }) => {
+            Err(GoveeError::DeviceNotFound(_)) | Err(GoveeError::Api { code: 404, .. }) => {
                 debug!(device_id = %id, "v2 control failed, falling back to legacy");
                 self.send_control(id, "colorTem", serde_json::json!(kelvin))
                     .await

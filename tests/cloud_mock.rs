@@ -5,7 +5,24 @@ use govee::backend::cloud::CloudBackend;
 use govee::error::GoveeError;
 use govee::types::{Color, DeviceId};
 use wiremock::matchers::{body_json, body_partial_json, header, method, path, query_param};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Match, Mock, MockServer, Request, ResponseTemplate};
+
+/// Assert that a JSON request body contains a non-empty `requestId` string field.
+///
+/// Used in v2 API tests alongside `body_partial_json` to verify the request
+/// envelope is complete even when `requestId` is a random UUID.
+struct HasRequestId;
+
+impl Match for HasRequestId {
+    fn matches(&self, request: &Request) -> bool {
+        let Ok(body) = serde_json::from_slice::<serde_json::Value>(&request.body) else {
+            return false;
+        };
+        body.get("requestId")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.is_empty())
+    }
+}
 
 /// Create a CloudBackend pointing at the mock server for both the legacy and new APIs.
 ///
@@ -1191,6 +1208,7 @@ async fn control_v2_set_power_on() {
     Mock::given(method("POST"))
         .and(path("/router/api/v1/device/control"))
         .and(header("Govee-API-Key", "test-key"))
+        .and(HasRequestId)
         .and(body_partial_json(serde_json::json!({
             "payload": {
                 "sku": "H6076",
@@ -1219,6 +1237,7 @@ async fn control_v2_set_brightness() {
     Mock::given(method("POST"))
         .and(path("/router/api/v1/device/control"))
         .and(header("Govee-API-Key", "test-key"))
+        .and(HasRequestId)
         .and(body_partial_json(serde_json::json!({
             "payload": {
                 "sku": "H6076",
@@ -1248,6 +1267,7 @@ async fn control_v2_set_color() {
     Mock::given(method("POST"))
         .and(path("/router/api/v1/device/control"))
         .and(header("Govee-API-Key", "test-key"))
+        .and(HasRequestId)
         .and(body_partial_json(serde_json::json!({
             "payload": {
                 "sku": "H6076",
@@ -1304,6 +1324,7 @@ async fn get_state_v2_success() {
     Mock::given(method("POST"))
         .and(path("/router/api/v1/device/state"))
         .and(header("Govee-API-Key", "test-key"))
+        .and(HasRequestId)
         .and(body_partial_json(serde_json::json!({
             "payload": { "sku": "H6076", "device": "AA:BB:CC:DD:EE:FF" }
         })))
@@ -1486,18 +1507,6 @@ const V2_DEVICES_RESPONSE: &str = r#"{
 #[tokio::test]
 async fn list_devices_v2_success() {
     let server = MockServer::start().await;
-
-    // Legacy v1 endpoint — needed because list_devices calls it first.
-    Mock::given(method("GET"))
-        .and(path("/v1/devices"))
-        .and(header("Govee-API-Key", "test-key"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "data": { "devices": [] },
-            "code": 200,
-            "message": "Success"
-        })))
-        .mount(&server)
-        .await;
 
     // v2 endpoint returns one device with capabilities.
     Mock::given(method("GET"))
