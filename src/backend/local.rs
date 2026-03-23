@@ -431,7 +431,14 @@ fn parse_dev_status(data: &serde_json::Value) -> Result<DeviceState> {
         .and_then(|v| u32::try_from(v).ok())
         .filter(|&v| v > 0);
 
-    DeviceState::new(on, brightness, color, color_temp, false)
+    DeviceState::new(
+        on,
+        brightness,
+        color,
+        color_temp,
+        false,
+        std::collections::HashMap::new(),
+    )
 }
 
 /// Validate color temperature range (1-10000K).
