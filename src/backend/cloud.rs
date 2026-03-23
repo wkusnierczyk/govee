@@ -7,6 +7,7 @@ use reqwest::Client;
 use tracing::{debug, instrument, warn};
 
 use super::GoveeBackend;
+use crate::capability::CapabilityValue;
 use crate::error::{GoveeError, Result};
 use crate::types::{BackendType, Color, Device, DeviceId, DeviceState};
 
@@ -402,6 +403,57 @@ impl CloudBackend {
         self.new_api_base = parsed;
         Ok(self)
     }
+
+    /// Send a control command via the v2 OpenAPI endpoint.
+    ///
+    /// Maps `CapabilityValue` variants to the `POST /router/api/v1/device/control`
+    /// payload format. Returns `GoveeError::NotImplemented` for variants that have
+    /// no v2 mapping, and `GoveeError::DeviceNotFound` if the device SKU is not cached.
+    async fn control_v2(&self, id: &DeviceId, value: CapabilityValue) -> Result<()> {
+        let sku = self.get_model(id)?;
+
+        let (type_, instance, json_value) = match value {
+            CapabilityValue::OnOff(v) => (
+                "devices.capabilities.on_off",
+                "powerSwitch",
+                serde_json::json!(v),
+            ),
+            CapabilityValue::Brightness(v) => (
+                "devices.capabilities.range",
+                "brightness",
+                serde_json::json!(v),
+            ),
+            CapabilityValue::Rgb(v) => (
+                "devices.capabilities.color_setting",
+                "colorRgb",
+                serde_json::json!(v),
+            ),
+            CapabilityValue::ColorTempK(v) => (
+                "devices.capabilities.color_setting",
+                "colorTemperatureK",
+                serde_json::json!(v),
+            ),
+            other => {
+                return Err(GoveeError::NotImplemented(format!(
+                    "control_v2 does not support {other:?}"
+                )));
+            }
+        };
+
+        let payload = ControlPayload {
+            sku: &sku,
+            device: id.as_str(),
+            capability: CapabilityPayload {
+                type_,
+                instance,
+                value: json_value,
+            },
+        };
+
+        self.new_api_post::<_, serde_json::Value>("/router/api/v1/device/control", payload)
+            .await
+            .map(|_| ())
+    }
 }
 
 // --- New (OpenAPI) request/response envelope types (internal) ---
@@ -424,6 +476,25 @@ struct NewApiResponse<T> {
     code: u32,
     #[serde(alias = "data")]
     payload: T,
+}
+
+// --- v2 control payload types (internal) ---
+
+/// Top-level payload for `POST /router/api/v1/device/control`.
+#[derive(serde::Serialize)]
+struct ControlPayload<'a> {
+    sku: &'a str,
+    device: &'a str,
+    capability: CapabilityPayload,
+}
+
+/// The capability object inside a v2 control payload.
+#[derive(serde::Serialize)]
+struct CapabilityPayload {
+    #[serde(rename = "type")]
+    type_: &'static str,
+    instance: &'static str,
+    value: serde_json::Value,
 }
 
 // --- v1 API response types (internal) ---
@@ -649,9 +720,17 @@ impl GoveeBackend for CloudBackend {
 
     #[instrument(skip(self), fields(backend = "cloud", device = %id))]
     async fn set_power(&self, id: &DeviceId, on: bool) -> Result<()> {
-        let value = if on { "on" } else { "off" };
-        self.send_control(id, "turn", serde_json::json!(value))
-            .await
+        let cap_value = CapabilityValue::OnOff(if on { 1 } else { 0 });
+        match self.control_v2(id, cap_value).await {
+            Ok(()) => Ok(()),
+            Err(GoveeError::DeviceNotFound(_)) | Err(GoveeError::Api { .. }) => {
+                debug!(device_id = %id, "v2 control failed, falling back to legacy");
+                let value = if on { "on" } else { "off" };
+                self.send_control(id, "turn", serde_json::json!(value))
+                    .await
+            }
+            Err(e) => Err(e),
+        }
     }
 
     #[instrument(skip(self), fields(backend = "cloud", device = %id))]
@@ -659,18 +738,35 @@ impl GoveeBackend for CloudBackend {
         if value > 100 {
             return Err(GoveeError::InvalidBrightness(value));
         }
-        self.send_control(id, "brightness", serde_json::json!(value))
-            .await
+        let cap_value = CapabilityValue::Brightness(value);
+        match self.control_v2(id, cap_value).await {
+            Ok(()) => Ok(()),
+            Err(GoveeError::DeviceNotFound(_)) | Err(GoveeError::Api { .. }) => {
+                debug!(device_id = %id, "v2 control failed, falling back to legacy");
+                self.send_control(id, "brightness", serde_json::json!(value))
+                    .await
+            }
+            Err(e) => Err(e),
+        }
     }
 
     #[instrument(skip(self, color), fields(backend = "cloud", device = %id))]
     async fn set_color(&self, id: &DeviceId, color: Color) -> Result<()> {
-        self.send_control(
-            id,
-            "color",
-            serde_json::json!({"r": color.r, "g": color.g, "b": color.b}),
-        )
-        .await
+        let packed = color.to_rgb24();
+        let cap_value = CapabilityValue::Rgb(packed);
+        match self.control_v2(id, cap_value).await {
+            Ok(()) => Ok(()),
+            Err(GoveeError::DeviceNotFound(_)) | Err(GoveeError::Api { .. }) => {
+                debug!(device_id = %id, "v2 control failed, falling back to legacy");
+                self.send_control(
+                    id,
+                    "color",
+                    serde_json::json!({"r": color.r, "g": color.g, "b": color.b}),
+                )
+                .await
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Set color temperature in Kelvin (1-10000).
@@ -681,8 +777,16 @@ impl GoveeBackend for CloudBackend {
                 "color temperature must be 1-10000K".into(),
             ));
         }
-        self.send_control(id, "colorTem", serde_json::json!(kelvin))
-            .await
+        let cap_value = CapabilityValue::ColorTempK(kelvin);
+        match self.control_v2(id, cap_value).await {
+            Ok(()) => Ok(()),
+            Err(GoveeError::DeviceNotFound(_)) | Err(GoveeError::Api { .. }) => {
+                debug!(device_id = %id, "v2 control failed, falling back to legacy");
+                self.send_control(id, "colorTem", serde_json::json!(kelvin))
+                    .await
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn backend_type(&self) -> BackendType {

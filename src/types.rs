@@ -168,6 +168,11 @@ impl Color {
     pub fn new(r: u8, g: u8, b: u8) -> Self {
         Self { r, g, b }
     }
+
+    /// Convert to a packed 24-bit RGB integer (R×65536 + G×256 + B).
+    pub fn to_rgb24(self) -> u32 {
+        (self.r as u32) << 16 | (self.g as u32) << 8 | self.b as u32
+    }
 }
 
 impl fmt::Display for Color {
@@ -250,6 +255,13 @@ mod tests {
     fn color_display() {
         let c = Color::new(255, 128, 0);
         assert_eq!(c.to_string(), "#FF8000");
+    }
+
+    #[test]
+    fn color_to_rgb24() {
+        assert_eq!(Color::new(255, 128, 0).to_rgb24(), 0xFF8000);
+        assert_eq!(Color::new(0, 0, 0).to_rgb24(), 0);
+        assert_eq!(Color::new(255, 255, 255).to_rgb24(), 0xFFFFFF);
     }
 
     // BackendType tests
