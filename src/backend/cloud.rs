@@ -417,11 +417,12 @@ struct NewApiRequest<T: serde::Serialize> {
 /// Response envelope for the new Govee OpenAPI.
 #[derive(serde::Deserialize)]
 struct NewApiResponse<T> {
-    /// Echo of the request ID from the caller; not used beyond deserialization.
     #[serde(rename = "requestId")]
-    _request_id: String,
+    #[allow(dead_code)]
+    request_id: Option<String>,
     msg: String,
     code: u32,
+    #[serde(alias = "data")]
     payload: T,
 }
 
