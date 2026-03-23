@@ -1111,6 +1111,151 @@ async fn new_api_get_http_401() {
     }
 }
 
+/// Build a CloudBackend where both the v1 base URL and the new-API base URL
+/// point at the same mock server.  This is needed for tests that exercise
+/// the v2 control path (which calls new_api_post) as well as the v1 legacy
+/// fallback (which calls send_control via PUT /v1/devices/control).
+fn combined_backend_for(server: &MockServer, api_key: &str) -> CloudBackend {
+    CloudBackend::new(api_key.to_string(), Some(server.uri()), None)
+        .unwrap()
+        .with_new_api_base(&server.uri())
+        .unwrap()
+}
+
+const NEW_API_CONTROL_SUCCESS: &str = r#"{
+    "requestId": "test-req-id",
+    "msg": "success",
+    "code": 200,
+    "payload": {}
+}"#;
+
+/// Helper: mount list_devices + v2 control mock, returning a combined backend.
+async fn setup_v2_control(server: &MockServer) -> (CloudBackend, DeviceId) {
+    let backend = combined_backend_for(server, "test-key");
+    // Populate device cache via v1 list endpoint.
+    Mock::given(method("GET"))
+        .and(path("/v1/devices"))
+        .and(header("Govee-API-Key", "test-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(HAPPY_RESPONSE, "application/json"))
+        .mount(server)
+        .await;
+    backend.list_devices().await.unwrap();
+    let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+    (backend, id)
+}
+
+#[tokio::test]
+async fn control_v2_set_power_on() {
+    let server = MockServer::start().await;
+    let (backend, id) = setup_v2_control(&server).await;
+
+    Mock::given(method("POST"))
+        .and(path("/router/api/v1/device/control"))
+        .and(header("Govee-API-Key", "test-key"))
+        .and(body_partial_json(serde_json::json!({
+            "payload": {
+                "sku": "H6076",
+                "device": "AA:BB:CC:DD:EE:FF",
+                "capability": {
+                    "type": "devices.capabilities.on_off",
+                    "instance": "powerSwitch",
+                    "value": 1
+                }
+            }
+        })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(NEW_API_CONTROL_SUCCESS, "application/json"),
+        )
+        .mount(&server)
+        .await;
+
+    backend.set_power(&id, true).await.unwrap();
+}
+
+#[tokio::test]
+async fn control_v2_set_brightness() {
+    let server = MockServer::start().await;
+    let (backend, id) = setup_v2_control(&server).await;
+
+    Mock::given(method("POST"))
+        .and(path("/router/api/v1/device/control"))
+        .and(header("Govee-API-Key", "test-key"))
+        .and(body_partial_json(serde_json::json!({
+            "payload": {
+                "sku": "H6076",
+                "device": "AA:BB:CC:DD:EE:FF",
+                "capability": {
+                    "type": "devices.capabilities.range",
+                    "instance": "brightness",
+                    "value": 80
+                }
+            }
+        })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(NEW_API_CONTROL_SUCCESS, "application/json"),
+        )
+        .mount(&server)
+        .await;
+
+    backend.set_brightness(&id, 80).await.unwrap();
+}
+
+#[tokio::test]
+async fn control_v2_set_color() {
+    let server = MockServer::start().await;
+    let (backend, id) = setup_v2_control(&server).await;
+
+    // Color::new(255, 128, 0) packed = 0xFF8000 = 16744448
+    Mock::given(method("POST"))
+        .and(path("/router/api/v1/device/control"))
+        .and(header("Govee-API-Key", "test-key"))
+        .and(body_partial_json(serde_json::json!({
+            "payload": {
+                "sku": "H6076",
+                "device": "AA:BB:CC:DD:EE:FF",
+                "capability": {
+                    "type": "devices.capabilities.color_setting",
+                    "instance": "colorRgb",
+                    "value": 0xFF8000u32
+                }
+            }
+        })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(NEW_API_CONTROL_SUCCESS, "application/json"),
+        )
+        .mount(&server)
+        .await;
+
+    backend
+        .set_color(&id, Color::new(255, 128, 0))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn control_v2_fallback() {
+    let server = MockServer::start().await;
+    let (backend, id) = setup_v2_control(&server).await;
+
+    // v2 endpoint returns 404 (API error) → should fall back to legacy PUT.
+    Mock::given(method("POST"))
+        .and(path("/router/api/v1/device/control"))
+        .and(header("Govee-API-Key", "test-key"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("Not Found"))
+        .mount(&server)
+        .await;
+
+    // Legacy PUT endpoint should be called as fallback.
+    Mock::given(method("PUT"))
+        .and(path("/v1/devices/control"))
+        .and(header("Govee-API-Key", "test-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(CONTROL_SUCCESS, "application/json"))
+        .mount(&server)
+        .await;
+
+    backend.set_power(&id, true).await.unwrap();
+}
+
 /// Concrete payload type used in the envelope error test below.
 #[derive(Debug, serde::Deserialize)]
 struct ConcretePayload {
