@@ -2679,6 +2679,19 @@ mod tests {
                     Err(GoveeError::DiscoveryTimeout)
                 }
             }
+            async fn list_scenes(
+                &self,
+                _id: &DeviceId,
+            ) -> crate::error::Result<Vec<crate::types::LightScene>> {
+                Ok(vec![])
+            }
+            async fn set_scene(
+                &self,
+                _id: &DeviceId,
+                _scene: &crate::types::LightScene,
+            ) -> crate::error::Result<()> {
+                Ok(())
+            }
             fn backend_type(&self) -> BackendType {
                 BackendType::Cloud
             }
@@ -3036,6 +3049,19 @@ mod tests {
                 } else {
                     Err(GoveeError::DiscoveryTimeout)
                 }
+            }
+            async fn list_scenes(
+                &self,
+                _id: &DeviceId,
+            ) -> crate::error::Result<Vec<crate::types::LightScene>> {
+                Ok(vec![])
+            }
+            async fn set_scene(
+                &self,
+                _id: &DeviceId,
+                _scene: &crate::types::LightScene,
+            ) -> crate::error::Result<()> {
+                Ok(())
             }
             fn backend_type(&self) -> BackendType {
                 BackendType::Cloud

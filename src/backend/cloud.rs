@@ -7,9 +7,9 @@ use reqwest::Client;
 use tracing::{debug, instrument, warn};
 
 use super::GoveeBackend;
-use crate::capability::{Capability, CapabilityValue};
+use crate::capability::{Capability, CapabilityValue, DynamicSceneValue};
 use crate::error::{GoveeError, Result};
-use crate::types::{BackendType, Color, Device, DeviceId, DeviceState};
+use crate::types::{BackendType, Color, Device, DeviceId, DeviceState, LightScene};
 
 /// Default base URL for the Govee cloud API.
 const DEFAULT_BASE_URL: &str = "https://developer-api.govee.com";
@@ -526,6 +526,11 @@ impl CloudBackend {
                 "colorTemperatureK",
                 serde_json::json!(v),
             ),
+            CapabilityValue::DynamicScene(scene_value) => (
+                "devices.capabilities.dynamic_scene",
+                "lightScene",
+                serde_json::to_value(&scene_value).map_err(GoveeError::Json)?,
+            ),
             other => {
                 return Err(GoveeError::NotImplemented(format!(
                     "control_v2 does not support {other:?}"
@@ -765,6 +770,23 @@ struct V1ControlResponse {
     message: String,
 }
 
+// --- Scene list response types (internal) ---
+
+/// Top-level payload returned by `POST /router/api/v1/device/scenes`.
+#[derive(serde::Deserialize)]
+struct SceneListResponse {
+    scenes: Vec<RawScene>,
+}
+
+/// A single scene entry in the scenes list response.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawScene {
+    scene_id: u32,
+    scene_name: String,
+    scene_param_id: u32,
+}
+
 /// Parse the `Retry-After` header value as seconds.
 fn parse_retry_after(response: &reqwest::Response) -> u64 {
     response
@@ -978,6 +1000,55 @@ impl GoveeBackend for CloudBackend {
             }
             Err(e) => Err(e),
         }
+    }
+
+    #[instrument(skip(self), fields(backend = "cloud", device = %id))]
+    async fn list_scenes(&self, id: &DeviceId) -> Result<Vec<LightScene>> {
+        // Skip the network call if the device has no dynamic_scene capability.
+        if let Some(caps) = self.get_capabilities(id) {
+            let has_dynamic_scene = caps
+                .iter()
+                .any(|c| c.type_ == "devices.capabilities.dynamic_scene");
+            if !has_dynamic_scene {
+                return Ok(vec![]);
+            }
+        } else {
+            return Ok(vec![]);
+        }
+
+        let sku = self.get_model(id)?;
+        let payload = serde_json::json!({
+            "sku": sku,
+            "device": id.as_str(),
+        });
+
+        let resp: SceneListResponse = self
+            .new_api_post("/router/api/v1/device/scenes", payload)
+            .await?;
+
+        let scenes = resp
+            .scenes
+            .into_iter()
+            .map(|s| LightScene {
+                id: s.scene_id,
+                name: s.scene_name,
+                param_id: s.scene_param_id,
+            })
+            .collect();
+
+        Ok(scenes)
+    }
+
+    #[instrument(skip(self, scene), fields(backend = "cloud", device = %id))]
+    async fn set_scene(&self, id: &DeviceId, scene: &LightScene) -> Result<()> {
+        self.control_v2(
+            id,
+            CapabilityValue::DynamicScene(DynamicSceneValue::Preset {
+                param_id: scene.param_id,
+                id: scene.id,
+            }),
+        )
+        .await
     }
 
     fn backend_type(&self) -> BackendType {

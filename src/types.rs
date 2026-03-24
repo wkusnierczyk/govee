@@ -75,6 +75,14 @@ pub struct Device {
     pub backend: BackendType,
 }
 
+/// A preset scene available on a device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LightScene {
+    pub id: u32,
+    pub name: String,
+    pub param_id: u32,
+}
+
 /// Which backend is active for a device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

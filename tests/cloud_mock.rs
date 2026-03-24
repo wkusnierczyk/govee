@@ -1626,3 +1626,169 @@ async fn list_devices_fallback_to_legacy() {
     assert_eq!(devices[0].id.as_str(), "AA:BB:CC:DD:EE:FF");
     assert_eq!(devices[1].id.as_str(), "11:22:33:44:55:66");
 }
+
+// --- list_scenes and set_scene tests ---
+
+/// V2 devices response that includes `devices.capabilities.dynamic_scene`.
+const V2_DEVICES_WITH_SCENE_CAP: &str = r#"{
+    "code": 200,
+    "msg": "success",
+    "requestId": "x",
+    "data": [
+        {
+            "sku": "H6076",
+            "device": "AA:BB:CC:DD:EE:FF",
+            "deviceName": "Kitchen",
+            "capabilities": [
+                {
+                    "type": "devices.capabilities.dynamic_scene",
+                    "instance": "lightScene",
+                    "parameters": {
+                        "dataType": "ENUM",
+                        "options": []
+                    }
+                }
+            ]
+        }
+    ]
+}"#;
+
+/// Mount the v1 and v2 list endpoints so that both model and capability caches are populated
+/// with a device that has the `dynamic_scene` capability.
+async fn populate_scene_capable_device_cache(server: &MockServer, backend: &CloudBackend) {
+    Mock::given(method("GET"))
+        .and(path("/router/api/v1/user/devices"))
+        .and(header("Govee-API-Key", "test-key"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(V2_DEVICES_WITH_SCENE_CAP, "application/json"),
+        )
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/devices"))
+        .and(header("Govee-API-Key", "test-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(HAPPY_RESPONSE, "application/json"))
+        .mount(server)
+        .await;
+    backend.list_devices().await.unwrap();
+}
+
+#[tokio::test]
+async fn list_scenes_returns_scenes() {
+    let server = MockServer::start().await;
+    let backend = full_backend_for(&server, "test-key");
+    populate_scene_capable_device_cache(&server, &backend).await;
+
+    let scenes_response = serde_json::json!({
+        "requestId": "test-req-id",
+        "msg": "success",
+        "code": 200,
+        "payload": {
+            "scenes": [
+                { "sceneId": 1, "sceneName": "Sunrise", "sceneParamId": 100 },
+                { "sceneId": 2, "sceneName": "Sunset", "sceneParamId": 101 }
+            ]
+        }
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/router/api/v1/device/scenes"))
+        .and(header("Govee-API-Key", "test-key"))
+        .and(HasRequestId)
+        .and(body_partial_json(serde_json::json!({
+            "payload": {
+                "sku": "H6076",
+                "device": "AA:BB:CC:DD:EE:FF"
+            }
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&scenes_response))
+        .mount(&server)
+        .await;
+
+    let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+    let scenes = backend.list_scenes(&id).await.unwrap();
+
+    assert_eq!(scenes.len(), 2);
+    assert_eq!(scenes[0].id, 1);
+    assert_eq!(scenes[0].name, "Sunrise");
+    assert_eq!(scenes[0].param_id, 100);
+    assert_eq!(scenes[1].id, 2);
+    assert_eq!(scenes[1].name, "Sunset");
+    assert_eq!(scenes[1].param_id, 101);
+}
+
+#[tokio::test]
+async fn list_scenes_skips_when_capabilities_not_cached() {
+    // When get_capabilities returns None (no list_devices called yet), return empty vec.
+    let server = MockServer::start().await;
+    let backend = full_backend_for(&server, "test-key");
+    // Do NOT call list_devices — capabilities cache is empty.
+    let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+    let scenes = backend.list_scenes(&id).await.unwrap();
+    assert!(scenes.is_empty());
+}
+
+#[tokio::test]
+async fn list_scenes_skips_when_no_dynamic_scene_cap() {
+    let server = MockServer::start().await;
+    // Use full backend so v2 list populates capabilities without dynamic_scene cap.
+    let backend = full_backend_for(&server, "test-key");
+
+    // list_devices with V2_DEVICES_RESPONSE: device has only on_off, no dynamic_scene.
+    Mock::given(method("GET"))
+        .and(path("/router/api/v1/user/devices"))
+        .and(header("Govee-API-Key", "test-key"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(V2_DEVICES_RESPONSE, "application/json"),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/devices"))
+        .and(header("Govee-API-Key", "test-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(HAPPY_RESPONSE, "application/json"))
+        .mount(&server)
+        .await;
+    backend.list_devices().await.unwrap();
+
+    // No scene endpoint mock mounted — any attempt to call it would fail.
+    let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+    let scenes = backend.list_scenes(&id).await.unwrap();
+    assert!(scenes.is_empty());
+}
+
+#[tokio::test]
+async fn set_scene_triggers_control() {
+    let server = MockServer::start().await;
+    let backend = full_backend_for(&server, "test-key");
+    populate_scene_capable_device_cache(&server, &backend).await;
+
+    Mock::given(method("POST"))
+        .and(path("/router/api/v1/device/control"))
+        .and(header("Govee-API-Key", "test-key"))
+        .and(HasRequestId)
+        .and(body_partial_json(serde_json::json!({
+            "payload": {
+                "sku": "H6076",
+                "device": "AA:BB:CC:DD:EE:FF",
+                "capability": {
+                    "type": "devices.capabilities.dynamic_scene",
+                    "instance": "lightScene",
+                    "value": { "paramId": 100, "id": 1 }
+                }
+            }
+        })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(NEW_API_CONTROL_SUCCESS, "application/json"),
+        )
+        .mount(&server)
+        .await;
+
+    let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+    let scene = govee::LightScene {
+        id: 1,
+        name: "Sunrise".to_string(),
+        param_id: 100,
+    };
+    backend.set_scene(&id, &scene).await.unwrap();
+}
