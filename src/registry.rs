@@ -2679,6 +2679,22 @@ mod tests {
                     Err(GoveeError::DiscoveryTimeout)
                 }
             }
+            async fn set_segment_color(
+                &self,
+                _id: &DeviceId,
+                _segments: Vec<u8>,
+                _color: Color,
+            ) -> crate::error::Result<()> {
+                Ok(())
+            }
+            async fn set_segment_brightness(
+                &self,
+                _id: &DeviceId,
+                _segments: Vec<u8>,
+                _brightness: u8,
+            ) -> crate::error::Result<()> {
+                Ok(())
+            }
             fn backend_type(&self) -> BackendType {
                 BackendType::Cloud
             }
@@ -3036,6 +3052,22 @@ mod tests {
                 } else {
                     Err(GoveeError::DiscoveryTimeout)
                 }
+            }
+            async fn set_segment_color(
+                &self,
+                _id: &DeviceId,
+                _segments: Vec<u8>,
+                _color: Color,
+            ) -> crate::error::Result<()> {
+                Ok(())
+            }
+            async fn set_segment_brightness(
+                &self,
+                _id: &DeviceId,
+                _segments: Vec<u8>,
+                _brightness: u8,
+            ) -> crate::error::Result<()> {
+                Ok(())
             }
             fn backend_type(&self) -> BackendType {
                 BackendType::Cloud

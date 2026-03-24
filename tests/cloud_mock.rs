@@ -1626,3 +1626,74 @@ async fn list_devices_fallback_to_legacy() {
     assert_eq!(devices[0].id.as_str(), "AA:BB:CC:DD:EE:FF");
     assert_eq!(devices[1].id.as_str(), "11:22:33:44:55:66");
 }
+
+#[tokio::test]
+async fn set_segment_color_sends_correct_payload() {
+    let server = MockServer::start().await;
+    let (backend, id) = setup_v2_control(&server).await;
+
+    // Color::new(255, 0, 128) packed = 0xFF0080 = 16711808
+    Mock::given(method("POST"))
+        .and(path("/router/api/v1/device/control"))
+        .and(header("Govee-API-Key", "test-key"))
+        .and(HasRequestId)
+        .and(body_partial_json(serde_json::json!({
+            "payload": {
+                "sku": "H6076",
+                "device": "AA:BB:CC:DD:EE:FF",
+                "capability": {
+                    "type": "devices.capabilities.segment_color_setting",
+                    "instance": "segmentedColorRgb",
+                    "value": {
+                        "segments": [0, 1, 2],
+                        "rgb": 0xFF0080u32
+                    }
+                }
+            }
+        })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(NEW_API_CONTROL_SUCCESS, "application/json"),
+        )
+        .mount(&server)
+        .await;
+
+    backend
+        .set_segment_color(&id, vec![0, 1, 2], Color::new(255, 0, 128))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn set_segment_brightness_sends_correct_payload() {
+    let server = MockServer::start().await;
+    let (backend, id) = setup_v2_control(&server).await;
+
+    Mock::given(method("POST"))
+        .and(path("/router/api/v1/device/control"))
+        .and(header("Govee-API-Key", "test-key"))
+        .and(HasRequestId)
+        .and(body_partial_json(serde_json::json!({
+            "payload": {
+                "sku": "H6076",
+                "device": "AA:BB:CC:DD:EE:FF",
+                "capability": {
+                    "type": "devices.capabilities.segment_color_setting",
+                    "instance": "segmentedBrightness",
+                    "value": {
+                        "segments": [3, 4],
+                        "brightness": 75
+                    }
+                }
+            }
+        })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(NEW_API_CONTROL_SUCCESS, "application/json"),
+        )
+        .mount(&server)
+        .await;
+
+    backend
+        .set_segment_brightness(&id, vec![3, 4], 75)
+        .await
+        .unwrap();
+}

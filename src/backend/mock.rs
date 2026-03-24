@@ -101,6 +101,26 @@ impl GoveeBackend for MockBackend {
         Ok(())
     }
 
+    async fn set_segment_color(
+        &self,
+        _id: &DeviceId,
+        _segments: Vec<u8>,
+        _color: Color,
+    ) -> Result<()> {
+        self.check_error()?;
+        Ok(())
+    }
+
+    async fn set_segment_brightness(
+        &self,
+        _id: &DeviceId,
+        _segments: Vec<u8>,
+        _brightness: u8,
+    ) -> Result<()> {
+        self.check_error()?;
+        Ok(())
+    }
+
     fn backend_type(&self) -> BackendType {
         self.backend_type
     }

@@ -526,6 +526,19 @@ impl CloudBackend {
                 "colorTemperatureK",
                 serde_json::json!(v),
             ),
+            CapabilityValue::SegmentColor { segments, rgb } => (
+                "devices.capabilities.segment_color_setting",
+                "segmentedColorRgb",
+                serde_json::json!({ "segments": segments, "rgb": rgb }),
+            ),
+            CapabilityValue::SegmentBrightness {
+                segments,
+                brightness,
+            } => (
+                "devices.capabilities.segment_color_setting",
+                "segmentedBrightness",
+                serde_json::json!({ "segments": segments, "brightness": brightness }),
+            ),
             other => {
                 return Err(GoveeError::NotImplemented(format!(
                     "control_v2 does not support {other:?}"
@@ -978,6 +991,35 @@ impl GoveeBackend for CloudBackend {
             }
             Err(e) => Err(e),
         }
+    }
+
+    #[instrument(skip(self, color), fields(backend = "cloud", device = %id))]
+    async fn set_segment_color(
+        &self,
+        id: &DeviceId,
+        segments: Vec<u8>,
+        color: Color,
+    ) -> Result<()> {
+        let rgb = color.to_rgb24();
+        self.control_v2(id, CapabilityValue::SegmentColor { segments, rgb })
+            .await
+    }
+
+    #[instrument(skip(self), fields(backend = "cloud", device = %id))]
+    async fn set_segment_brightness(
+        &self,
+        id: &DeviceId,
+        segments: Vec<u8>,
+        brightness: u8,
+    ) -> Result<()> {
+        self.control_v2(
+            id,
+            CapabilityValue::SegmentBrightness {
+                segments,
+                brightness,
+            },
+        )
+        .await
     }
 
     fn backend_type(&self) -> BackendType {

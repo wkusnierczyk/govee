@@ -608,6 +608,28 @@ impl GoveeBackend for LocalBackend {
         self.send_command(id, payload).await
     }
 
+    async fn set_segment_color(
+        &self,
+        _id: &DeviceId,
+        _segments: Vec<u8>,
+        _color: Color,
+    ) -> Result<()> {
+        Err(GoveeError::NotImplemented(
+            "set_segment_color is not supported by the local backend".into(),
+        ))
+    }
+
+    async fn set_segment_brightness(
+        &self,
+        _id: &DeviceId,
+        _segments: Vec<u8>,
+        _brightness: u8,
+    ) -> Result<()> {
+        Err(GoveeError::NotImplemented(
+            "set_segment_brightness is not supported by the local backend".into(),
+        ))
+    }
+
     fn backend_type(&self) -> BackendType {
         BackendType::Local
     }
