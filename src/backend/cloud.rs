@@ -9,7 +9,7 @@ use tracing::{debug, instrument, warn};
 use super::GoveeBackend;
 use crate::capability::{Capability, CapabilityValue};
 use crate::error::{GoveeError, Result};
-use crate::types::{BackendType, Color, Device, DeviceId, DeviceState};
+use crate::types::{BackendType, Color, Device, DeviceId, DeviceState, DiyScene};
 
 /// Default base URL for the Govee cloud API.
 const DEFAULT_BASE_URL: &str = "https://developer-api.govee.com";
@@ -453,6 +453,42 @@ impl CloudBackend {
         DeviceState::new(on, brightness, color, color_temp_kelvin, false, raw)
     }
 
+    /// List available DIY scenes for a device.
+    ///
+    /// Returns an empty list if the device does not advertise the
+    /// `devices.capabilities.dynamic_scene` capability. Otherwise POSTs to
+    /// `/router/api/v1/device/diy-scenes` and parses the response.
+    async fn list_diy_scenes_cloud(&self, id: &DeviceId) -> Result<Vec<DiyScene>> {
+        // Check capability — skip the network call if the device doesn't support it.
+        let has_cap = self
+            .get_capabilities(id)
+            .map(|caps| caps.iter().any(|c| c.type_.contains("dynamic_scene")))
+            .unwrap_or(false);
+
+        if !has_cap {
+            return Ok(vec![]);
+        }
+
+        let sku = self.get_model(id)?;
+        let payload = serde_json::json!({
+            "sku": sku,
+            "device": id.as_str(),
+        });
+
+        let resp: DiySceneListResponse = self
+            .new_api_post("/router/api/v1/device/diy-scenes", payload)
+            .await?;
+
+        Ok(resp
+            .diy_scenes
+            .into_iter()
+            .map(|s| DiyScene {
+                id: s.scene_id,
+                name: s.scene_name,
+            })
+            .collect())
+    }
+
     /// Override the new API base URL.
     ///
     /// Returns `GoveeError::InvalidConfig` if `base` is not a valid URL or
@@ -524,6 +560,11 @@ impl CloudBackend {
             CapabilityValue::ColorTempK(v) => (
                 "devices.capabilities.color_setting",
                 "colorTemperatureK",
+                serde_json::json!(v),
+            ),
+            CapabilityValue::DiyScene(v) => (
+                "devices.capabilities.dynamic_scene",
+                "diyScene",
                 serde_json::json!(v),
             ),
             other => {
@@ -601,6 +642,23 @@ impl CloudBackend {
         debug!(device = %id, stale = state.stale, "queried v1 device state");
         Ok(state)
     }
+}
+
+// --- DIY scene response types (internal) ---
+
+/// Response payload for `POST /router/api/v1/device/diy-scenes`.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DiySceneListResponse {
+    diy_scenes: Vec<RawDiyScene>,
+}
+
+/// A single DIY scene entry from the API.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawDiyScene {
+    scene_id: u32,
+    scene_name: String,
 }
 
 // --- New (OpenAPI) request/response envelope types (internal) ---
@@ -978,6 +1036,17 @@ impl GoveeBackend for CloudBackend {
             }
             Err(e) => Err(e),
         }
+    }
+
+    #[instrument(skip(self), fields(backend = "cloud", device = %id))]
+    async fn list_diy_scenes(&self, id: &DeviceId) -> Result<Vec<DiyScene>> {
+        self.list_diy_scenes_cloud(id).await
+    }
+
+    #[instrument(skip(self, scene), fields(backend = "cloud", device = %id, scene_id = scene.id))]
+    async fn set_diy_scene(&self, id: &DeviceId, scene: &DiyScene) -> Result<()> {
+        self.control_v2(id, CapabilityValue::DiyScene(scene.id))
+            .await
     }
 
     fn backend_type(&self) -> BackendType {

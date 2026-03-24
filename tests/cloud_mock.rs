@@ -1626,3 +1626,148 @@ async fn list_devices_fallback_to_legacy() {
     assert_eq!(devices[0].id.as_str(), "AA:BB:CC:DD:EE:FF");
     assert_eq!(devices[1].id.as_str(), "11:22:33:44:55:66");
 }
+
+// --- list_diy_scenes / set_diy_scene tests ---
+
+/// Response body for the v2 device list that includes a `dynamic_scene` capability.
+const V2_DEVICES_WITH_DYNAMIC_SCENE: &str = r#"{
+    "code": 200,
+    "msg": "success",
+    "requestId": "x",
+    "data": [
+        {
+            "sku": "H6076",
+            "device": "AA:BB:CC:DD:EE:FF",
+            "deviceName": "Kitchen",
+            "capabilities": [
+                {
+                    "type": "devices.capabilities.dynamic_scene",
+                    "instance": "diyScene",
+                    "parameters": {
+                        "dataType": "ENUM",
+                        "options": []
+                    }
+                }
+            ]
+        }
+    ]
+}"#;
+
+/// Response body for the DIY scenes endpoint.
+const DIY_SCENES_RESPONSE: &str = r#"{
+    "requestId": "test-req-id",
+    "msg": "success",
+    "code": 200,
+    "payload": {
+        "diyScenes": [
+            { "sceneId": 42, "sceneName": "My Custom" },
+            { "sceneId": 7, "sceneName": "Sunset" }
+        ]
+    }
+}"#;
+
+/// Populate device cache via the v2 endpoint with a device that has `dynamic_scene` capability.
+async fn populate_diy_scene_cache(server: &MockServer, backend: &CloudBackend) {
+    Mock::given(method("GET"))
+        .and(path("/router/api/v1/user/devices"))
+        .and(header("Govee-API-Key", "test-key"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(V2_DEVICES_WITH_DYNAMIC_SCENE, "application/json"),
+        )
+        .mount(server)
+        .await;
+    // v1 fallback returns 404 (wiremock default for unregistered paths), that's fine.
+    backend.list_devices().await.unwrap();
+}
+
+#[tokio::test]
+async fn list_diy_scenes_returns_scenes() {
+    let server = MockServer::start().await;
+    let backend = combined_backend_for(&server, "test-key");
+    populate_diy_scene_cache(&server, &backend).await;
+
+    Mock::given(method("POST"))
+        .and(path("/router/api/v1/device/diy-scenes"))
+        .and(header("Govee-API-Key", "test-key"))
+        .and(HasRequestId)
+        .and(body_partial_json(serde_json::json!({
+            "payload": {
+                "sku": "H6076",
+                "device": "AA:BB:CC:DD:EE:FF"
+            }
+        })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(DIY_SCENES_RESPONSE, "application/json"),
+        )
+        .mount(&server)
+        .await;
+
+    let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+    let scenes = backend.list_diy_scenes(&id).await.unwrap();
+
+    assert_eq!(scenes.len(), 2);
+    assert_eq!(scenes[0].id, 42);
+    assert_eq!(scenes[0].name, "My Custom");
+    assert_eq!(scenes[1].id, 7);
+    assert_eq!(scenes[1].name, "Sunset");
+}
+
+#[tokio::test]
+async fn list_diy_scenes_skips_when_no_dynamic_scene_cap() {
+    let server = MockServer::start().await;
+    let backend = combined_backend_for(&server, "test-key");
+
+    // Populate cache with a device that has NO dynamic_scene capability.
+    Mock::given(method("GET"))
+        .and(path("/router/api/v1/user/devices"))
+        .and(header("Govee-API-Key", "test-key"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(V2_DEVICES_RESPONSE, "application/json"),
+        )
+        .mount(&server)
+        .await;
+    backend.list_devices().await.unwrap();
+
+    // No mock for /router/api/v1/device/diy-scenes — if it were called, the test would fail
+    // because wiremock returns 404 for unregistered paths, causing an Api error.
+    let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+    let scenes = backend.list_diy_scenes(&id).await.unwrap();
+
+    assert!(scenes.is_empty());
+}
+
+#[tokio::test]
+async fn set_diy_scene_triggers_control() {
+    let server = MockServer::start().await;
+    let backend = combined_backend_for(&server, "test-key");
+    populate_diy_scene_cache(&server, &backend).await;
+
+    Mock::given(method("POST"))
+        .and(path("/router/api/v1/device/control"))
+        .and(header("Govee-API-Key", "test-key"))
+        .and(HasRequestId)
+        .and(body_partial_json(serde_json::json!({
+            "payload": {
+                "sku": "H6076",
+                "device": "AA:BB:CC:DD:EE:FF",
+                "capability": {
+                    "type": "devices.capabilities.dynamic_scene",
+                    "instance": "diyScene",
+                    "value": 42
+                }
+            }
+        })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(NEW_API_CONTROL_SUCCESS, "application/json"),
+        )
+        .mount(&server)
+        .await;
+
+    let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+    let scene = govee::DiyScene {
+        id: 42,
+        name: "My Custom".to_string(),
+    };
+    backend.set_diy_scene(&id, &scene).await.unwrap();
+}
