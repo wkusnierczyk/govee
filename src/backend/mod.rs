@@ -6,7 +6,7 @@ pub(crate) mod mock;
 use async_trait::async_trait;
 
 use crate::error::Result;
-use crate::types::{BackendType, Color, Device, DeviceId, DeviceState};
+use crate::types::{BackendType, Color, Device, DeviceId, DeviceState, WorkMode};
 
 /// Unified interface for controlling Govee devices.
 ///
@@ -32,6 +32,17 @@ pub trait GoveeBackend: Send + Sync {
 
     /// Set color temperature in Kelvin.
     async fn set_color_temp(&self, id: &DeviceId, kelvin: u32) -> Result<()>;
+
+    /// List work modes available for a device (read from cached capabilities — no network call).
+    async fn list_work_modes(&self, id: &DeviceId) -> Result<Vec<WorkMode>>;
+
+    /// Set the active work mode (and optional sub-mode value).
+    async fn set_work_mode(
+        &self,
+        id: &DeviceId,
+        work_mode: u32,
+        mode_value: Option<u32>,
+    ) -> Result<()>;
 
     /// Which backend type this implementation represents.
     fn backend_type(&self) -> BackendType;

@@ -1626,3 +1626,122 @@ async fn list_devices_fallback_to_legacy() {
     assert_eq!(devices[0].id.as_str(), "AA:BB:CC:DD:EE:FF");
     assert_eq!(devices[1].id.as_str(), "11:22:33:44:55:66");
 }
+
+// --- work mode tests ---
+
+const V2_WORK_MODE_DEVICES_RESPONSE: &str = r#"{
+    "code": 200, "msg": "success", "requestId": "x",
+    "data": [{
+        "sku": "H6076",
+        "device": "AA:BB:CC:DD:EE:FF",
+        "deviceName": "Test",
+        "capabilities": [{
+            "type": "devices.capabilities.work_mode",
+            "instance": "workMode",
+            "parameters": {
+                "dataType": "ENUM",
+                "options": [
+                    { "name": "Music", "value": 1 },
+                    { "name": "Scene", "value": 2 }
+                ]
+            }
+        }]
+    }]
+}"#;
+
+#[tokio::test]
+async fn list_work_modes_returns_modes() {
+    let server = MockServer::start().await;
+
+    // Mount v2 device list with work_mode capability.
+    Mock::given(method("GET"))
+        .and(path("/router/api/v1/user/devices"))
+        .and(header("Govee-API-Key", "test-key"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(V2_WORK_MODE_DEVICES_RESPONSE, "application/json"),
+        )
+        .mount(&server)
+        .await;
+
+    // Mount v1 device list (needed for list_devices to succeed).
+    Mock::given(method("GET"))
+        .and(path("/v1/devices"))
+        .and(header("Govee-API-Key", "test-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(HAPPY_RESPONSE, "application/json"))
+        .mount(&server)
+        .await;
+
+    let backend = full_backend_for(&server, "test-key");
+    backend.list_devices().await.unwrap();
+
+    let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+    let modes = backend.list_work_modes(&id).await.unwrap();
+
+    assert_eq!(modes.len(), 2);
+    assert_eq!(modes[0].id, 1);
+    assert_eq!(modes[0].name, "Music");
+    assert!(modes[0].sub_modes.is_empty());
+    assert_eq!(modes[1].id, 2);
+    assert_eq!(modes[1].name, "Scene");
+    assert!(modes[1].sub_modes.is_empty());
+}
+
+#[tokio::test]
+async fn list_work_modes_empty_when_no_cap() {
+    let server = MockServer::start().await;
+
+    // Mount v2 device list with no work_mode capability.
+    Mock::given(method("GET"))
+        .and(path("/router/api/v1/user/devices"))
+        .and(header("Govee-API-Key", "test-key"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(V2_DEVICES_RESPONSE, "application/json"),
+        )
+        .mount(&server)
+        .await;
+
+    // Mount v1 device list.
+    Mock::given(method("GET"))
+        .and(path("/v1/devices"))
+        .and(header("Govee-API-Key", "test-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(HAPPY_RESPONSE, "application/json"))
+        .mount(&server)
+        .await;
+
+    let backend = full_backend_for(&server, "test-key");
+    backend.list_devices().await.unwrap();
+
+    let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+    let modes = backend.list_work_modes(&id).await.unwrap();
+    assert!(modes.is_empty());
+}
+
+#[tokio::test]
+async fn set_work_mode_sends_correct_payload() {
+    let server = MockServer::start().await;
+    let (backend, id) = setup_v2_control(&server).await;
+
+    Mock::given(method("POST"))
+        .and(path("/router/api/v1/device/control"))
+        .and(header("Govee-API-Key", "test-key"))
+        .and(HasRequestId)
+        .and(body_partial_json(serde_json::json!({
+            "payload": {
+                "sku": "H6076",
+                "device": "AA:BB:CC:DD:EE:FF",
+                "capability": {
+                    "type": "devices.capabilities.work_mode",
+                    "instance": "workMode",
+                    "value": { "workMode": 1, "modeValue": 3 }
+                }
+            }
+        })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(NEW_API_CONTROL_SUCCESS, "application/json"),
+        )
+        .mount(&server)
+        .await;
+
+    backend.set_work_mode(&id, 1, Some(3)).await.unwrap();
+}

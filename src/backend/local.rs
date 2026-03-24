@@ -14,7 +14,7 @@ use tracing::instrument;
 
 use crate::backend::GoveeBackend;
 use crate::error::{GoveeError, Result};
-use crate::types::{BackendType, Color, Device, DeviceId, DeviceState};
+use crate::types::{BackendType, Color, Device, DeviceId, DeviceState, WorkMode};
 
 /// Helper to create a `GoveeError::Protocol` with a custom message.
 fn protocol_error(msg: &str) -> GoveeError {
@@ -606,6 +606,21 @@ impl GoveeBackend for LocalBackend {
             }
         });
         self.send_command(id, payload).await
+    }
+
+    async fn list_work_modes(&self, _id: &DeviceId) -> Result<Vec<WorkMode>> {
+        Ok(vec![])
+    }
+
+    async fn set_work_mode(
+        &self,
+        _id: &DeviceId,
+        _work_mode: u32,
+        _mode_value: Option<u32>,
+    ) -> Result<()> {
+        Err(GoveeError::NotImplemented(
+            "set_work_mode is not supported on the local backend".into(),
+        ))
     }
 
     fn backend_type(&self) -> BackendType {

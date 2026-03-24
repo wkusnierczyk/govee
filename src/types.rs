@@ -189,6 +189,21 @@ impl fmt::Display for Color {
     }
 }
 
+/// A sub-mode available within a work mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubMode {
+    pub id: u32,
+    pub name: String,
+}
+
+/// A work mode available on a device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkMode {
+    pub id: u32,
+    pub name: String,
+    pub sub_modes: Vec<SubMode>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

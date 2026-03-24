@@ -9,7 +9,7 @@ use tracing::{debug, instrument, warn};
 use super::GoveeBackend;
 use crate::capability::{Capability, CapabilityValue};
 use crate::error::{GoveeError, Result};
-use crate::types::{BackendType, Color, Device, DeviceId, DeviceState};
+use crate::types::{BackendType, Color, Device, DeviceId, DeviceState, WorkMode};
 
 /// Default base URL for the Govee cloud API.
 const DEFAULT_BASE_URL: &str = "https://developer-api.govee.com";
@@ -526,6 +526,14 @@ impl CloudBackend {
                 "colorTemperatureK",
                 serde_json::json!(v),
             ),
+            CapabilityValue::WorkMode {
+                work_mode,
+                mode_value,
+            } => (
+                "devices.capabilities.work_mode",
+                "workMode",
+                serde_json::json!({ "workMode": work_mode, "modeValue": mode_value }),
+            ),
             other => {
                 return Err(GoveeError::NotImplemented(format!(
                     "control_v2 does not support {other:?}"
@@ -765,6 +773,31 @@ struct V1ControlResponse {
     message: String,
 }
 
+/// Parse work modes from a capability's parameters.
+///
+/// Extracts `EnumOption` entries from `CapabilityParameters::Enum { options }`.
+/// Each option's integer `value` becomes the work mode `id`; non-integer values
+/// are silently skipped. Sub-modes are not available from this structure.
+fn parse_work_modes(params: &crate::capability::CapabilityParameters) -> Result<Vec<WorkMode>> {
+    use crate::capability::CapabilityParameters;
+    let options = match params {
+        CapabilityParameters::Enum { options } => options,
+        _ => return Ok(vec![]),
+    };
+    let modes = options
+        .iter()
+        .filter_map(|opt| {
+            let id = opt.value.as_u64().map(|v| v as u32)?;
+            Some(WorkMode {
+                id,
+                name: opt.name.clone(),
+                sub_modes: vec![],
+            })
+        })
+        .collect();
+    Ok(modes)
+}
+
 /// Parse the `Retry-After` header value as seconds.
 fn parse_retry_after(response: &reqwest::Response) -> u64 {
     response
@@ -978,6 +1011,39 @@ impl GoveeBackend for CloudBackend {
             }
             Err(e) => Err(e),
         }
+    }
+
+    #[instrument(skip(self), fields(backend = "cloud", device = %id))]
+    async fn list_work_modes(&self, id: &DeviceId) -> Result<Vec<WorkMode>> {
+        let caps = match self.get_capabilities(id) {
+            Some(c) => c,
+            None => return Ok(vec![]),
+        };
+        let work_cap = caps
+            .iter()
+            .find(|c| c.type_ == "devices.capabilities.work_mode");
+        let work_cap = match work_cap {
+            Some(c) => c,
+            None => return Ok(vec![]),
+        };
+        parse_work_modes(&work_cap.parameters)
+    }
+
+    #[instrument(skip(self), fields(backend = "cloud", device = %id))]
+    async fn set_work_mode(
+        &self,
+        id: &DeviceId,
+        work_mode: u32,
+        mode_value: Option<u32>,
+    ) -> Result<()> {
+        self.control_v2(
+            id,
+            CapabilityValue::WorkMode {
+                work_mode,
+                mode_value,
+            },
+        )
+        .await
     }
 
     fn backend_type(&self) -> BackendType {

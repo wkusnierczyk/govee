@@ -10,3 +10,4 @@ pub use capability::{
     Capability, CapabilityParameters, CapabilityState, CapabilityValue, DynamicSceneValue,
     EnumOption, IntRange, StateValue, StructField,
 };
+pub use types::{SubMode, WorkMode};
