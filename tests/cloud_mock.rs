@@ -1880,6 +1880,17 @@ async fn list_diy_scenes_returns_scenes() {
 }
 
 #[tokio::test]
+async fn list_diy_scenes_skips_when_capabilities_not_cached() {
+    // When get_capabilities returns None (no list_devices called yet), return empty vec.
+    let server = MockServer::start().await;
+    let backend = combined_backend_for(&server, "test-key");
+    // Do NOT call list_devices — capabilities cache is empty.
+    let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+    let scenes = backend.list_diy_scenes(&id).await.unwrap();
+    assert!(scenes.is_empty());
+}
+
+#[tokio::test]
 async fn list_diy_scenes_skips_when_no_dynamic_scene_cap() {
     let server = MockServer::start().await;
     let backend = combined_backend_for(&server, "test-key");
@@ -2127,4 +2138,23 @@ async fn set_work_mode_sends_correct_payload() {
         .await;
 
     backend.set_work_mode(&id, 1, Some(3)).await.unwrap();
+}
+
+#[test]
+fn cloud_backend_type_is_cloud() {
+    let server_uri = "https://developer-api.govee.com";
+    // Use the known public base — we just need a constructed backend, no server needed.
+    let backend = CloudBackend::new("test-key".to_string(), Some(server_uri.to_string()), None)
+        .unwrap()
+        .with_new_api_base(server_uri)
+        .unwrap();
+    assert_eq!(backend.backend_type(), govee::types::BackendType::Cloud);
+}
+
+#[test]
+fn with_new_api_base_rejects_http_non_loopback() {
+    let result = CloudBackend::new("test-key".to_string(), None, None)
+        .unwrap()
+        .with_new_api_base("http://example.com");
+    assert!(result.is_err(), "expected error for HTTP non-loopback URL");
 }

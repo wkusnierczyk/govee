@@ -648,6 +648,221 @@ async fn udp_loopback_set_color_temp() {
 }
 
 #[tokio::test]
+async fn local_backend_rejects_invalid_discovery_interval() {
+    // discovery_interval_secs < MIN (5) → InvalidConfig before any socket bind.
+    let result = LocalBackend::new(Duration::from_millis(100), 4).await;
+    assert!(
+        matches!(result, Err(GoveeError::InvalidConfig(_))),
+        "expected InvalidConfig, got: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn local_backend_debug_format() {
+    let _lock = PORT_LOCK.lock().await;
+    let backend = LocalBackend::new(Duration::from_millis(100), 10).await;
+    if let Err(GoveeError::BackendUnavailable(_)) = &backend {
+        eprintln!("skipping local_backend_debug_format: port 4002 in use");
+        return;
+    }
+    let backend = backend.unwrap();
+    let debug_str = format!("{backend:?}");
+    assert!(debug_str.contains("LocalBackend"), "debug: {debug_str}");
+}
+
+#[tokio::test]
+async fn local_backend_ignores_unknown_udp_command() {
+    let _lock = PORT_LOCK.lock().await;
+    let backend = LocalBackend::new(Duration::from_millis(100), 10).await;
+    if let Err(GoveeError::BackendUnavailable(_)) = &backend {
+        eprintln!("skipping local_backend_ignores_unknown_udp_command: port 4002 in use");
+        return;
+    }
+    let backend = backend.unwrap();
+    let sender = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0u16))
+        .await
+        .unwrap();
+    let unknown_cmd = serde_json::json!({
+        "msg": { "cmd": "unknownLanCommand", "data": {} }
+    });
+    sender
+        .send_to(
+            &serde_json::to_vec(&unknown_cmd).unwrap(),
+            (Ipv4Addr::LOCALHOST, 4002u16),
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // No crash — device list stays empty.
+    let devices = backend.list_devices().await.unwrap();
+    assert!(devices.is_empty());
+}
+
+#[tokio::test]
+async fn udp_loopback_state_without_color_field() {
+    let _lock = PORT_LOCK.lock().await;
+    let backend = LocalBackend::new(Duration::from_millis(500), 60).await;
+    if let Err(GoveeError::BackendUnavailable(_)) = &backend {
+        eprintln!("skipping udp_loopback_state_without_color_field: port 4002 in use");
+        return;
+    }
+    let backend = backend.expect("LocalBackend should bind");
+    let sender = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0u16))
+        .await
+        .unwrap();
+    let scan_response = serde_json::json!({
+        "msg": {
+            "cmd": "scan",
+            "data": {
+                "ip": "127.0.0.1",
+                "device": "AA:BB:CC:DD:EE:FF:00:12",
+                "sku": "H6076"
+            }
+        }
+    });
+    sender
+        .send_to(
+            &serde_json::to_vec(&scan_response).unwrap(),
+            (Ipv4Addr::LOCALHOST, 4002u16),
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Responder that sends a devStatus without the `color` field.
+    let responder = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 4003u16)).await;
+    if responder.is_err() {
+        eprintln!("skipping udp_loopback_state_without_color_field: port 4003 in use");
+        return;
+    }
+    let responder = responder.unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 4096];
+        if let Ok(_) = responder.recv_from(&mut buf).await {
+            let status_response = serde_json::json!({
+                "msg": {
+                    "cmd": "devStatus",
+                    "data": { "onOff": 0, "brightness": 50 }
+                }
+            });
+            let reply_socket = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0u16))
+                .await
+                .unwrap();
+            reply_socket
+                .send_to(
+                    &serde_json::to_vec(&status_response).unwrap(),
+                    (Ipv4Addr::LOCALHOST, 4002u16),
+                )
+                .await
+                .unwrap();
+        }
+    });
+
+    let id = govee::types::DeviceId::new("AA:BB:CC:DD:EE:FF:00:12").unwrap();
+    let state = backend
+        .get_state(&id)
+        .await
+        .expect("get_state should succeed");
+    // Color should default to (0, 0, 0) when absent from response.
+    assert_eq!(state.color, govee::types::Color::new(0, 0, 0));
+}
+
+#[tokio::test]
+async fn local_backend_list_scenes_returns_not_implemented() {
+    let _lock = PORT_LOCK.lock().await;
+    let backend = LocalBackend::new(Duration::from_millis(100), 10).await;
+    if let Err(GoveeError::BackendUnavailable(_)) = &backend {
+        eprintln!("skipping local_backend_list_scenes_returns_not_implemented: port 4002 in use");
+        return;
+    }
+    let backend = backend.expect("LocalBackend should bind");
+    let id = govee::types::DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+    let result = backend.list_scenes(&id).await;
+    assert!(matches!(result.unwrap_err(), GoveeError::NotImplemented(_)));
+}
+
+#[tokio::test]
+async fn local_backend_set_scene_returns_not_implemented() {
+    let _lock = PORT_LOCK.lock().await;
+    let backend = LocalBackend::new(Duration::from_millis(100), 10).await;
+    if let Err(GoveeError::BackendUnavailable(_)) = &backend {
+        eprintln!("skipping local_backend_set_scene_returns_not_implemented: port 4002 in use");
+        return;
+    }
+    let backend = backend.expect("LocalBackend should bind");
+    let id = govee::types::DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+    let scene = govee::LightScene {
+        id: 1,
+        name: "Sunrise".to_string(),
+        param_id: 100,
+    };
+    let result = backend.set_scene(&id, &scene).await;
+    assert!(matches!(result.unwrap_err(), GoveeError::NotImplemented(_)));
+}
+
+#[tokio::test]
+async fn local_backend_set_segment_color_returns_not_implemented() {
+    let _lock = PORT_LOCK.lock().await;
+    let backend = LocalBackend::new(Duration::from_millis(100), 10).await;
+    if let Err(GoveeError::BackendUnavailable(_)) = &backend {
+        eprintln!(
+            "skipping local_backend_set_segment_color_returns_not_implemented: port 4002 in use"
+        );
+        return;
+    }
+    let backend = backend.expect("LocalBackend should bind");
+    let id = govee::types::DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+    let result = backend
+        .set_segment_color(&id, vec![0, 1], govee::types::Color::new(255, 0, 0))
+        .await;
+    assert!(matches!(result.unwrap_err(), GoveeError::NotImplemented(_)));
+}
+
+#[tokio::test]
+async fn local_backend_set_segment_brightness_returns_not_implemented() {
+    let _lock = PORT_LOCK.lock().await;
+    let backend = LocalBackend::new(Duration::from_millis(100), 10).await;
+    if let Err(GoveeError::BackendUnavailable(_)) = &backend {
+        eprintln!(
+            "skipping local_backend_set_segment_brightness_returns_not_implemented: port 4002 in use"
+        );
+        return;
+    }
+    let backend = backend.expect("LocalBackend should bind");
+    let id = govee::types::DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+    let result = backend.set_segment_brightness(&id, vec![0, 1], 50).await;
+    assert!(matches!(result.unwrap_err(), GoveeError::NotImplemented(_)));
+}
+
+#[tokio::test]
+async fn local_backend_list_work_modes_returns_empty() {
+    let _lock = PORT_LOCK.lock().await;
+    let backend = LocalBackend::new(Duration::from_millis(100), 10).await;
+    if let Err(GoveeError::BackendUnavailable(_)) = &backend {
+        eprintln!("skipping local_backend_list_work_modes_returns_empty: port 4002 in use");
+        return;
+    }
+    let backend = backend.expect("LocalBackend should bind");
+    let id = govee::types::DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+    let modes = backend.list_work_modes(&id).await.unwrap();
+    assert!(modes.is_empty());
+}
+
+#[tokio::test]
+async fn local_backend_set_work_mode_returns_not_implemented() {
+    let _lock = PORT_LOCK.lock().await;
+    let backend = LocalBackend::new(Duration::from_millis(100), 10).await;
+    if let Err(GoveeError::BackendUnavailable(_)) = &backend {
+        eprintln!("skipping local_backend_set_work_mode_returns_not_implemented: port 4002 in use");
+        return;
+    }
+    let backend = backend.expect("LocalBackend should bind");
+    let id = govee::types::DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+    let result = backend.set_work_mode(&id, 1, Some(2)).await;
+    assert!(matches!(result.unwrap_err(), GoveeError::NotImplemented(_)));
+}
+
+#[tokio::test]
 async fn local_backend_list_diy_scenes_returns_empty() {
     let _lock = PORT_LOCK.lock().await;
     let backend = LocalBackend::new(Duration::from_millis(100), 10).await;

@@ -166,6 +166,57 @@ mod tests {
         assert!(mock.set_scene(&id, &scene).await.is_ok());
     }
 
+    #[tokio::test]
+    async fn mock_list_diy_scenes_returns_empty() {
+        let mock = MockBackend::new();
+        let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+        let scenes = mock.list_diy_scenes(&id).await.unwrap();
+        assert!(scenes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mock_set_diy_scene_succeeds() {
+        let mock = MockBackend::new();
+        let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+        let scene = crate::types::DiyScene {
+            id: 42,
+            name: "Custom".into(),
+        };
+        assert!(mock.set_diy_scene(&id, &scene).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn mock_set_segment_operations_succeed() {
+        let mock = MockBackend::new();
+        let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+        assert!(
+            mock.set_segment_color(&id, vec![0, 1], Color::new(255, 0, 0))
+                .await
+                .is_ok()
+        );
+        assert!(
+            mock.set_segment_brightness(&id, vec![0, 1], 80)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_list_work_modes_returns_empty() {
+        let mock = MockBackend::new();
+        let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+        let modes = mock.list_work_modes(&id).await.unwrap();
+        assert!(modes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mock_set_work_mode_succeeds() {
+        let mock = MockBackend::new();
+        let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+        assert!(mock.set_work_mode(&id, 1, Some(3)).await.is_ok());
+        assert!(mock.set_work_mode(&id, 2, None).await.is_ok());
+    }
+
     #[test]
     fn mock_backend_type_default_cloud() {
         let mock = MockBackend::new();
