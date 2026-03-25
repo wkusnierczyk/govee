@@ -678,7 +678,7 @@ async fn local_backend_ignores_unknown_udp_command() {
         eprintln!("skipping local_backend_ignores_unknown_udp_command: port 4002 in use");
         return;
     }
-    let backend = backend.unwrap();
+    let _backend = backend.unwrap();
     let sender = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0u16))
         .await
         .unwrap();
