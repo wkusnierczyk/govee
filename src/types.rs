@@ -170,10 +170,13 @@ impl<'de> Deserialize<'de> for DeviceState {
 }
 
 /// A user-created DIY scene stored on the Govee cloud.
+///
+/// `name` is `None` when the Govee API omits the scene name (observed for
+/// some DIY scene entries).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiyScene {
     pub id: u32,
-    pub name: String,
+    pub name: Option<String>,
 }
 
 /// RGB color value (sRGB, each component 0–255).

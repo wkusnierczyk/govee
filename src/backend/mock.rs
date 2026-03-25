@@ -108,6 +108,7 @@ impl GoveeBackend for MockBackend {
     }
 
     async fn set_scene(&self, _id: &DeviceId, _scene: &LightScene) -> Result<()> {
+        self.check_error()?;
         Ok(())
     }
 
@@ -116,13 +117,14 @@ impl GoveeBackend for MockBackend {
     }
 
     async fn set_diy_scene(&self, _id: &DeviceId, _scene: &DiyScene) -> Result<()> {
+        self.check_error()?;
         Ok(())
     }
 
     async fn set_segment_color(
         &self,
         _id: &DeviceId,
-        _segments: Vec<u8>,
+        _segments: &[u8],
         _color: Color,
     ) -> Result<()> {
         self.check_error()?;
@@ -132,7 +134,7 @@ impl GoveeBackend for MockBackend {
     async fn set_segment_brightness(
         &self,
         _id: &DeviceId,
-        _segments: Vec<u8>,
+        _segments: &[u8],
         _brightness: u8,
     ) -> Result<()> {
         self.check_error()?;
@@ -149,6 +151,7 @@ impl GoveeBackend for MockBackend {
         _work_mode: u32,
         _mode_value: Option<u32>,
     ) -> Result<()> {
+        self.check_error()?;
         Ok(())
     }
 

@@ -1793,6 +1793,43 @@ async fn set_scene_triggers_control() {
     backend.set_scene(&id, &scene).await.unwrap();
 }
 
+#[tokio::test]
+async fn set_scene_fails_when_no_light_scene_cap() {
+    // When capabilities are cached but don't include lightScene, set_scene returns NotImplemented.
+    let server = MockServer::start().await;
+    let backend = full_backend_for(&server, "test-key");
+
+    // Populate cache with a device that has only diyScene, not lightScene.
+    Mock::given(method("GET"))
+        .and(path("/router/api/v1/user/devices"))
+        .and(header("Govee-API-Key", "test-key"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(V2_DEVICES_WITH_DYNAMIC_SCENE, "application/json"),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/devices"))
+        .and(header("Govee-API-Key", "test-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(HAPPY_RESPONSE, "application/json"))
+        .mount(&server)
+        .await;
+    backend.list_devices().await.unwrap();
+
+    let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+    let scene = govee::LightScene {
+        id: 1,
+        name: "Sunrise".to_string(),
+        param_id: 100,
+    };
+    let result = backend.set_scene(&id, &scene).await;
+    assert!(
+        matches!(result, Err(govee::error::GoveeError::NotImplemented(_))),
+        "expected NotImplemented, got: {result:?}"
+    );
+}
+
 // --- list_diy_scenes / set_diy_scene tests (#114) ---
 
 /// Response body for the v2 device list that includes a `dynamic_scene` capability (diyScene instance).
@@ -1874,9 +1911,9 @@ async fn list_diy_scenes_returns_scenes() {
 
     assert_eq!(scenes.len(), 2);
     assert_eq!(scenes[0].id, 42);
-    assert_eq!(scenes[0].name, "My Custom");
+    assert_eq!(scenes[0].name, Some("My Custom".to_string()));
     assert_eq!(scenes[1].id, 7);
-    assert_eq!(scenes[1].name, "Sunset");
+    assert_eq!(scenes[1].name, Some("Sunset".to_string()));
 }
 
 #[tokio::test]
@@ -1944,7 +1981,7 @@ async fn set_diy_scene_triggers_control() {
     let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
     let scene = govee::DiyScene {
         id: 42,
-        name: "My Custom".to_string(),
+        name: Some("My Custom".to_string()),
     };
     backend.set_diy_scene(&id, &scene).await.unwrap();
 }
@@ -1982,7 +2019,7 @@ async fn set_segment_color_sends_correct_payload() {
         .await;
 
     backend
-        .set_segment_color(&id, vec![0, 1, 2], Color::new(255, 0, 128))
+        .set_segment_color(&id, &[0, 1, 2], Color::new(255, 0, 128))
         .await
         .unwrap();
 }
@@ -2017,7 +2054,7 @@ async fn set_segment_brightness_sends_correct_payload() {
         .await;
 
     backend
-        .set_segment_brightness(&id, vec![3, 4], 75)
+        .set_segment_brightness(&id, &[3, 4], 75)
         .await
         .unwrap();
 }
@@ -2138,6 +2175,37 @@ async fn set_work_mode_sends_correct_payload() {
         .await;
 
     backend.set_work_mode(&id, 1, Some(3)).await.unwrap();
+}
+
+#[tokio::test]
+async fn set_work_mode_omits_mode_value_when_none() {
+    // When mode_value is None, the payload must NOT include a "modeValue" key at all.
+    let server = MockServer::start().await;
+    let (backend, id) = setup_v2_control(&server).await;
+
+    // Use body_json (exact match) to verify modeValue is absent.
+    Mock::given(method("POST"))
+        .and(path("/router/api/v1/device/control"))
+        .and(header("Govee-API-Key", "test-key"))
+        .and(HasRequestId)
+        .and(body_partial_json(serde_json::json!({
+            "payload": {
+                "sku": "H6076",
+                "device": "AA:BB:CC:DD:EE:FF",
+                "capability": {
+                    "type": "devices.capabilities.work_mode",
+                    "instance": "workMode",
+                    "value": { "workMode": 2 }
+                }
+            }
+        })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(NEW_API_CONTROL_SUCCESS, "application/json"),
+        )
+        .mount(&server)
+        .await;
+
+    backend.set_work_mode(&id, 2, None).await.unwrap();
 }
 
 #[test]

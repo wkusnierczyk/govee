@@ -811,7 +811,7 @@ async fn local_backend_set_segment_color_returns_not_implemented() {
     let backend = backend.expect("LocalBackend should bind");
     let id = govee::types::DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
     let result = backend
-        .set_segment_color(&id, vec![0, 1], govee::types::Color::new(255, 0, 0))
+        .set_segment_color(&id, &[0, 1], govee::types::Color::new(255, 0, 0))
         .await;
     assert!(matches!(result.unwrap_err(), GoveeError::NotImplemented(_)));
 }
@@ -828,22 +828,24 @@ async fn local_backend_set_segment_brightness_returns_not_implemented() {
     }
     let backend = backend.expect("LocalBackend should bind");
     let id = govee::types::DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
-    let result = backend.set_segment_brightness(&id, vec![0, 1], 50).await;
+    let result = backend.set_segment_brightness(&id, &[0, 1], 50).await;
     assert!(matches!(result.unwrap_err(), GoveeError::NotImplemented(_)));
 }
 
 #[tokio::test]
-async fn local_backend_list_work_modes_returns_empty() {
+async fn local_backend_list_work_modes_returns_not_implemented() {
     let _lock = PORT_LOCK.lock().await;
     let backend = LocalBackend::new(Duration::from_millis(100), 10).await;
     if let Err(GoveeError::BackendUnavailable(_)) = &backend {
-        eprintln!("skipping local_backend_list_work_modes_returns_empty: port 4002 in use");
+        eprintln!(
+            "skipping local_backend_list_work_modes_returns_not_implemented: port 4002 in use"
+        );
         return;
     }
     let backend = backend.expect("LocalBackend should bind");
     let id = govee::types::DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
-    let modes = backend.list_work_modes(&id).await.unwrap();
-    assert!(modes.is_empty());
+    let result = backend.list_work_modes(&id).await;
+    assert!(matches!(result.unwrap_err(), GoveeError::NotImplemented(_)));
 }
 
 #[tokio::test]
@@ -861,17 +863,19 @@ async fn local_backend_set_work_mode_returns_not_implemented() {
 }
 
 #[tokio::test]
-async fn local_backend_list_diy_scenes_returns_empty() {
+async fn local_backend_list_diy_scenes_returns_not_implemented() {
     let _lock = PORT_LOCK.lock().await;
     let backend = LocalBackend::new(Duration::from_millis(100), 10).await;
     if let Err(GoveeError::BackendUnavailable(_)) = &backend {
-        eprintln!("skipping local_backend_list_diy_scenes_returns_empty: port 4002 in use");
+        eprintln!(
+            "skipping local_backend_list_diy_scenes_returns_not_implemented: port 4002 in use"
+        );
         return;
     }
     let backend = backend.expect("LocalBackend should bind");
     let id = govee::types::DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
-    let scenes = backend.list_diy_scenes(&id).await.unwrap();
-    assert!(scenes.is_empty());
+    let result = backend.list_diy_scenes(&id).await;
+    assert!(matches!(result.unwrap_err(), GoveeError::NotImplemented(_)));
 }
 
 #[tokio::test]
@@ -886,7 +890,7 @@ async fn local_backend_set_diy_scene_returns_not_implemented() {
     let id = govee::types::DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
     let scene = govee::DiyScene {
         id: 42,
-        name: "Test".to_string(),
+        name: Some("Test".to_string()),
     };
     let result = backend.set_diy_scene(&id, &scene).await;
     assert!(matches!(result.unwrap_err(), GoveeError::NotImplemented(_)));

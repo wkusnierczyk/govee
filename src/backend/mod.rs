@@ -48,14 +48,13 @@ pub trait GoveeBackend: Send + Sync {
     async fn set_diy_scene(&self, id: &DeviceId, scene: &DiyScene) -> Result<()>;
 
     /// Set the color of specific segments (0-based indices).
-    async fn set_segment_color(&self, id: &DeviceId, segments: Vec<u8>, color: Color)
-    -> Result<()>;
+    async fn set_segment_color(&self, id: &DeviceId, segments: &[u8], color: Color) -> Result<()>;
 
     /// Set the brightness of specific segments (0-based indices).
     async fn set_segment_brightness(
         &self,
         id: &DeviceId,
-        segments: Vec<u8>,
+        segments: &[u8],
         brightness: u8,
     ) -> Result<()>;
 
@@ -180,7 +179,7 @@ mod tests {
         let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
         let scene = crate::types::DiyScene {
             id: 42,
-            name: "Custom".into(),
+            name: Some("Custom".into()),
         };
         assert!(mock.set_diy_scene(&id, &scene).await.is_ok());
     }
@@ -190,15 +189,11 @@ mod tests {
         let mock = MockBackend::new();
         let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
         assert!(
-            mock.set_segment_color(&id, vec![0, 1], Color::new(255, 0, 0))
+            mock.set_segment_color(&id, &[0, 1], Color::new(255, 0, 0))
                 .await
                 .is_ok()
         );
-        assert!(
-            mock.set_segment_brightness(&id, vec![0, 1], 80)
-                .await
-                .is_ok()
-        );
+        assert!(mock.set_segment_brightness(&id, &[0, 1], 80).await.is_ok());
     }
 
     #[tokio::test]

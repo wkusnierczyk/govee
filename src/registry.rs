@@ -2708,7 +2708,7 @@ mod tests {
             async fn set_segment_color(
                 &self,
                 _id: &DeviceId,
-                _segments: Vec<u8>,
+                _segments: &[u8],
                 _color: Color,
             ) -> crate::error::Result<()> {
                 Ok(())
@@ -2716,7 +2716,7 @@ mod tests {
             async fn set_segment_brightness(
                 &self,
                 _id: &DeviceId,
-                _segments: Vec<u8>,
+                _segments: &[u8],
                 _brightness: u8,
             ) -> crate::error::Result<()> {
                 Ok(())
@@ -3119,7 +3119,7 @@ mod tests {
             async fn set_segment_color(
                 &self,
                 _id: &DeviceId,
-                _segments: Vec<u8>,
+                _segments: &[u8],
                 _color: Color,
             ) -> crate::error::Result<()> {
                 Ok(())
@@ -3127,7 +3127,7 @@ mod tests {
             async fn set_segment_brightness(
                 &self,
                 _id: &DeviceId,
-                _segments: Vec<u8>,
+                _segments: &[u8],
                 _brightness: u8,
             ) -> crate::error::Result<()> {
                 Ok(())

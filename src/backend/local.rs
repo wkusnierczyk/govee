@@ -623,7 +623,9 @@ impl GoveeBackend for LocalBackend {
     }
 
     async fn list_diy_scenes(&self, _id: &DeviceId) -> Result<Vec<DiyScene>> {
-        Ok(vec![])
+        Err(GoveeError::NotImplemented(
+            "list_diy_scenes is not supported by the local backend".into(),
+        ))
     }
 
     async fn set_diy_scene(&self, _id: &DeviceId, _scene: &DiyScene) -> Result<()> {
@@ -635,7 +637,7 @@ impl GoveeBackend for LocalBackend {
     async fn set_segment_color(
         &self,
         _id: &DeviceId,
-        _segments: Vec<u8>,
+        _segments: &[u8],
         _color: Color,
     ) -> Result<()> {
         Err(GoveeError::NotImplemented(
@@ -646,7 +648,7 @@ impl GoveeBackend for LocalBackend {
     async fn set_segment_brightness(
         &self,
         _id: &DeviceId,
-        _segments: Vec<u8>,
+        _segments: &[u8],
         _brightness: u8,
     ) -> Result<()> {
         Err(GoveeError::NotImplemented(
@@ -655,7 +657,9 @@ impl GoveeBackend for LocalBackend {
     }
 
     async fn list_work_modes(&self, _id: &DeviceId) -> Result<Vec<WorkMode>> {
-        Ok(vec![])
+        Err(GoveeError::NotImplemented(
+            "list_work_modes is not supported by the local backend".into(),
+        ))
     }
 
     async fn set_work_mode(
