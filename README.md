@@ -12,17 +12,17 @@ Designed as a foundation for higher-level consumers — it has no opinion about 
 
 ## Status
 
-**WIP** — in active development, not ready for production use. See the [development plan](#development-plan) for progress.
+Development complete. See the [development plan](#development-plan) for completed milestones.
 
 ## Ecosystem
 
-| Crate | Description | Repo |
-|-------|-------------|------|
-| **govee** | Core library — backends, registry, scenes | [wkusnierczyk/govee](https://github.com/wkusnierczyk/govee) |
-| **govee-workflow** | Workflow engine — timed command sequences, choreography | [wkusnierczyk/govee-workflow](https://github.com/wkusnierczyk/govee-workflow) |
-| **govee-cli** | Command-line interface | [wkusnierczyk/govee-cli](https://github.com/wkusnierczyk/govee-cli) |
-| **govee-server** | HTTP/WebSocket server for remote control | [wkusnierczyk/govee-server](https://github.com/wkusnierczyk/govee-server) |
-| **govee-mcp** | Model Context Protocol server for AI agents | [wkusnierczyk/govee-mcp](https://github.com/wkusnierczyk/govee-mcp) |
+| Crate | Description | Repo | Status |
+|-------|-------------|------|--|
+| **govee** | Core library — backends, registry, scenes | [wkusnierczyk/govee](https://github.com/wkusnierczyk/govee) | Done |
+| **govee-workflow** | Workflow engine — timed command sequences, choreography | [wkusnierczyk/govee-workflow](https://github.com/wkusnierczyk/govee-workflow) | Pending |
+| **govee-cli** | Command-line interface | [wkusnierczyk/govee-cli](https://github.com/wkusnierczyk/govee-cli) | Pending |
+| **govee-server** | HTTP/WebSocket server for remote control | [wkusnierczyk/govee-server](https://github.com/wkusnierczyk/govee-server) | Pending |
+| **govee-mcp** | Model Context Protocol server for AI agents | [wkusnierczyk/govee-mcp](https://github.com/wkusnierczyk/govee-mcp) | Pending |
 
 ## Getting started
 
