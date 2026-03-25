@@ -14,7 +14,9 @@ use tracing::instrument;
 
 use crate::backend::GoveeBackend;
 use crate::error::{GoveeError, Result};
-use crate::types::{BackendType, Color, Device, DeviceId, DeviceState};
+use crate::types::{
+    BackendType, Color, Device, DeviceId, DeviceState, DiyScene, LightScene, WorkMode,
+};
 
 /// Helper to create a `GoveeError::Protocol` with a custom message.
 fn protocol_error(msg: &str) -> GoveeError {
@@ -606,6 +608,69 @@ impl GoveeBackend for LocalBackend {
             }
         });
         self.send_command(id, payload).await
+    }
+
+    async fn list_scenes(&self, _id: &DeviceId) -> Result<Vec<LightScene>> {
+        Err(GoveeError::NotImplemented(
+            "list_scenes is not supported by the local backend".into(),
+        ))
+    }
+
+    async fn set_scene(&self, _id: &DeviceId, _scene: &LightScene) -> Result<()> {
+        Err(GoveeError::NotImplemented(
+            "set_scene is not supported by the local backend".into(),
+        ))
+    }
+
+    async fn list_diy_scenes(&self, _id: &DeviceId) -> Result<Vec<DiyScene>> {
+        Err(GoveeError::NotImplemented(
+            "list_diy_scenes is not supported by the local backend".into(),
+        ))
+    }
+
+    async fn set_diy_scene(&self, _id: &DeviceId, _scene: &DiyScene) -> Result<()> {
+        Err(GoveeError::NotImplemented(
+            "DIY scenes are not supported by the local backend".into(),
+        ))
+    }
+
+    async fn set_segment_color(
+        &self,
+        _id: &DeviceId,
+        _segments: &[u8],
+        _color: Color,
+    ) -> Result<()> {
+        Err(GoveeError::NotImplemented(
+            "set_segment_color is not supported by the local backend".into(),
+        ))
+    }
+
+    async fn set_segment_brightness(
+        &self,
+        _id: &DeviceId,
+        _segments: &[u8],
+        _brightness: u8,
+    ) -> Result<()> {
+        Err(GoveeError::NotImplemented(
+            "set_segment_brightness is not supported by the local backend".into(),
+        ))
+    }
+
+    async fn list_work_modes(&self, _id: &DeviceId) -> Result<Vec<WorkMode>> {
+        Err(GoveeError::NotImplemented(
+            "list_work_modes is not supported by the local backend".into(),
+        ))
+    }
+
+    async fn set_work_mode(
+        &self,
+        _id: &DeviceId,
+        _work_mode: u32,
+        _mode_value: Option<u32>,
+    ) -> Result<()> {
+        Err(GoveeError::NotImplemented(
+            "set_work_mode is not supported on the local backend".into(),
+        ))
     }
 
     fn backend_type(&self) -> BackendType {

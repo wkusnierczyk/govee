@@ -426,4 +426,11 @@ mod tests {
         assert_eq!(scene.brightness(), 50);
         assert_eq!(*scene.color(), SceneColor::Temp(3000));
     }
+
+    #[test]
+    fn scene_registry_default_equals_new() {
+        let default = SceneRegistry::default();
+        let new = SceneRegistry::new();
+        assert_eq!(default.scenes.len(), new.scenes.len());
+    }
 }

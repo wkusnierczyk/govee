@@ -75,6 +75,14 @@ pub struct Device {
     pub backend: BackendType,
 }
 
+/// A preset scene available on a device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LightScene {
+    pub id: u32,
+    pub name: String,
+    pub param_id: u32,
+}
+
 /// Which backend is active for a device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -161,6 +169,16 @@ impl<'de> Deserialize<'de> for DeviceState {
     }
 }
 
+/// A user-created DIY scene stored on the Govee cloud.
+///
+/// `name` is `None` when the Govee API omits the scene name (observed for
+/// some DIY scene entries).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiyScene {
+    pub id: u32,
+    pub name: Option<String>,
+}
+
 /// RGB color value (sRGB, each component 0–255).
 ///
 /// Components are bounded by `u8` — no additional validation needed.
@@ -187,6 +205,21 @@ impl fmt::Display for Color {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "#{:02X}{:02X}{:02X}", self.r, self.g, self.b)
     }
+}
+
+/// A sub-mode available within a work mode.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubMode {
+    pub id: u32,
+    pub name: String,
+}
+
+/// A work mode available on a device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkMode {
+    pub id: u32,
+    pub name: String,
+    pub sub_modes: Vec<SubMode>,
 }
 
 #[cfg(test)]

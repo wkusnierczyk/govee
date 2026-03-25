@@ -3,7 +3,9 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 
 use crate::error::{GoveeError, Result};
-use crate::types::{BackendType, Color, Device, DeviceId, DeviceState};
+use crate::types::{
+    BackendType, Color, Device, DeviceId, DeviceState, DiyScene, LightScene, WorkMode,
+};
 
 use super::GoveeBackend;
 
@@ -97,6 +99,58 @@ impl GoveeBackend for MockBackend {
     }
 
     async fn set_color_temp(&self, _id: &DeviceId, _kelvin: u32) -> Result<()> {
+        self.check_error()?;
+        Ok(())
+    }
+
+    async fn list_scenes(&self, _id: &DeviceId) -> Result<Vec<LightScene>> {
+        Ok(vec![])
+    }
+
+    async fn set_scene(&self, _id: &DeviceId, _scene: &LightScene) -> Result<()> {
+        self.check_error()?;
+        Ok(())
+    }
+
+    async fn list_diy_scenes(&self, _id: &DeviceId) -> Result<Vec<DiyScene>> {
+        Ok(vec![])
+    }
+
+    async fn set_diy_scene(&self, _id: &DeviceId, _scene: &DiyScene) -> Result<()> {
+        self.check_error()?;
+        Ok(())
+    }
+
+    async fn set_segment_color(
+        &self,
+        _id: &DeviceId,
+        _segments: &[u8],
+        _color: Color,
+    ) -> Result<()> {
+        self.check_error()?;
+        Ok(())
+    }
+
+    async fn set_segment_brightness(
+        &self,
+        _id: &DeviceId,
+        _segments: &[u8],
+        _brightness: u8,
+    ) -> Result<()> {
+        self.check_error()?;
+        Ok(())
+    }
+
+    async fn list_work_modes(&self, _id: &DeviceId) -> Result<Vec<WorkMode>> {
+        Ok(vec![])
+    }
+
+    async fn set_work_mode(
+        &self,
+        _id: &DeviceId,
+        _work_mode: u32,
+        _mode_value: Option<u32>,
+    ) -> Result<()> {
         self.check_error()?;
         Ok(())
     }

@@ -6,7 +6,9 @@ pub(crate) mod mock;
 use async_trait::async_trait;
 
 use crate::error::Result;
-use crate::types::{BackendType, Color, Device, DeviceId, DeviceState};
+use crate::types::{
+    BackendType, Color, Device, DeviceId, DeviceState, DiyScene, LightScene, WorkMode,
+};
 
 /// Unified interface for controlling Govee devices.
 ///
@@ -32,6 +34,40 @@ pub trait GoveeBackend: Send + Sync {
 
     /// Set color temperature in Kelvin.
     async fn set_color_temp(&self, id: &DeviceId, kelvin: u32) -> Result<()>;
+
+    /// List available preset scenes for a device.
+    async fn list_scenes(&self, id: &DeviceId) -> Result<Vec<LightScene>>;
+
+    /// Activate a preset scene by scene ID and param ID.
+    async fn set_scene(&self, id: &DeviceId, scene: &LightScene) -> Result<()>;
+
+    /// List available DIY scenes for a device.
+    async fn list_diy_scenes(&self, id: &DeviceId) -> Result<Vec<DiyScene>>;
+
+    /// Activate a DIY scene by its ID.
+    async fn set_diy_scene(&self, id: &DeviceId, scene: &DiyScene) -> Result<()>;
+
+    /// Set the color of specific segments (0-based indices).
+    async fn set_segment_color(&self, id: &DeviceId, segments: &[u8], color: Color) -> Result<()>;
+
+    /// Set the brightness of specific segments (0-based indices).
+    async fn set_segment_brightness(
+        &self,
+        id: &DeviceId,
+        segments: &[u8],
+        brightness: u8,
+    ) -> Result<()>;
+
+    /// List work modes available for a device (read from cached capabilities — no network call).
+    async fn list_work_modes(&self, id: &DeviceId) -> Result<Vec<WorkMode>>;
+
+    /// Set the active work mode (and optional sub-mode value).
+    async fn set_work_mode(
+        &self,
+        id: &DeviceId,
+        work_mode: u32,
+        mode_value: Option<u32>,
+    ) -> Result<()>;
 
     /// Which backend type this implementation represents.
     fn backend_type(&self) -> BackendType;
@@ -107,6 +143,73 @@ mod tests {
         assert!(mock.set_brightness(&id, 50).await.is_ok());
         assert!(mock.set_color(&id, Color::new(0, 255, 0)).await.is_ok());
         assert!(mock.set_color_temp(&id, 4000).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn mock_list_scenes_returns_empty() {
+        let mock = MockBackend::new();
+        let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+        let scenes = mock.list_scenes(&id).await.unwrap();
+        assert!(scenes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mock_set_scene_succeeds() {
+        let mock = MockBackend::new();
+        let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+        let scene = LightScene {
+            id: 1,
+            name: "Sunrise".into(),
+            param_id: 100,
+        };
+        assert!(mock.set_scene(&id, &scene).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn mock_list_diy_scenes_returns_empty() {
+        let mock = MockBackend::new();
+        let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+        let scenes = mock.list_diy_scenes(&id).await.unwrap();
+        assert!(scenes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mock_set_diy_scene_succeeds() {
+        let mock = MockBackend::new();
+        let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+        let scene = crate::types::DiyScene {
+            id: 42,
+            name: Some("Custom".into()),
+        };
+        assert!(mock.set_diy_scene(&id, &scene).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn mock_set_segment_operations_succeed() {
+        let mock = MockBackend::new();
+        let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+        assert!(
+            mock.set_segment_color(&id, &[0, 1], Color::new(255, 0, 0))
+                .await
+                .is_ok()
+        );
+        assert!(mock.set_segment_brightness(&id, &[0, 1], 80).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn mock_list_work_modes_returns_empty() {
+        let mock = MockBackend::new();
+        let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+        let modes = mock.list_work_modes(&id).await.unwrap();
+        assert!(modes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mock_set_work_mode_succeeds() {
+        let mock = MockBackend::new();
+        let id = DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+        assert!(mock.set_work_mode(&id, 1, Some(3)).await.is_ok());
+        assert!(mock.set_work_mode(&id, 2, None).await.is_ok());
     }
 
     #[test]

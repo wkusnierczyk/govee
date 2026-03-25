@@ -7,9 +7,11 @@ use reqwest::Client;
 use tracing::{debug, instrument, warn};
 
 use super::GoveeBackend;
-use crate::capability::{Capability, CapabilityValue};
+use crate::capability::{Capability, CapabilityValue, DynamicSceneValue};
 use crate::error::{GoveeError, Result};
-use crate::types::{BackendType, Color, Device, DeviceId, DeviceState};
+use crate::types::{
+    BackendType, Color, Device, DeviceId, DeviceState, DiyScene, LightScene, WorkMode,
+};
 
 /// Default base URL for the Govee cloud API.
 const DEFAULT_BASE_URL: &str = "https://developer-api.govee.com";
@@ -453,6 +455,46 @@ impl CloudBackend {
         DeviceState::new(on, brightness, color, color_temp_kelvin, false, raw)
     }
 
+    /// List available DIY scenes for a device.
+    ///
+    /// Returns an empty list if the device does not advertise the
+    /// `devices.capabilities.dynamic_scene` capability with instance `diyScene`.
+    /// Otherwise POSTs to `/router/api/v1/device/diy-scenes` and parses the response.
+    async fn list_diy_scenes_cloud(&self, id: &DeviceId) -> Result<Vec<DiyScene>> {
+        // Check capability — skip the network call if the device doesn't support DIY scenes.
+        let has_cap = self
+            .get_capabilities(id)
+            .map(|caps| {
+                caps.iter().any(|c| {
+                    c.type_ == "devices.capabilities.dynamic_scene" && c.instance == "diyScene"
+                })
+            })
+            .unwrap_or(false);
+
+        if !has_cap {
+            return Ok(vec![]);
+        }
+
+        let sku = self.get_model(id)?;
+        let payload = serde_json::json!({
+            "sku": sku,
+            "device": id.as_str(),
+        });
+
+        let resp: DiySceneListResponse = self
+            .new_api_post("/router/api/v1/device/diy-scenes", payload)
+            .await?;
+
+        Ok(resp
+            .diy_scenes
+            .into_iter()
+            .map(|s| DiyScene {
+                id: s.scene_id,
+                name: s.scene_name,
+            })
+            .collect())
+    }
+
     /// Override the new API base URL.
     ///
     /// Returns `GoveeError::InvalidConfig` if `base` is not a valid URL or
@@ -526,6 +568,39 @@ impl CloudBackend {
                 "colorTemperatureK",
                 serde_json::json!(v),
             ),
+            CapabilityValue::DynamicScene(scene_value) => (
+                "devices.capabilities.dynamic_scene",
+                "lightScene",
+                serde_json::to_value(&scene_value).map_err(GoveeError::Json)?,
+            ),
+            CapabilityValue::DiyScene(v) => (
+                "devices.capabilities.dynamic_scene",
+                "diyScene",
+                serde_json::json!(v),
+            ),
+            CapabilityValue::SegmentColor { segments, rgb } => (
+                "devices.capabilities.segment_color_setting",
+                "segmentedColorRgb",
+                serde_json::json!({ "segments": segments, "rgb": rgb }),
+            ),
+            CapabilityValue::SegmentBrightness {
+                segments,
+                brightness,
+            } => (
+                "devices.capabilities.segment_color_setting",
+                "segmentedBrightness",
+                serde_json::json!({ "segments": segments, "brightness": brightness }),
+            ),
+            CapabilityValue::WorkMode {
+                work_mode,
+                mode_value,
+            } => {
+                let mut wm_json = serde_json::json!({ "workMode": work_mode });
+                if let Some(mv) = mode_value {
+                    wm_json["modeValue"] = serde_json::json!(mv);
+                }
+                ("devices.capabilities.work_mode", "workMode", wm_json)
+            }
             other => {
                 return Err(GoveeError::NotImplemented(format!(
                     "control_v2 does not support {other:?}"
@@ -601,6 +676,24 @@ impl CloudBackend {
         debug!(device = %id, stale = state.stale, "queried v1 device state");
         Ok(state)
     }
+}
+
+// --- DIY scene response types (internal) ---
+
+/// Response payload for `POST /router/api/v1/device/diy-scenes`.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DiySceneListResponse {
+    diy_scenes: Vec<RawDiyScene>,
+}
+
+/// A single DIY scene entry from the API.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawDiyScene {
+    scene_id: u32,
+    #[serde(default)]
+    scene_name: Option<String>,
 }
 
 // --- New (OpenAPI) request/response envelope types (internal) ---
@@ -763,6 +856,48 @@ fn build_state_from_properties(properties: Vec<serde_json::Value>) -> Result<Dev
 struct V1ControlResponse {
     code: u16,
     message: String,
+}
+
+// --- Scene list response types (internal) ---
+
+/// Top-level payload returned by `POST /router/api/v1/device/scenes`.
+#[derive(serde::Deserialize)]
+struct SceneListResponse {
+    scenes: Vec<RawScene>,
+}
+
+/// A single scene entry in the scenes list response.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawScene {
+    scene_id: u32,
+    scene_name: String,
+    scene_param_id: u32,
+}
+
+/// Parse work modes from a capability's parameters.
+///
+/// Extracts `EnumOption` entries from `CapabilityParameters::Enum { options }`.
+/// Each option's integer `value` becomes the work mode `id`; non-integer values
+/// are silently skipped. Sub-modes are not available from this structure.
+fn parse_work_modes(params: &crate::capability::CapabilityParameters) -> Result<Vec<WorkMode>> {
+    use crate::capability::CapabilityParameters;
+    let options = match params {
+        CapabilityParameters::Enum { options } => options,
+        _ => return Ok(vec![]),
+    };
+    let modes = options
+        .iter()
+        .filter_map(|opt| {
+            let id = opt.value.as_u64().map(|v| v as u32)?;
+            Some(WorkMode {
+                id,
+                name: opt.name.clone(),
+                sub_modes: vec![],
+            })
+        })
+        .collect();
+    Ok(modes)
 }
 
 /// Parse the `Retry-After` header value as seconds.
@@ -978,6 +1113,143 @@ impl GoveeBackend for CloudBackend {
             }
             Err(e) => Err(e),
         }
+    }
+
+    #[instrument(skip(self), fields(backend = "cloud", device = %id))]
+    async fn list_scenes(&self, id: &DeviceId) -> Result<Vec<LightScene>> {
+        // Skip the network call if the device has no lightScene instance of dynamic_scene.
+        if let Some(caps) = self.get_capabilities(id) {
+            let has_light_scene = caps.iter().any(|c| {
+                c.type_ == "devices.capabilities.dynamic_scene" && c.instance == "lightScene"
+            });
+            if !has_light_scene {
+                return Ok(vec![]);
+            }
+        } else {
+            return Ok(vec![]);
+        }
+
+        let sku = self.get_model(id)?;
+        let payload = serde_json::json!({
+            "sku": sku,
+            "device": id.as_str(),
+        });
+
+        let resp: SceneListResponse = self
+            .new_api_post("/router/api/v1/device/scenes", payload)
+            .await?;
+
+        let scenes = resp
+            .scenes
+            .into_iter()
+            .map(|s| LightScene {
+                id: s.scene_id,
+                name: s.scene_name,
+                param_id: s.scene_param_id,
+            })
+            .collect();
+
+        Ok(scenes)
+    }
+
+    #[instrument(skip(self, scene), fields(backend = "cloud", device = %id))]
+    async fn set_scene(&self, id: &DeviceId, scene: &LightScene) -> Result<()> {
+        // Reject early if the device's cached capabilities don't include lightScene.
+        if let Some(caps) = self.get_capabilities(id) {
+            let has_light_scene = caps.iter().any(|c| {
+                c.type_ == "devices.capabilities.dynamic_scene" && c.instance == "lightScene"
+            });
+            if !has_light_scene {
+                return Err(GoveeError::NotImplemented(
+                    "device does not support preset scenes (no lightScene capability)".into(),
+                ));
+            }
+        }
+        self.control_v2(
+            id,
+            CapabilityValue::DynamicScene(DynamicSceneValue::Preset {
+                param_id: scene.param_id,
+                id: scene.id,
+            }),
+        )
+        .await
+    }
+
+    #[instrument(skip(self), fields(backend = "cloud", device = %id))]
+    async fn list_diy_scenes(&self, id: &DeviceId) -> Result<Vec<DiyScene>> {
+        self.list_diy_scenes_cloud(id).await
+    }
+
+    #[instrument(skip(self, scene), fields(backend = "cloud", device = %id, scene_id = scene.id))]
+    async fn set_diy_scene(&self, id: &DeviceId, scene: &DiyScene) -> Result<()> {
+        self.control_v2(id, CapabilityValue::DiyScene(scene.id))
+            .await
+    }
+
+    #[instrument(skip(self, color), fields(backend = "cloud", device = %id))]
+    async fn set_segment_color(&self, id: &DeviceId, segments: &[u8], color: Color) -> Result<()> {
+        let rgb = color.to_rgb24();
+        self.control_v2(
+            id,
+            CapabilityValue::SegmentColor {
+                segments: segments.to_vec(),
+                rgb,
+            },
+        )
+        .await
+    }
+
+    #[instrument(skip(self), fields(backend = "cloud", device = %id))]
+    async fn set_segment_brightness(
+        &self,
+        id: &DeviceId,
+        segments: &[u8],
+        brightness: u8,
+    ) -> Result<()> {
+        if brightness > 100 {
+            return Err(GoveeError::InvalidBrightness(brightness));
+        }
+        self.control_v2(
+            id,
+            CapabilityValue::SegmentBrightness {
+                segments: segments.to_vec(),
+                brightness,
+            },
+        )
+        .await
+    }
+
+    #[instrument(skip(self), fields(backend = "cloud", device = %id))]
+    async fn list_work_modes(&self, id: &DeviceId) -> Result<Vec<WorkMode>> {
+        let caps = match self.get_capabilities(id) {
+            Some(c) => c,
+            None => return Ok(vec![]),
+        };
+        let work_cap = caps
+            .iter()
+            .find(|c| c.type_ == "devices.capabilities.work_mode");
+        let work_cap = match work_cap {
+            Some(c) => c,
+            None => return Ok(vec![]),
+        };
+        parse_work_modes(&work_cap.parameters)
+    }
+
+    #[instrument(skip(self), fields(backend = "cloud", device = %id))]
+    async fn set_work_mode(
+        &self,
+        id: &DeviceId,
+        work_mode: u32,
+        mode_value: Option<u32>,
+    ) -> Result<()> {
+        self.control_v2(
+            id,
+            CapabilityValue::WorkMode {
+                work_mode,
+                mode_value,
+            },
+        )
+        .await
     }
 
     fn backend_type(&self) -> BackendType {
