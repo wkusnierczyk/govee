@@ -4,8 +4,9 @@
 [![Release](https://github.com/wkusnierczyk/govee/actions/workflows/release.yml/badge.svg)](https://github.com/wkusnierczyk/govee/actions/workflows/release.yml)
 [![crates.io](https://img.shields.io/crates/v/govee.svg)](https://crates.io/crates/govee)
 [![docs.rs](https://docs.rs/govee/badge.svg)](https://docs.rs/govee)
+[![codecov](https://codecov.io/gh/wkusnierczyk/govee/graph/badge.svg)](https://codecov.io/gh/wkusnierczyk/govee)
 
-A Rust library for controlling Govee smart lighting devices. Provides idiomatic async access to both the Govee cloud API (v1) and the local LAN API over UDP, a unified backend abstraction, device registry with name/alias resolution, and a scene system for multi-device presets.
+A Rust library for controlling Govee smart lighting devices. Provides idiomatic async access to both the Govee cloud API (v1 and v2) and the local LAN API over UDP, a unified backend abstraction, device registry with name/alias resolution, and a scene system for multi-device presets.
 
 Designed as a foundation for higher-level consumers — it has no opinion about how it is invoked.
 
@@ -31,7 +32,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-govee = "0.6"
+govee = "0.7"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -156,6 +157,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 The API key is obtained from the Govee Home mobile app. Store it in an environment variable or a `.env` file — never hardcode it in source or commit it to version control. HTTPS is enforced for all remote URLs.
 
+#### v2 API features
+
+The cloud backend uses the Govee v2 API for device list, state, and all control commands. It also exposes higher-level capabilities only available through v2:
+
+```rust
+// Preset light scenes (device firmware scenes)
+let scenes = backend.list_scenes(&id).await?;
+backend.set_scene(&id, &scenes[0]).await?;
+
+// DIY scenes (user-created in the Govee Home app)
+let diy = backend.list_diy_scenes(&id).await?;
+backend.set_diy_scene(&id, &diy[0]).await?;
+
+// Segmented color and brightness (devices with addressable segments)
+backend.set_segment_color(&id, &[0, 1, 2], Color::new(255, 0, 0)).await?;
+backend.set_segment_brightness(&id, &[0, 1], 80).await?;
+
+// Work modes (device-specific modes with optional sub-mode value)
+let modes = backend.list_work_modes(&id).await?;
+backend.set_work_mode(&id, modes[0].id, None).await?;
+```
+
+`list_scenes`, `list_diy_scenes`, and `list_work_modes` require the device's capability list to be cached (fetched during `list_devices`). Calling them before `list_devices` returns `GoveeError::NotImplemented`. The local backend returns `NotImplemented` for these methods — they are cloud-only.
+
 ### Local LAN backend
 
 ```rust
@@ -224,4 +249,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for build, test, lint, and git hooks setu
 | **M5 — Device registry** | `DeviceRegistry`: cloud+local merge, name/alias resolution, backend auto-selection, optimistic state cache, groups | v0.5.0 |
 | **M6 — Scenes** | Built-in + user-defined scene presets, `apply_scene` with device/group/all targeting, scene validation | v0.6.0 |
 | **M7 — SRE & hardening** | Structured tracing, retry/backoff, graceful degradation, security audit, integration test suite, threat model docs | v0.7.0 |
-| **M8 — API v2** | Govee v2 API | In progress | 
+| **M8 — API v2** | v2 API transport, capability model, preset/DIY scenes, segmented control, work modes, Codecov integration | v0.8.0 |
