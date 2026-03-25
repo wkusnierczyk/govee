@@ -32,7 +32,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-govee = "0.7"
+govee = "0.8"
 tokio = { version = "1", features = ["full"] }
 ```
 
