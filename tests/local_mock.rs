@@ -646,3 +646,35 @@ async fn udp_loopback_set_color_temp() {
 
     drop(backend);
 }
+
+#[tokio::test]
+async fn local_backend_list_diy_scenes_returns_empty() {
+    let _lock = PORT_LOCK.lock().await;
+    let backend = LocalBackend::new(Duration::from_millis(100), 10).await;
+    if let Err(GoveeError::BackendUnavailable(_)) = &backend {
+        eprintln!("skipping local_backend_list_diy_scenes_returns_empty: port 4002 in use");
+        return;
+    }
+    let backend = backend.expect("LocalBackend should bind");
+    let id = govee::types::DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+    let scenes = backend.list_diy_scenes(&id).await.unwrap();
+    assert!(scenes.is_empty());
+}
+
+#[tokio::test]
+async fn local_backend_set_diy_scene_returns_not_implemented() {
+    let _lock = PORT_LOCK.lock().await;
+    let backend = LocalBackend::new(Duration::from_millis(100), 10).await;
+    if let Err(GoveeError::BackendUnavailable(_)) = &backend {
+        eprintln!("skipping local_backend_set_diy_scene_returns_not_implemented: port 4002 in use");
+        return;
+    }
+    let backend = backend.expect("LocalBackend should bind");
+    let id = govee::types::DeviceId::new("AA:BB:CC:DD:EE:FF").unwrap();
+    let scene = govee::DiyScene {
+        id: 42,
+        name: "Test".to_string(),
+    };
+    let result = backend.set_diy_scene(&id, &scene).await;
+    assert!(matches!(result.unwrap_err(), GoveeError::NotImplemented(_)));
+}

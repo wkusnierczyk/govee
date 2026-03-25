@@ -2692,6 +2692,19 @@ mod tests {
             ) -> crate::error::Result<()> {
                 Ok(())
             }
+            async fn list_diy_scenes(
+                &self,
+                _id: &DeviceId,
+            ) -> crate::error::Result<Vec<crate::types::DiyScene>> {
+                Ok(vec![])
+            }
+            async fn set_diy_scene(
+                &self,
+                _id: &DeviceId,
+                _scene: &crate::types::DiyScene,
+            ) -> crate::error::Result<()> {
+                Ok(())
+            }
             fn backend_type(&self) -> BackendType {
                 BackendType::Cloud
             }
@@ -3060,6 +3073,19 @@ mod tests {
                 &self,
                 _id: &DeviceId,
                 _scene: &crate::types::LightScene,
+            ) -> crate::error::Result<()> {
+                Ok(())
+            }
+            async fn list_diy_scenes(
+                &self,
+                _id: &DeviceId,
+            ) -> crate::error::Result<Vec<crate::types::DiyScene>> {
+                Ok(vec![])
+            }
+            async fn set_diy_scene(
+                &self,
+                _id: &DeviceId,
+                _scene: &crate::types::DiyScene,
             ) -> crate::error::Result<()> {
                 Ok(())
             }

@@ -14,7 +14,7 @@ use tracing::instrument;
 
 use crate::backend::GoveeBackend;
 use crate::error::{GoveeError, Result};
-use crate::types::{BackendType, Color, Device, DeviceId, DeviceState, LightScene};
+use crate::types::{BackendType, Color, Device, DeviceId, DeviceState, DiyScene, LightScene};
 
 /// Helper to create a `GoveeError::Protocol` with a custom message.
 fn protocol_error(msg: &str) -> GoveeError {
@@ -617,6 +617,16 @@ impl GoveeBackend for LocalBackend {
     async fn set_scene(&self, _id: &DeviceId, _scene: &LightScene) -> Result<()> {
         Err(GoveeError::NotImplemented(
             "set_scene is not supported by the local backend".into(),
+        ))
+    }
+
+    async fn list_diy_scenes(&self, _id: &DeviceId) -> Result<Vec<DiyScene>> {
+        Ok(vec![])
+    }
+
+    async fn set_diy_scene(&self, _id: &DeviceId, _scene: &DiyScene) -> Result<()> {
+        Err(GoveeError::NotImplemented(
+            "DIY scenes are not supported by the local backend".into(),
         ))
     }
 

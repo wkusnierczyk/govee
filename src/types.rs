@@ -169,6 +169,13 @@ impl<'de> Deserialize<'de> for DeviceState {
     }
 }
 
+/// A user-created DIY scene stored on the Govee cloud.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiyScene {
+    pub id: u32,
+    pub name: String,
+}
+
 /// RGB color value (sRGB, each component 0–255).
 ///
 /// Components are bounded by `u8` — no additional validation needed.
