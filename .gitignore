@@ -24,3 +24,5 @@ target
 .dev/m07/*
 !.dev/m07/security-audit.md
 lefthook-local.yml
+.worktrees/
+lcov.info
