@@ -37,6 +37,11 @@ jobs:
         with:
           name: coverage-lcov
           path: lcov.info
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@1af58845a975a7985b0beb0cbe6fbbb71a41dbad # v5.5.3
+        with:
+          files: lcov.info
+          fail_ci_if_error: false
       - name: Check coverage threshold
         run: |
           COVERAGE=$(cargo llvm-cov --json --summary-only | jq '.data[0].totals.lines.percent')
