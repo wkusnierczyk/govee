@@ -270,7 +270,7 @@ impl<'de> Deserialize<'de> for Config {
 impl fmt::Debug for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Config")
-            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field("api_key", &self.api_key.is_some().then_some("[REDACTED]"))
             .field("backend", &self.backend)
             .field("discovery_interval_secs", &self.discovery_interval_secs)
             .field("aliases", &self.aliases)
