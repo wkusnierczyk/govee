@@ -3,7 +3,9 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 
 use crate::error::{GoveeError, Result};
-use crate::types::{BackendType, Color, Device, DeviceId, DeviceState, DiyScene, LightScene};
+use crate::types::{
+    BackendType, Color, Device, DeviceId, DeviceState, DiyScene, LightScene, WorkMode,
+};
 
 use super::GoveeBackend;
 
@@ -134,6 +136,19 @@ impl GoveeBackend for MockBackend {
         _brightness: u8,
     ) -> Result<()> {
         self.check_error()?;
+        Ok(())
+    }
+
+    async fn list_work_modes(&self, _id: &DeviceId) -> Result<Vec<WorkMode>> {
+        Ok(vec![])
+    }
+
+    async fn set_work_mode(
+        &self,
+        _id: &DeviceId,
+        _work_mode: u32,
+        _mode_value: Option<u32>,
+    ) -> Result<()> {
         Ok(())
     }
 
