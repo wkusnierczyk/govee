@@ -45,6 +45,18 @@ pub trait GoveeBackend: Send + Sync {
     /// Activate a DIY scene by its ID.
     async fn set_diy_scene(&self, id: &DeviceId, scene: &DiyScene) -> Result<()>;
 
+    /// Set the color of specific segments (0-based indices).
+    async fn set_segment_color(&self, id: &DeviceId, segments: Vec<u8>, color: Color)
+    -> Result<()>;
+
+    /// Set the brightness of specific segments (0-based indices).
+    async fn set_segment_brightness(
+        &self,
+        id: &DeviceId,
+        segments: Vec<u8>,
+        brightness: u8,
+    ) -> Result<()>;
+
     /// Which backend type this implementation represents.
     fn backend_type(&self) -> BackendType;
 }

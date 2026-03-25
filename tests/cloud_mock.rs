@@ -1627,7 +1627,7 @@ async fn list_devices_fallback_to_legacy() {
     assert_eq!(devices[1].id.as_str(), "11:22:33:44:55:66");
 }
 
-// --- list_scenes and set_scene tests ---
+// --- list_scenes and set_scene tests (#113) ---
 
 /// V2 devices response that includes `devices.capabilities.dynamic_scene`.
 const V2_DEVICES_WITH_SCENE_CAP: &str = r#"{
@@ -1793,7 +1793,7 @@ async fn set_scene_triggers_control() {
     backend.set_scene(&id, &scene).await.unwrap();
 }
 
-// --- list_diy_scenes / set_diy_scene tests ---
+// --- list_diy_scenes / set_diy_scene tests (#114) ---
 
 /// Response body for the v2 device list that includes a `dynamic_scene` capability (diyScene instance).
 const V2_DEVICES_WITH_DYNAMIC_SCENE: &str = r#"{
@@ -1936,4 +1936,77 @@ async fn set_diy_scene_triggers_control() {
         name: "My Custom".to_string(),
     };
     backend.set_diy_scene(&id, &scene).await.unwrap();
+}
+
+// --- segmented color tests (#115) ---
+
+#[tokio::test]
+async fn set_segment_color_sends_correct_payload() {
+    let server = MockServer::start().await;
+    let (backend, id) = setup_v2_control(&server).await;
+
+    // Color::new(255, 0, 128) packed = 0xFF0080 = 16711808
+    Mock::given(method("POST"))
+        .and(path("/router/api/v1/device/control"))
+        .and(header("Govee-API-Key", "test-key"))
+        .and(HasRequestId)
+        .and(body_partial_json(serde_json::json!({
+            "payload": {
+                "sku": "H6076",
+                "device": "AA:BB:CC:DD:EE:FF",
+                "capability": {
+                    "type": "devices.capabilities.segment_color_setting",
+                    "instance": "segmentedColorRgb",
+                    "value": {
+                        "segments": [0, 1, 2],
+                        "rgb": 0xFF0080u32
+                    }
+                }
+            }
+        })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(NEW_API_CONTROL_SUCCESS, "application/json"),
+        )
+        .mount(&server)
+        .await;
+
+    backend
+        .set_segment_color(&id, vec![0, 1, 2], Color::new(255, 0, 128))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn set_segment_brightness_sends_correct_payload() {
+    let server = MockServer::start().await;
+    let (backend, id) = setup_v2_control(&server).await;
+
+    Mock::given(method("POST"))
+        .and(path("/router/api/v1/device/control"))
+        .and(header("Govee-API-Key", "test-key"))
+        .and(HasRequestId)
+        .and(body_partial_json(serde_json::json!({
+            "payload": {
+                "sku": "H6076",
+                "device": "AA:BB:CC:DD:EE:FF",
+                "capability": {
+                    "type": "devices.capabilities.segment_color_setting",
+                    "instance": "segmentedBrightness",
+                    "value": {
+                        "segments": [3, 4],
+                        "brightness": 75
+                    }
+                }
+            }
+        })))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(NEW_API_CONTROL_SUCCESS, "application/json"),
+        )
+        .mount(&server)
+        .await;
+
+    backend
+        .set_segment_brightness(&id, vec![3, 4], 75)
+        .await
+        .unwrap();
 }
