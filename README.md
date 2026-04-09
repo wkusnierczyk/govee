@@ -12,7 +12,7 @@ Designed as a foundation for higher-level consumers — it has no opinion about 
 
 ## Status
 
-Development complete. See the [development plan](#development-plan) for completed milestones.
+Development complete. See [Development](#development) for completed milestones.
 
 ## Ecosystem
 
@@ -237,8 +237,6 @@ See [SECURITY.md](SECURITY.md) for the full threat model.
 ## Development
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for build, test, lint, and git hooks setup.
-
-## Development plan
 
 | Milestone | Scope | Status |
 |-----------|-------|--------|
